@@ -600,6 +600,7 @@ void SdClip::finish_fetch_(bool ok) {
     return;
   }
   // On the card now; into memory from there.
+  this->revision_++;
   if (!this->start_load_(fx.key, this->cache_path_(fx.key)) && fx.key == this->want_key_)
     this->item_event_ = ITEM_FAILED;
 }
@@ -774,6 +775,7 @@ void SdClip::evict_(Item *item) {
   }
   ESP_LOGD(TAG, "Evicting %s (%u KB) from memory", item->key.c_str(),
            static_cast<unsigned>(item->len / 1024));
+  this->revision_++;
   this->cache_.erase(std::remove_if(this->cache_.begin(), this->cache_.end(),
                                     [item](const std::unique_ptr<Item> &p) { return p.get() == item; }),
                      this->cache_.end());
@@ -889,6 +891,85 @@ void SdClip::pump_load_() {
   const uint32_t started = ld.started;
   this->load_ = Load{};
   this->adopt_(key, buf, got, started);
+}
+
+static void json_string(std::string &out, const std::string &value) {
+  out += '"';
+  for (char c : value) {
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if (static_cast<unsigned char>(c) < 0x20) {
+      out += '?';
+    } else {
+      out += c;
+    }
+  }
+  out += '"';
+}
+
+std::string SdClip::cache_report(size_t max_card) {
+  std::string out = str_sprintf(
+      "{\"budget\":%u,\"used\":%u,\"max\":%u,\"psram_free\":%u,\"psram_total\":%u,"
+      "\"heap_free\":%u,\"shown\":",
+      static_cast<unsigned>(this->cache_bytes_), static_cast<unsigned>(this->cache_used()),
+      static_cast<unsigned>(this->max_bytes_),
+      static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+      static_cast<unsigned>(heap_caps_get_total_size(MALLOC_CAP_SPIRAM)),
+      static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
+  json_string(out, this->shown_key());
+  out += ",\"mem\":[";
+  bool first = true;
+  for (auto &it : this->cache_) {
+    if (!first)
+      out += ',';
+    first = false;
+    out += '[';
+    json_string(out, it->key);
+    out += str_sprintf(",%u,%u]", static_cast<unsigned>(it->len), static_cast<unsigned>(it->off.size()));
+  }
+  out += "],\"card\":";
+  if (this->sd_ == nullptr || !this->sd_->is_mounted()) {
+    out += "null}";
+    return out;
+  }
+  out += '[';
+  first = true;
+  size_t listed = 0;
+  for (auto &name : this->sd_->list_directory("/mjpeg/cache", 128)) {
+    if (name.size() <= 4 || name.compare(name.size() - 4, 4, ".mjp") != 0)
+      continue;
+    if (listed++ >= max_card)
+      break;
+    if (!first)
+      out += ',';
+    first = false;
+    out += '[';
+    json_string(out, name.substr(0, name.size() - 4));
+    out += str_sprintf(",%u]", static_cast<unsigned>(this->sd_->file_size("/mjpeg/cache/" + name)));
+  }
+  out += "]}";
+  return out;
+}
+
+bool SdClip::push_report(const std::string &url) {
+  if (this->http_ == nullptr)
+    return false;
+  const std::string body = this->cache_report();
+  const std::vector<http_request::Header> headers{{"Content-Type", "application/json"}};
+  auto container = this->http_->post(url, body, headers);
+  if (container == nullptr) {
+    ESP_LOGD(TAG, "Report to %s failed", url.c_str());
+    return false;
+  }
+  const int status = container->status_code;
+  container->end();
+  if (status < 200 || status >= 300) {
+    ESP_LOGW(TAG, "Report to %s: HTTP %d", url.c_str(), status);
+    return false;
+  }
+  ESP_LOGD(TAG, "Reported %u bytes of cache state", static_cast<unsigned>(body.size()));
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,6 +1121,7 @@ void SdClip::adopt_(const std::string &key, uint8_t *buf, size_t len, uint32_t s
     this->evict_(old);
   Item *raw = item.get();
   this->cache_.push_back(std::move(item));
+  this->revision_++;
   ESP_LOGD(TAG, "Memory cache: %u item(s), %u KB", static_cast<unsigned>(this->cache_.size()),
            static_cast<unsigned>(this->cache_used() / 1024));
   if (key == this->want_key_)
@@ -1048,6 +1130,7 @@ void SdClip::adopt_(const std::string &key, uint8_t *buf, size_t len, uint32_t s
 
 void SdClip::activate_(Item *item) {
   this->shown_ = item;
+  this->revision_++;
   item->used = millis();
   this->decode_errors_ = 0;
   // The first frame goes up now, so a switch is visible immediately -- and a

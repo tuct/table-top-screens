@@ -82,6 +82,10 @@ def _prefs_path(root: Path, device: str) -> Path:
     return device_dir(root, device) / "prefs.json"
 
 
+def _state_path(root: Path, device: str) -> Path:
+    return device_dir(root, device) / "state.json"
+
+
 # A file, not a directory, so it cannot be mistaken for a screen by anything
 # that lists data/ looking for devices.
 def _scenes_path(root: Path) -> Path:
@@ -205,6 +209,19 @@ def prefs(root: Path, device: str) -> dict:
 
 def set_prefs(root: Path, device: str, value: dict) -> dict:
     _write_json(_prefs_path(root, device), value)
+    return value
+
+
+# --------------------------------------------------------------------------
+# what a screen last reported holding (pushed by the screen, never polled)
+# --------------------------------------------------------------------------
+def screen_state(root: Path, device: str) -> dict | None:
+    got = _read_json(_state_path(root, device), None)
+    return got if isinstance(got, dict) else None
+
+
+def set_screen_state(root: Path, device: str, value: dict) -> dict:
+    _write_json(_state_path(root, device), value)
     return value
 
 

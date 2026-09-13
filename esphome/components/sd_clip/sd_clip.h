@@ -230,6 +230,20 @@ class SdClip : public Component {
   float last_decode_ms() const { return this->last_decode_us_ / 1000.0f; }
   float last_load_ms() const { return this->last_load_ms_; }
 
+  /// Bumped whenever what is cached or shown changes, so a caller can publish
+  /// cache_report() only when there is something new to say.
+  uint32_t cache_revision() const { return this->revision_; }
+  /// What this screen holds, as compact JSON for the content server:
+  ///   {"budget":B,"used":U,"max":M,"psram_free":P,"psram_total":T,
+  ///    "heap_free":H,"shown":"key",
+  ///    "mem":[["key",bytes,frames],...],"card":[["key",bytes],...] or null}
+  /// Card entries are the files in /mjpeg/cache, at most `max_card` of them
+  /// (listing the card costs a directory read, so call it on change only).
+  std::string cache_report(size_t max_card = 32);
+  /// POST cache_report() to `url` (the server's /d/<device>/state). True on a
+  /// 2xx. Blocks for the request, so call it on change, not per tick.
+  bool push_report(const std::string &url);
+
   /// Largest single item held in memory; longer clips are cut to whole frames.
   void set_max_bytes(size_t max_bytes) { this->max_bytes_ = max_bytes; }
   size_t max_bytes() const { return this->max_bytes_; }
@@ -358,6 +372,7 @@ class SdClip : public Component {
   float last_load_ms_{0};
   uint32_t decode_errors_{0};
   int item_event_{ITEM_NONE};
+  uint32_t revision_{0};
   /// Playback deadlines are tens of ms apart; ESPHome's default ~16 ms loop
   /// cadence would add that much jitter to every frame.
   HighFrequencyLoopRequester high_freq_;

@@ -153,6 +153,8 @@ many live screens were told to refresh.
 | `GET` | `/d/<device>/meta` | Stored content metadata (JSON) |
 | `GET` | `/d/<device>/image` | Render for a device — **what the screen calls** |
 | `GET` | `/d/<device>/clip.mjpeg` | The whole clip as one TTMJ file (`w`, `h`, `q`, `fps`, `max`) |
+| `POST` | `/d/<device>/state` | A screen reports what it holds (sent by the screen on change) |
+| `GET` | `/d/<device>/state` | That last report, one row per cached item |
 | `GET` | `/healthz` | Liveness + whether QOI is available |
 
 ### Clips as one file (`/clip.mjpeg`)
@@ -183,6 +185,23 @@ re-sends the content URL whenever it changed, then presses Refresh. The URL's
 any. The same item with the same framing always gives the same URL, so a
 caching screen can switch back to content it already holds without
 downloading it again.
+
+### What each screen holds (`/state`)
+
+A screen running `mjpeg-clip.yaml` **pushes** a report. Nothing polls it. It
+sends one about a second after anything in its cache or on its panel changes,
+and one at boot. The report gives memory-cache use against its budget, free
+PSRAM and heap, the item on screen, and every item in memory and on the card
+with its size. The server stores the latest report as `data/<device>/state.json`
+and shows it:
+
+- **Each screen's card and page:** a memory meter, and the cached items by
+  name, with fps, custom framing, and memory/card sizes.
+- **Each library row:** a `cached` badge for items the screen can switch to
+  without a download.
+
+The report is the screen's last word. A screen that's offline still shows what
+it held when it last reported, marked with the report's age.
 
 ### Framing from the device page
 

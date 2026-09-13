@@ -474,6 +474,39 @@ def main() -> int:
     r = c.get("/d/endian/image?w=4&h=4&fmt=rgb565&fit=cover")
     check("rgb565 red is big-endian F800", r.data[:2] == bytes((0xF8, 0x00)), r.data[:2].hex())
 
+    print("\nscreen state (pushed by the screen)")
+    items = c.get("/d/tabletop-01/items").get_json()
+    item_id = items["current"]
+    report = {
+        "budget": 5000000, "used": 1300000, "max": 4000000,
+        "psram_free": 2100000, "psram_total": 8000000, "heap_free": 120000,
+        "shown": f"{item_id}-f15-q80",
+        "mem": [[f"{item_id}-f15-q80", 900000, 1], ["file:intro.mjpeg", 400000, 240]],
+        "card": [[f"{item_id}-f15-q80", 900000], [f"{item_id}.abcd1234-f20-q80", 1200000]],
+    }
+    r = c.post("/d/tabletop-01/state", json=report)
+    check("state accepted", r.status_code == 204, str(r.status_code))
+    check("non-JSON state rejected",
+          c.post("/d/tabletop-01/state", data="x", content_type="text/plain").status_code == 400)
+    st = c.get("/d/tabletop-01/state").get_json()
+    check("state stored with a timestamp", st.get("report") == report and st.get("at"))
+    by_key = {e["key"]: e for e in st["entries"]}
+    shown = by_key.get(f"{item_id}-f15-q80", {})
+    check("an item in memory and on card is one row",
+          shown.get("mem") == 900000 and shown.get("card") == 900000 and shown.get("shown"),
+          str(shown))
+    check("keys parse back to item, fps and framing",
+          shown.get("item_id") == item_id and shown.get("fps") == 15
+          and by_key[f"{item_id}.abcd1234-f20-q80"]["framed"], str(shown))
+    check("hand-copied files are recognised", by_key["file:intro.mjpeg"]["file"] == "intro.mjpeg")
+    check("the row on screen sorts first", st["entries"][0]["shown"])
+    page = c.get("/d/tabletop-01/").get_data(as_text=True)
+    check("device page shows memory in use", "Memory cache: 1.2 MB of 4.8 MB" in page)
+    check("and the cached items", "intro.mjpeg" in page and "on screen" in page)
+    check("library row carries a cached badge", 'class="cached"' in page)
+    check("index card shows memory too",
+          "Memory cache: 1.2 MB of 4.8 MB" in c.get("/").get_data(as_text=True))
+
     print("\npages")
     check("device page", c.get("/d/tabletop-01/").status_code == 200)
     check("index", c.get("/").status_code == 200)

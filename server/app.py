@@ -290,6 +290,120 @@ def sd_html(state: dict | None) -> str:
     return f'<small class="caps">SD card: {use}{size}</small>'
 
 
+def parse_cache_key(key: str) -> dict:
+    """What a screen's cache key names.
+
+    Keys are `<item id>[.<prefs hash>]-f<fps>-q<quality>` for server content
+    (see mjpeg-clip.yaml) and `file:<name>` for a file copied onto the card.
+    """
+    if key.startswith("file:"):
+        return {"file": key[5:], "item_id": None, "fps": None, "framed": False}
+    m = re.match(r"^([0-9A-Za-z]+)(\.[0-9a-f]+)?(?:-f(\d+))?", key)
+    if not m:
+        return {"file": None, "item_id": None, "fps": None, "framed": False}
+    return {"file": None, "item_id": m.group(1), "fps": int(m.group(3)) if m.group(3) else None,
+            "framed": bool(m.group(2))}
+
+
+def cache_entries(state: dict | None) -> list[dict]:
+    """A screen's report as one row per cached key: where it is, and its size."""
+    report = (state or {}).get("report") or {}
+    rows: dict[str, dict] = {}
+    for entry in report.get("mem") or []:
+        if isinstance(entry, list) and len(entry) >= 2:
+            rows.setdefault(str(entry[0]), {})["mem"] = int(entry[1])
+            rows[str(entry[0])]["frames"] = int(entry[2]) if len(entry) > 2 else None
+    for entry in report.get("card") or []:
+        if isinstance(entry, list) and len(entry) >= 2:
+            rows.setdefault(str(entry[0]), {})["card"] = int(entry[1])
+    shown = report.get("shown")
+    out = []
+    for key, row in rows.items():
+        out.append({"key": key, "shown": key == shown, **parse_cache_key(key), **row})
+    # On screen first, then memory, then card only.
+    out.sort(key=lambda r: (not r["shown"], "mem" not in r, r["key"]))
+    return out
+
+
+def _kb(n: int | None) -> str:
+    if n is None:
+        return "?"
+    return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{max(1, n // 1024)} kB"
+
+
+def _ago(ts: float | None) -> str:
+    if not ts:
+        return "never"
+    s = max(0, int(time.time() - ts))
+    if s < 60:
+        return f"{s} s ago"
+    if s < 3600:
+        return f"{s // 60} min ago"
+    if s < 86400:
+        return f"{s // 3600} h ago"
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+def memory_html(device: str, detailed: bool = False) -> str:
+    """What the screen last said it holds: memory in use, and each cached item."""
+    state = lib(library.screen_state, device)
+    report = (state or {}).get("report")
+    if not report:
+        return ""
+    budget, used = report.get("budget") or 0, report.get("used") or 0
+    pct = 100 * used / budget if budget else 0
+    line = (f'<small class="caps">Memory cache: {_kb(used)} of {_kb(budget)} '
+            f'<meter min="0" max="100" value="{pct:.0f}" title="{pct:.0f}% used"></meter>')
+    if report.get("psram_total"):
+        line += f' &middot; PSRAM {_kb(report.get("psram_free"))} free of {_kb(report["psram_total"])}'
+    if report.get("heap_free") is not None:
+        line += f' &middot; heap {_kb(report["heap_free"])} free'
+    line += f' &middot; reported {_ago(state.get("at"))}</small>'
+
+    rows = cache_entries(state)
+    if not rows:
+        return line + '<br><small class="caps">Nothing cached.</small>'
+    names = {it["id"]: it["filename"] for it in lib(library.pool)}
+    lis = []
+    for r in rows:
+        name = r["file"] if r["file"] else names.get(r["item_id"], r["item_id"] or r["key"])
+        where = []
+        if "mem" in r:
+            frames = f', {r["frames"]} frames' if r.get("frames") and r["frames"] > 1 else ""
+            where.append(f'memory {_kb(r["mem"])}{frames}')
+        if "card" in r:
+            where.append(f'card {_kb(r["card"])}')
+        extra = []
+        if r["fps"]:
+            extra.append(f'{r["fps"]} fps')
+        if r["framed"]:
+            extra.append("custom framing")
+        if r["file"]:
+            extra.append("SD file")
+        lis.append(
+            f'<li>{"<b>" if r["shown"] else ""}{name}{"</b> &mdash; on screen" if r["shown"] else ""}'
+            f' <small class="caps">{" &middot; ".join(where)}'
+            f'{" (" + ", ".join(extra) + ")" if extra else ""}</small></li>'
+        )
+    in_mem = sum(1 for r in rows if "mem" in r)
+    on_card = sum(1 for r in rows if "card" in r)
+    summary = f"Cached: {in_mem} in memory" + (f", {on_card} on card" if report.get("card") is not None else "")
+    body = f'<ul class="cache">{"".join(lis)}</ul>'
+    if detailed:
+        return f"{line}<br><b>{summary}</b>{body}"
+    return f"{line}<details><summary><small>{summary}</small></summary>{body}</details>"
+
+
+def cache_badge(rows: list[dict], item_id: str) -> str:
+    """Where a library item is cached on the screen, for its row."""
+    mem = sum(r.get("mem", 0) for r in rows if r["item_id"] == item_id)
+    card = sum(r.get("card", 0) for r in rows if r["item_id"] == item_id)
+    if not mem and not card:
+        return ""
+    parts = ([f"memory {_kb(mem)}"] if mem else []) + ([f"card {_kb(card)}"] if card else [])
+    return f'<span class="cached" title="Held by the screen: switching to it needs no download">cached: {" &middot; ".join(parts)}</span>'
+
+
 def still_badge(screen, item: dict | None) -> str:
     if screen is None or not plays_as_still(screen, item):
         return ""
@@ -624,6 +738,27 @@ def get_image(device: str):
             "Content-Length": str(len(body)),
         },
     )
+
+
+@app.post("/d/<device>/state")
+def post_state(device: str):
+    """A screen reporting what it holds. Sent by the screen on change."""
+    device_dir(device)  # validates the name
+    if request.content_length and request.content_length > 64 * 1024:
+        abort(413, "state report too large")
+    report = request.get_json(silent=True)
+    if not isinstance(report, dict):
+        abort(400, "expected a JSON object")
+    lib(library.set_screen_state, device,
+        {"report": report, "at": time.time(), "addr": request.remote_addr})
+    return Response(status=204)
+
+
+@app.get("/d/<device>/state")
+def get_state(device: str):
+    device_dir(device)
+    state = lib(library.screen_state, device) or {}
+    return jsonify({**state, "entries": cache_entries(state)})
 
 
 @app.get("/d/<device>/video")
@@ -1210,6 +1345,7 @@ def device_page(device: str):
     else:
         current = "<p><i>No content yet.</i></p>"
 
+    cache_rows = cache_entries(lib(library.screen_state, device))
     used_state = lib(library.used, device)
     used = lib(library.used_items, device)
     unused = lib(library.unused_items, device)
@@ -1244,7 +1380,7 @@ def device_page(device: str):
             f'{grip}'
             f'<img src="{thumb_src(it)}" width="80" height="48" alt="" loading="lazy">'
             f'<span class="who"><b>{num}{it["filename"]}</b> {motion_badge(it)} '
-            f'{still_badge(screen, it)}<br>'
+            f'{still_badge(screen, it)} {cache_badge(cache_rows, it["id"])}<br>'
             f'<small>{it["source_size"][0]}x{it["source_size"][1]}, '
             f'{it["bytes"] // 1024} kB, {when}'
             f'{" &mdash; <b>on screen</b>" if is_current else ""}</small></span>'
@@ -1348,12 +1484,16 @@ def device_page(device: str):
   .still {{ font-size: .75rem; color: #a60; border: 1px solid #a60;
             border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
   .caps {{ color: #666; }}
+  .cached {{ font-size: .75rem; color: #2458b3; border: 1px solid #2458b3;
+             border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
+  ul.cache {{ margin: .3rem 0; padding-left: 1.2rem; font-size: .9rem; }}
   .sdon {{ color: #1a7f37; }}
   .sdwarn {{ color: #a60; }}
   meter {{ width: 4rem; height: .7rem; vertical-align: middle; }}
 </style>
 <h1>{device}</h1>
 <p>{caps_html(screen) if screen else '<small class="caps">offline &mdash; capabilities unknown</small>'}</p>
+<div>{memory_html(device, detailed=True)}</div>
 {current}
 
 <fieldset>
@@ -1454,6 +1594,9 @@ def index():
                 status += f' <small class="err">({sc.last_error})</small>'
         else:
             status = '<span class="off">&#9675; offline</span>'
+        # Last report, even while offline: it is what the screen held then.
+        if mem := memory_html(name):
+            status += f"<br>{mem}"
 
         # "Dropdown with preview": a details/summary holding a strip of
         # thumbnails. A <select> cannot show pictures, and picking an image by
@@ -1538,6 +1681,9 @@ def index():
   .still {{ font-size: .75rem; color: #a60; border: 1px solid #a60;
             border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
   .caps {{ color: #666; }}
+  .cached {{ font-size: .75rem; color: #2458b3; border: 1px solid #2458b3;
+             border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
+  ul.cache {{ margin: .3rem 0; padding-left: 1.2rem; font-size: .9rem; }}
   .sdon {{ color: #1a7f37; }}
   .sdwarn {{ color: #a60; }}
   meter {{ width: 4rem; height: .7rem; vertical-align: middle; }}

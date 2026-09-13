@@ -238,6 +238,30 @@ interval:
           if (id(clip_loaded_name).state != key)
             id(clip_loaded_name).publish_state(key);
 
+          // Tell the content server what this screen holds -- pushed, never
+          // polled: only when the cache or the item on screen changed, a
+          // second after the last change so a burst sends one report. The
+          // server's address comes from the content URL it gave us.
+          static uint32_t sent_rev = UINT32_MAX;
+          static uint32_t seen_rev = UINT32_MAX;
+          static uint32_t changed_at = 0;
+          static uint32_t retry_at = 0;
+          const uint32_t rev = id(clip)->cache_revision();
+          if (rev != seen_rev) {
+            seen_rev = rev;
+            changed_at = now;
+          }
+          const std::string &curl = id(content_url).state;
+          const auto img = curl.find("/image?");
+          if (rev != sent_rev && now - changed_at >= 1000 && (int32_t) (now - retry_at) >= 0 &&
+              img != std::string::npos && wifi::global_wifi_component->is_connected()) {
+            if (id(clip)->push_report(curl.substr(0, img) + "/state")) {
+              sent_rev = rev;
+            } else {
+              retry_at = now + 30000;  // server away; try again, not every tick
+            }
+          }
+
 switch:
   # An override, not a prerequisite: on by default, so a clip plays without
   # anyone pressing anything. Off freezes on the current frame.
