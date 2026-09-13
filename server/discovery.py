@@ -96,6 +96,9 @@ class Screen:
     anim: tuple[str, ...] | None = None
     # Stores stills on an SD card (when one is mounted).
     sd: bool = False
+    # How clips reach the screen: "mjpeg" (one /clip.mjpeg download, played
+    # from memory) or "frames" (per-frame fetches). None: firmware predates it.
+    clip: str | None = None
     # Live card state read back from the screen (see Registry.refresh_sd):
     # {"mounted", "in_use", "total_mb", "free_mb", "at"}, or None if never read.
     sd_state: dict | None = None
@@ -129,6 +132,7 @@ class Screen:
             "img": list(self.img),
             "anim": None if self.anim is None else list(self.anim),
             "sd": self.sd,
+            "clip": self.clip,
         }
 
     def can_animate(self, source_format: str) -> bool:
@@ -139,7 +143,8 @@ class Screen:
     def config_key(self) -> tuple:
         """Everything that, when it changes, means the screen needs re-pushing."""
         return (self.host, self.port, self.width, self.height, self.fmt,
-                self.quality, self.rot, self.round, self.img, self.anim, self.sd)
+                self.quality, self.rot, self.round, self.img, self.anim, self.sd,
+                self.clip)
 
 
 def _csv(value: str | None) -> tuple[str, ...] | None:
@@ -362,11 +367,41 @@ class Registry:
                     self.refresh_sd(screen)
             time.sleep(interval)
 
+    def push_url(self, screen: Screen) -> bool:
+        """Re-send the content URL if it changed since the screen was configured.
+
+        The URL's `v` token names the current content (item + framing), so a
+        screen that caches content can tell from the URL alone whether it
+        already holds what it is being switched to -- and show it without
+        pulling anything. Returns True if a new URL was delivered.
+        """
+        url = self.content_url_for(screen)
+        if url == screen.configured_url:
+            return False
+        base = f"http://{screen.host}:{screen.port}"
+        for path in TEXT_SET_PATHS:
+            try:
+                r = requests.post(base + path, params={"value": url}, timeout=HTTP_TIMEOUT)
+            except requests.RequestException as exc:
+                log.warning("url push to %s failed: %s", screen.name, exc)
+                return False
+            if r.status_code == 200:
+                with self._lock:
+                    screen.configured_url = url
+                log.info("switched %s -> %s", screen.name, url)
+                return True
+            if r.status_code != 404:
+                return False
+        return False
+
     def notify(self, device: str) -> int:
         """Push: make every screen for `device` fetch now. Returns how many."""
         pushed = 0
         for screen in self.for_device(device):
             base = f"http://{screen.host}:{screen.port}"
+            # URL first: a caching screen decides from it whether the refresh
+            # below needs the network at all.
+            self.push_url(screen)
             for path in BUTTON_PRESS_PATHS:
                 try:
                     r = requests.post(base + path, timeout=HTTP_TIMEOUT)
@@ -437,6 +472,7 @@ class _Listener(ServiceListener):
             img=_csv(txt.get("img")) or (txt.get("fmt", "jpeg"),),
             anim=_csv(txt.get("anim")),
             sd=txt.get("sd", "0") in ("1", "true", "yes"),
+            clip=(txt.get("clip") or "").strip().lower() or None,
         )
 
         if (needs_config := self.registry.put(name, screen)) is not None:

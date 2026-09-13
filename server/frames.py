@@ -132,6 +132,56 @@ def synthetic(n: int, w: int, h: int) -> Image.Image:
     return img
 
 
+def durations(body: bytes | None) -> list[int]:
+    """Per-frame display time in ms, from the best available source.
+
+    Same rule as describe_motion(): a missing or zero duration means "as fast
+    as you can", which browsers treat as ~100 ms, so that is what we use too.
+    """
+    if body is not None and is_animated(body):
+        with Image.open(io.BytesIO(body)) as im:
+            return [int(f.info.get("duration") or 0) or 100
+                    for f in ImageSequence.Iterator(im)]
+    return [100] * SYNTHETIC_FRAMES
+
+
+def resample(durs: list[int], fps: int) -> list[int]:
+    """Source frame index for each output frame of one cycle played at `fps`.
+
+    Output frame k shows whichever source frame is on screen at t = k/fps, so
+    a clip keeps its real speed whatever rate the device plays at: a slow GIF
+    repeats frames, a fast one drops them. At least one frame, always.
+    """
+    total = sum(durs)
+    count = max(1, round(total * fps / 1000))
+    out: list[int] = []
+    src, ends = 0, durs[0]
+    for k in range(count):
+        t = k * 1000 / fps
+        while t >= ends and src < len(durs) - 1:
+            src += 1
+            ends += durs[src]
+        out.append(src)
+    return out
+
+
+def iter_frames(body: bytes | None, indices: list[int], w: int, h: int):
+    """Yield (index, RGB image) for each DISTINCT index, in ascending order.
+
+    One open and forward seeks only. extract() reopens and seeks per call,
+    which for a long GIF is quadratic -- fine for one frame, not for a clip.
+    """
+    wanted = sorted(set(indices))
+    if body is not None and is_animated(body):
+        with Image.open(io.BytesIO(body)) as im:
+            for n in wanted:
+                im.seek(n)
+                yield n, im.convert("RGB")
+        return
+    for n in wanted:
+        yield n, synthetic(n, w, h)
+
+
 def source_info(body: bytes | None) -> dict:
     """What the device is about to play, for the UI and the API."""
     if body is not None and is_animated(body):

@@ -33,6 +33,7 @@ Each screen also says what it can do, in the same TXT record:
 | `img` | `jpeg,rgb565` | still formats the firmware accepts |
 | `anim` | `gif,apng,webp` or `none` | animation sources it can play |
 | `sd` | `0` / `1` | stores stills on an SD card when one is mounted |
+| `clip` | `frames` / `mjpeg` | how it takes clips: per-frame fetches, or one `/clip.mjpeg` |
 
 The server acts on these. An animated item whose format is not in `anim` is
 pushed as **1 frame**, so the screen never starts a clip cache and simply shows
@@ -151,7 +152,37 @@ many live screens were told to refresh.
 | `DELETE` | `/d/<device>/content` | Clear content |
 | `GET` | `/d/<device>/meta` | Stored content metadata (JSON) |
 | `GET` | `/d/<device>/image` | Render for a device — **what the screen calls** |
+| `GET` | `/d/<device>/clip.mjpeg` | The whole clip as one TTMJ file (`w`, `h`, `q`, `fps`, `max`) |
 | `GET` | `/healthz` | Liveness + whether QOI is available |
+
+### Clips as one file (`/clip.mjpeg`)
+
+A screen with `clip=mjpeg` downloads its clip in one request and plays it from
+memory. The response is a small container of baseline JPEGs, all
+little-endian:
+
+```
+header   "TTMJ"  u16 version=1  u16 w  u16 h  u16 fps  u32 count
+record   u32 len, then len bytes of JPEG                (count times)
+```
+
+- **Resampled to `fps`.** Output frame *k* is whichever source frame is on
+  screen at *k*/`fps`, so a clip keeps its real speed at any playback rate.
+  Repeated frames reuse the same JPEG bytes. There are no per-frame delays.
+- **Capped at `max` bytes.** Trailing frames are dropped whole to fit the
+  screen's memory budget. `X-Frame-Count` says how many were kept, and 413 means
+  even the first frame is too big.
+- **Framed like a still.** It uses the screen's stored fit, rotation, zoom and
+  background. An `ETag` makes an unchanged clip a 304.
+- **A still is one frame.** So is a clip in a format the screen didn't
+  advertise. Only a screen with no content gets the synthetic test clip.
+
+**Switching pushes the URL.** Selecting an item, uploading, or changing prefs
+re-sends the content URL whenever it changed, then presses Refresh. The URL's
+`v` token is the item id, plus a short hash of the screen's prefs when it has
+any. The same item with the same framing always gives the same URL, so a
+caching screen can switch back to content it already holds without
+downloading it again.
 
 ### Framing from the device page
 

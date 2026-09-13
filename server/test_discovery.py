@@ -120,6 +120,7 @@ def main() -> int:
             "img": "jpeg,rgb565",
             "anim": "gif",
             "sd": "1",
+            "clip": "mjpeg",
         },
     )
 
@@ -186,7 +187,7 @@ def main() -> int:
         results.append(
             check("capabilities parsed from mDNS",
                   caps == {"x": 800, "y": 480, "round": False, "img": ["jpeg", "rgb565"],
-                           "anim": ["gif"], "sd": True},
+                           "anim": ["gif"], "sd": True, "clip": "mjpeg"},
                   str(caps))
         )
         r = client.get("/devices")
@@ -299,6 +300,50 @@ def main() -> int:
         )
         r = client.get(f"/d/{DEVICE}/")
         results.append(check("device page badges it as a still", b"still here" in r.data))
+
+        # A caching screen decides from the URL alone whether it already holds
+        # what it is switched to, so every switch must deliver the URL, and the
+        # URL must name item + framing exactly.
+        print("\nswitching pushes a URL that names the content")
+        def v_of(u):
+            return parse_qs(urlparse(u).query).get("v", [None])[0]
+        items = client.get(f"/d/{DEVICE}/items").get_json()
+        apng_url = received["set_url"][-1]
+        results.append(check("the last upload pushed its own URL",
+                             v_of(apng_url) == items["current"], str(v_of(apng_url))))
+        gif_id = next(it["id"] for it in items["used"]
+                      if str(it.get("source_format", "")).upper() == "GIF")
+        before = len(received["set_url"])
+        client.post(f"/d/{DEVICE}/items/{gif_id}/select")
+        results.append(check("a switch pushes the new URL",
+                             len(received["set_url"]) == before + 1
+                             and v_of(received["set_url"][-1]) == gif_id,
+                             str(received["set_url"][-1:])))
+        gif_url = received["set_url"][-1]
+        client.post(f"/d/{DEVICE}/items/{items['current']}/select")
+        client.post(f"/d/{DEVICE}/items/{gif_id}/select")
+        results.append(check("switching back gives the identical URL",
+                             received["set_url"][-1] == gif_url))
+        before = len(received["set_url"])
+        client.post(f"/d/{DEVICE}/items/{gif_id}/select")
+        results.append(check("re-selecting the current item pushes no URL",
+                             len(received["set_url"]) == before))
+        client.post(f"/d/{DEVICE}/prefs", json={"rot": 180})
+        rot_url = received["set_url"][-1]
+        results.append(check("a framing change is a different token",
+                             rot_url != gif_url and v_of(rot_url).startswith(gif_id + "."),
+                             str(v_of(rot_url))))
+        client.post(f"/d/{DEVICE}/prefs", json={"reset": 1})
+        results.append(check("and resetting it restores the original",
+                             received["set_url"][-1] == gif_url))
+        r = client.get(f"/d/{DEVICE}/clip.mjpeg?w=80&h=80&fps=10")
+        results.append(check("a clip in a played format is many frames",
+                             r.status_code == 200 and int(r.headers["X-Frame-Count"]) > 1,
+                             r.headers.get("X-Frame-Count")))
+        client.post(f"/d/{DEVICE}/items/{items['current']}/select")
+        r = client.get(f"/d/{DEVICE}/clip.mjpeg?w=80&h=80&fps=10")
+        results.append(check("an unplayable format is one frame",
+                             r.headers.get("X-Frame-Count") == "1", r.headers.get("X-Frame-Count")))
 
         print("\nserving what the screen was told to fetch")
         path = urlparse(url).path + "?" + urlparse(url).query

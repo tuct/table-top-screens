@@ -1,0 +1,350 @@
+# MJPEG content -- stills AND clips -- held in memory and on the SD card, and
+# decoded straight to the panel. Modelled on github.com/derdacavga/video-Player.
+#
+# Every piece of content is an ITEM: the server's /clip.mjpeg for it, one
+# frame for a still, many for a clip. Items are named by a key taken from the
+# content URL the server pushes -- its `v` token covers the picture AND its
+# framing -- plus the playback rate. So:
+#
+#   switch to something shown before  ->  from memory, instantly, no network
+#   ... evicted from memory           ->  from the card, no network
+#   ... never seen                    ->  downloaded once: onto the card if one
+#                                         is mounted, else straight into memory
+#
+# Memory holds cache_bytes (5 MB) of items, least recently shown evicted first;
+# one item is at most max_bytes (4 MB), so longer clips are cut to whole frames.
+# The card keeps every item it is given, in /mjpeg/cache.
+#
+# Decoding per frame works because sd_clip drives JPEGDEC directly, in RGB565,
+# one block per draw_pixels_at(). ESPHome's image decoder spends its ~1.8 s a
+# frame on per-pixel output, not on the JPEG (see components/sd_clip/sd_clip.h).
+#
+# Files copied onto the card by hand go in /mjpeg (.mjp, .mjpg, .mjpeg): the
+# server's TTMJ, or plain ffmpeg MJPEG such as video-Player's converter output.
+# Pick one with "Next SD Clip" or by typing its name into "SD Clip". New content
+# from the server replaces the pick.
+#
+# Requires common/content-pull.yaml and common/sd-card.yaml, listed before this
+# file. Do not combine with sd-still.yaml: both would take the still fetches.
+
+substitutions:
+  anim_formats: gif,apng,webp
+  clip_transport: mjpeg
+  clip_max_bytes: "4000000"
+  clip_cache_bytes: "5000000"
+  clip_quality: "80"
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [sd_clip]
+
+sd_clip:
+  id: clip
+  width: ${display_width}
+  height: ${display_height}
+  max_bytes: ${clip_max_bytes}
+  cache_bytes: ${clip_cache_bytes}
+
+globals:
+  - id: mjpeg_frames_prev
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+number:
+  # Clip playback rate, and the rate the server resamples clips to. Part of an
+  # item's key, so a new rate is a new download once; switching back is not.
+  # A hand-copied file just plays at it.
+  - platform: template
+    name: Target FPS
+    id: clip_target_fps
+    optimistic: true
+    restore_value: true
+    initial_value: "15"
+    min_value: 1
+    max_value: 30
+    step: 1
+    mode: box
+    entity_category: config
+    on_value:
+      - lambda: 'id(clip)->set_fps(x);'
+
+text:
+  # A clip file in /mjpeg to show instead of the server's content. Empty = the
+  # server's content. Restored, so a reboot shows it with no network at all.
+  - platform: template
+    name: SD Clip
+    id: sd_clip_file
+    optimistic: true
+    restore_value: true
+    mode: text
+    min_length: 0
+    max_length: 64
+
+interval:
+  - interval: 250ms
+    then:
+      - lambda: |-
+          static const uint32_t MIN_GAP_MS = 2000;
+          static uint32_t next_ms = 0;
+          static uint32_t failures = 0;
+          static std::string last_want;
+          static bool pending = true;
+          static bool url_seen = false;
+          static std::string seen_url;
+          const uint32_t now = millis();
+          using esphome::sd_clip::SdClip;
+
+          // Fetches (Refresh, boot retry, background poll) come to us, not to
+          // online_image. Cheap when the item is already held: no network.
+          id(content_external) = true;
+          if (id(still_fetch_pending)) {
+            id(still_fetch_pending) = false;
+            pending = true;
+          }
+
+          // A different content URL is new content from the server, and new
+          // content replaces a hand-picked file. The first look only records
+          // the URL restored at boot.
+          if (!url_seen) {
+            url_seen = true;
+            seen_url = id(content_url).state;
+          } else if (id(content_url).state != seen_url) {
+            seen_url = id(content_url).state;
+            if (!id(sd_clip_file).state.empty()) {
+              ESP_LOGI("mjpeg", "New content from the server replaces %s",
+                       id(sd_clip_file).state.c_str());
+              id(sd_clip_file).make_call().set_value("").perform();
+            }
+          }
+
+          switch (id(clip)->take_item_event()) {
+            case SdClip::ITEM_SHOWN:
+              failures = 0;
+              id(content_on_sd) = true;     // the panel is ours: no repaints
+              id(content_loaded) = true;    // stops the boot checklist
+              id(loading) = false;
+              id(status_text) = "";
+              id(video_active) = id(clip)->shown_frames() > 1;
+              break;
+            case SdClip::ITEM_FAILED: {
+              failures++;
+              // 2 s, 4 s, 6 s; then 30 s doubling to a 5 minute ceiling.
+              uint32_t delay_ms = failures <= 3
+                  ? MIN_GAP_MS * failures
+                  : std::min<uint32_t>(30000u << std::min<uint32_t>(failures - 4, 4), 300000u);
+              next_ms = now + delay_ms;
+              pending = true;
+              id(loading) = false;
+              if (!id(content_on_sd))
+                id(status_text) = "Could not load content";
+              ESP_LOGW("mjpeg", "Content failed (%u in a row); retrying in %u s",
+                       (unsigned) failures, (unsigned) (delay_ms / 1000));
+              break;
+            }
+            default:
+              break;
+          }
+
+          // What should be on the panel: a hand-picked file, or the server's
+          // current content at the current rate.
+          const std::string &file = id(sd_clip_file).state;
+          const std::string &url = id(content_url).state;
+          std::string key;
+          if (file.empty() && !url.empty()) {
+            // The server's token names item + framing. Without one (an older
+            // server), fall back to hashing the whole URL.
+            auto v = url.find("v=");
+            if (v != std::string::npos && (v == 0 || url[v - 1] == '?' || url[v - 1] == '&')) {
+              auto end = url.find('&', v);
+              key = url.substr(v + 2, end == std::string::npos ? std::string::npos : end - v - 2);
+            } else {
+              key = str_sprintf("u%08x", (unsigned) fnv1_hash(url));
+            }
+            key += "-f" + to_string((int) id(clip_target_fps).state) + "-q${clip_quality}";
+          }
+          const std::string want = file.empty() ? key : "file:" + file;
+          if (want != last_want) {
+            last_want = want;
+            pending = true;
+            failures = 0;
+            next_ms = now;
+          }
+          if (!pending || want.empty() || (int32_t) (now - next_ms) < 0)
+            return;
+
+          bool started;
+          if (!file.empty()) {
+            if (!id(sd)->is_mounted())
+              return;  // the card may still be mounting
+            started = id(clip)->request_file(file);
+          } else {
+            // sd_clip looks in memory, then on the card, and only uses the URL
+            // for an item held in neither -- so it is only offered when the
+            // network is actually there.
+            const bool local = id(clip)->has_item(key);
+            const bool online = wifi::global_wifi_component->is_connected();
+            if (!local && !online)
+              return;
+            std::string u;
+            auto pos = url.find("/image?");
+            if (online && pos != std::string::npos) {
+              u = url;
+              u.replace(pos, 7, "/clip.mjpeg?");
+              u += "&q=${clip_quality}";
+              u += "&fps=" + to_string((int) id(clip_target_fps).state);
+              u += "&max=" + to_string((unsigned) id(clip)->max_bytes());
+            }
+            if (!local) {
+              if (u.empty()) {
+                ESP_LOGW("mjpeg", "Content URL has no /image? to derive a clip URL from");
+                pending = false;
+                return;
+              }
+              ESP_LOGI("mjpeg", "Fetching %s", key.c_str());
+              id(loading) = true;
+            }
+            started = id(clip)->request_item(key, u);
+          }
+          if (started)
+            pending = false;
+
+  # Achieved, not requested: the number that says whether decoding per frame
+  # keeps up.
+  - interval: 1s
+    then:
+      - lambda: |-
+          static uint32_t window = 0;
+          const uint32_t now = millis();
+          const uint32_t shown = id(clip)->frames_shown();
+          if (window != 0 && now > window)
+            id(clip_fps).publish_state((shown - id(mjpeg_frames_prev)) * 1000.0f / (now - window));
+          window = now;
+          id(mjpeg_frames_prev) = shown;
+          const int frames = id(clip)->shown_frames();
+          id(clip_frames_loaded).publish_state(frames);
+          id(clip_cache_items).publish_state(id(clip)->cache_count());
+          id(clip_cache_kb).publish_state(id(clip)->cache_used() / 1024.0f);
+          if (frames > 0) {
+            id(clip_decode_ms).publish_state(id(clip)->last_decode_ms());
+            id(clip_load_ms).publish_state(id(clip)->last_load_ms());
+            id(clip_kb).publish_state(id(clip)->shown_bytes() / 1024.0f);
+            const float fps = id(clip_target_fps).state;
+            id(clip_seconds).publish_state(frames > 1 && fps > 0 ? frames / fps : 0);
+          }
+          const std::string key = id(clip)->shown_key();
+          if (id(clip_loaded_name).state != key)
+            id(clip_loaded_name).publish_state(key);
+
+switch:
+  # An override, not a prerequisite: on by default, so a clip plays without
+  # anyone pressing anything. Off freezes on the current frame.
+  - platform: template
+    name: Play Cached Clip
+    id: clip_play
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: 'id(clip)->set_playing(true);'
+    turn_off_action:
+      - lambda: 'id(clip)->set_playing(false);'
+
+button:
+  # Cycle through the clips on the card, then back to the server's content.
+  - platform: template
+    name: Next SD Clip
+    id: next_sd_clip
+    on_press:
+      - lambda: |-
+          auto files = id(clip)->list_mjpegs();
+          if (files.empty()) {
+            ESP_LOGW("mjpeg", "No clips in /mjpeg on the card");
+            return;
+          }
+          const std::string &cur = id(sd_clip_file).state;
+          std::string next = files[0];
+          if (!cur.empty()) {
+            auto at = std::find(files.begin(), files.end(), cur);
+            next = (at == files.end() || at + 1 == files.end()) ? "" : *(at + 1);
+          }
+          ESP_LOGI("mjpeg", "Next: %s", next.empty() ? "(server content)" : next.c_str());
+          id(sd_clip_file).make_call().set_value(next).perform();
+
+  - platform: template
+    name: SD List Clips
+    id: sd_list_clips
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          auto files = id(clip)->list_mjpegs();
+          ESP_LOGI("mjpeg", "%u clip(s) in /mjpeg:", (unsigned) files.size());
+          for (auto &f : files)
+            ESP_LOGI("mjpeg", "  %s (%u KB)", f.c_str(),
+                     (unsigned) (id(sd)->file_size("/mjpeg/" + f) / 1024));
+          ESP_LOGI("mjpeg", "%u item(s) in memory, %u KB", (unsigned) id(clip)->cache_count(),
+                   (unsigned) (id(clip)->cache_used() / 1024));
+
+sensor:
+  - platform: template
+    name: Clip FPS
+    id: clip_fps
+    unit_of_measurement: fps
+    accuracy_decimals: 1
+    entity_category: diagnostic
+
+  - platform: template
+    name: Clip Frames Loaded
+    id: clip_frames_loaded
+    accuracy_decimals: 0
+    entity_category: diagnostic
+
+  - platform: template
+    name: Clip Seconds
+    id: clip_seconds
+    unit_of_measurement: s
+    accuracy_decimals: 1
+    entity_category: diagnostic
+
+  - platform: template
+    name: Clip Size
+    id: clip_kb
+    unit_of_measurement: KB
+    accuracy_decimals: 0
+    entity_category: diagnostic
+
+  - platform: template
+    name: Memory Cache Items
+    id: clip_cache_items
+    accuracy_decimals: 0
+    entity_category: diagnostic
+
+  - platform: template
+    name: Memory Cache
+    id: clip_cache_kb
+    unit_of_measurement: KB
+    accuracy_decimals: 0
+    entity_category: diagnostic
+
+  # Decode + panel push for one frame. If this is near 1000 / Target FPS, the
+  # SPI panel, not the decoder, is the limit.
+  - platform: template
+    name: Clip Decode
+    id: clip_decode_ms
+    unit_of_measurement: ms
+    accuracy_decimals: 1
+    entity_category: diagnostic
+
+  - platform: template
+    name: Clip Load
+    id: clip_load_ms
+    unit_of_measurement: ms
+    accuracy_decimals: 0
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: template
+    name: Showing
+    id: clip_loaded_name
+    entity_category: diagnostic

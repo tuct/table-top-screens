@@ -44,6 +44,29 @@ def sample_png(w: int = 1200, h: int = 900) -> bytes:
     return buf.getvalue()
 
 
+def parse_clip(data: bytes) -> dict | None:
+    """Read a TTMJ container the way the firmware does, bounds-checked."""
+    head = srv.CLIP_HEADER
+    if len(data) < head.size:
+        return None
+    magic, version, w, h, fps, count = head.unpack_from(data)
+    if magic != b"TTMJ" or version != 1:
+        return None
+    pos, out = head.size, []
+    for _ in range(count):
+        if pos + 4 > len(data):
+            return None
+        (n,) = srv.CLIP_RECORD.unpack_from(data, pos)
+        pos += 4
+        if pos + n > len(data):
+            return None
+        out.append(data[pos:pos + n])
+        pos += n
+    if pos != len(data):
+        return None
+    return {"w": w, "h": h, "fps": fps, "frames": out}
+
+
 def main() -> int:
     srv.DATA_DIR = DATA_TEST
     if DATA_TEST.exists():
@@ -343,6 +366,57 @@ def main() -> int:
     check("rotation applied to frames",
           c.get("/d/vid/frame?n=0&w=240&h=240&fmt=png").data != a)
     c.post("/d/vid/prefs", json={"reset": 1})
+
+    print("\nclip.mjpeg (whole clip, resampled to fps, for playback from memory)")
+    # 8 frames x 80 ms = 640 ms of source.
+    r = c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=10")
+    check("clip serves", r.status_code == 200, str(r.status_code))
+    clip = parse_clip(r.data)
+    check("TTMJ header parses", clip is not None)
+    if clip is not None:
+        check("header carries the panel size and fps",
+              (clip["w"], clip["h"], clip["fps"]) == (240, 240, 10), str(clip["w"]))
+        check("10 fps over 640 ms is 6 frames", len(clip["frames"]) == 6,
+              str(len(clip["frames"])))
+        check("X-Frame-Count agrees", r.headers.get("X-Frame-Count") == "6",
+              str(r.headers.get("X-Frame-Count")))
+        ok = True
+        for jpeg in clip["frames"]:
+            with Image.open(io.BytesIO(jpeg)) as out:
+                ok = ok and out.format == "JPEG" and out.size == (240, 240) \
+                    and "progression" not in out.info
+        check("every frame is a baseline 240x240 JPEG", ok)
+    fast = parse_clip(c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=20").data)
+    check("20 fps over 640 ms is 13 frames", fast is not None and len(fast["frames"]) == 13,
+          str(fast and len(fast["frames"])))
+    if fast is not None:
+        # t=0,50 ms -> source 0; t=100 ms -> source 1. Repeats reuse the bytes.
+        check("resampling repeats a frame that is still on screen",
+              fast["frames"][0] == fast["frames"][1] != fast["frames"][2])
+    etag = r.headers.get("ETag")
+    r2 = c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=10", headers={"If-None-Match": etag})
+    check("unchanged clip is an empty 304", r2.status_code == 304 and not r2.data,
+          str(r2.status_code))
+    check("a different fps is a different clip",
+          c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=20").headers.get("ETag") != etag)
+    one = len(clip["frames"][0]) if clip else 0
+    budget = srv.CLIP_HEADER.size + 2 * (srv.CLIP_RECORD.size + one) + 8
+    r = c.get(f"/d/vid/clip.mjpeg?w=240&h=240&fps=10&max={budget}")
+    small = parse_clip(r.data)
+    check("max truncates to whole frames", small is not None and 1 <= len(small["frames"]) < 6
+          and len(r.data) <= budget, f"{len(r.data)} bytes")
+    check("a budget below one frame is 413",
+          c.get("/d/vid/clip.mjpeg?w=240&h=240&max=64").status_code == 413)
+    check("bad fps rejected", c.get("/d/vid/clip.mjpeg?fps=0").status_code == 400)
+    still = parse_clip(c.get("/d/tabletop-01/clip.mjpeg?w=64&h=64&fps=5").data)
+    check("a still is a one-frame clip", still is not None and len(still["frames"]) == 1,
+          str(still and len(still["frames"])))
+    if still is not None:
+        with Image.open(io.BytesIO(still["frames"][0])) as out:
+            check("which is the still at the panel size", out.size == (64, 64), str(out.size))
+    empty = parse_clip(c.get("/d/nobody-here/clip.mjpeg?w=64&h=64&fps=5").data)
+    check("no content at all gets the synthetic test clip",
+          empty is not None and len(empty["frames"]) > 1)
     c.delete("/d/vid/content")
 
     print("\nrejections")

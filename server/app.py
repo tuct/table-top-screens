@@ -26,6 +26,7 @@ import logging
 import mimetypes
 import os
 import re
+import struct
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -130,18 +131,31 @@ def _frames_for(screen) -> int:
 
 
 def _version_for(device: str) -> str | None:
-    """A token that changes whenever `device`'s current image changes.
+    """A token that names exactly what `device` is showing: item + framing.
 
-    The pool stores items under a content hash, so the item id is already
-    exactly that: same picture, same token; different picture, different token.
-    It rides along in the content URL so a device caching frames by index can
-    tell that the clip underneath it has been replaced.
+    The pool stores items under a content hash, so the item id already names
+    the picture. The screen's stored prefs (fit, rotation, zoom, background,
+    quality) change what it receives just as much, so they are folded in: a
+    screen that caches rendered content by this token must never be handed a
+    token it already holds for different pixels. And the same item with the
+    same prefs always gives the same token, which is what lets a screen switch
+    back to something it has without pulling it again.
     """
     try:
         item = library.current(DATA_DIR, device)
     except library.LibraryError:
         return None
-    return (item or {}).get("id")
+    item_id = (item or {}).get("id")
+    if not item_id:
+        return None
+    try:
+        prefs = library.prefs(DATA_DIR, device)
+    except library.LibraryError:
+        prefs = {}
+    if not prefs:
+        return item_id
+    digest = hashlib.sha256(json.dumps(prefs, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"{item_id}.{digest[:8]}"
 
 
 registry.frames_provider = _frames_for
@@ -149,6 +163,10 @@ registry.version_provider = _version_for
 
 # (device, source_hash, params) -> (body, content_type)
 _render_cache: OrderedDict[tuple, tuple[bytes, str]] = OrderedDict()
+# (source_hash, params) -> (clip bytes, frame count). Few entries: a clip is
+# megabytes, and only the screens' current clips are ever asked for.
+_clip_cache: OrderedDict[tuple, tuple[bytes, int]] = OrderedDict()
+CLIP_CACHE_SIZE = 4
 
 
 # --------------------------------------------------------------------------
@@ -245,6 +263,8 @@ def caps_html(screen) -> str:
     if screen.round:
         parts.append("round")
     parts += [motion, "img " + "/".join(screen.img)]
+    if screen.clip:
+        parts.append("clips " + screen.clip)
     html = '<small class="caps">' + " &middot; ".join(parts) + "</small>"
     if screen.sd:
         html += "<br>" + sd_html(screen.sd_state)
@@ -616,6 +636,149 @@ def video_info(device: str):
     return jsonify(info)
 
 
+def _framing(device: str) -> tuple[str, int, int, str]:
+    """(fit, rot, zoom, bg) from the screen's own preferences.
+
+    Clips follow them so video is cropped and rotated the same way the screen's
+    stills are. Bad stored values fall back rather than failing a clip.
+    """
+    prefs = read_prefs(device)
+    fit = str(prefs.get("fit", "cover")).lower()
+    fit = FIT_ALIASES.get(fit, fit)
+    if fit not in FIT_MODES:
+        fit = "cover"
+    rot = int(prefs.get("rot", 0)) % 360
+    if rot not in ROTATIONS:
+        rot = 0
+    zoom = max(ZOOM_MIN, min(ZOOM_MAX, int(prefs.get("zoom", 100))))
+    bg = str(prefs.get("bg", "black"))
+    return fit, rot, zoom, bg
+
+
+# TTMJ: the clip container the screens load into PSRAM. Little-endian:
+#   header   "TTMJ" u16 version, u16 w, u16 h, u16 fps, u32 count
+#   record   u32 len, then len bytes of baseline JPEG      (count times)
+# No per-frame delays: the clip is resampled to `fps` here, so the device
+# plays at one fixed rate and "how long fits" is simply bytes / fps.
+CLIP_MAGIC = b"TTMJ"
+CLIP_VERSION = 1
+CLIP_HEADER = struct.Struct("<4sHHHHI")
+CLIP_RECORD = struct.Struct("<I")
+CLIP_QUALITY = 80
+CLIP_MAX_BYTES = 64 * 1024 * 1024
+
+
+class ClipTooLarge(Exception):
+    """Even the first frame does not fit the device's byte budget."""
+
+
+def build_clip(body: bytes | None, w: int, h: int, fps: int, max_bytes: int,
+               framing: tuple, still: bool = False) -> tuple[bytes, int]:
+    """One cycle of the clip at `fps`, as TTMJ, truncated to `max_bytes`.
+
+    Frames are encoded once per distinct SOURCE frame: resampling a slow GIF
+    to a high rate repeats frames, and repeats reuse the same JPEG bytes.
+    """
+    fit, quality, bg, rot, zoom = framing
+    if still:
+        # A still is a one-frame clip, so a screen can hold stills and clips in
+        # the same cache and show both through one decoder.
+        jpeg, _ = render(body, w, h, "jpeg", fit, quality, bg, rot, zoom)
+        if CLIP_HEADER.size + CLIP_RECORD.size + len(jpeg) > max_bytes:
+            raise ClipTooLarge
+        return (CLIP_HEADER.pack(CLIP_MAGIC, CLIP_VERSION, w, h, fps, 1)
+                + CLIP_RECORD.pack(len(jpeg)) + jpeg), 1
+    indices = frames.resample(frames.durations(body), fps)
+    encoded: dict[int, bytes] = {}
+    for n, img in frames.iter_frames(body, indices, w, h):
+        encoded[n], _ = render_image(img, w, h, "jpeg", fit, quality, bg, rot, zoom)
+
+    parts: list[bytes] = []
+    used = CLIP_HEADER.size
+    for n in indices:
+        jpeg = encoded[n]
+        cost = CLIP_RECORD.size + len(jpeg)
+        if used + cost > max_bytes:
+            break
+        parts.append(CLIP_RECORD.pack(len(jpeg)))
+        parts.append(jpeg)
+        used += cost
+    count = len(parts) // 2
+    if count == 0:
+        raise ClipTooLarge
+    header = CLIP_HEADER.pack(CLIP_MAGIC, CLIP_VERSION, w, h, fps, count)
+    return header + b"".join(parts), count
+
+
+@app.get("/d/<device>/clip.mjpeg")
+def get_clip(device: str):
+    """The screen's whole clip in one download, for playback from memory.
+
+    This replaces fetching /frame n, n+1, ... one request at a time: the device
+    stores this file (on its SD card if it has one) and decodes each JPEG
+    straight to the panel, so neither the network nor a decode buffer sits
+    between frames.
+    """
+    try:
+        w = int(request.args.get("w", 240))
+        h = int(request.args.get("h", 240))
+        quality = int(request.args.get("q", CLIP_QUALITY))
+        fps = int(request.args.get("fps", 15))
+        max_bytes = int(request.args.get("max", 4_000_000))
+    except (TypeError, ValueError):
+        abort(400, "w, h, q, fps and max must be integers")
+    if not (0 < w <= 4096 and 0 < h <= 4096):
+        abort(400, "w/h out of range")
+    if not 1 <= fps <= 60:
+        abort(400, "fps must be 1-60")
+    if not CLIP_HEADER.size < max_bytes <= CLIP_MAX_BYTES:
+        abort(400, f"max must be up to {CLIP_MAX_BYTES} bytes")
+    quality = max(1, min(100, quality))
+
+    fit, rot, zoom, bg = _framing(device)
+    meta = read_meta(device)
+    body = lib(library.body_of, meta["id"]) if meta else None
+    sha = meta["sha256"] if meta else "synthetic"
+    # A still -- or a clip in a format this screen did not advertise -- is one
+    # frame. Only a screen with no content at all gets the synthetic test clip.
+    screens = registry.for_device(device)
+    still = bool(meta) and (
+        not meta.get("animated", frames.is_animated(body))
+        or (bool(screens) and plays_as_still(screens[0], meta))
+    )
+    params = (w, h, fps, max_bytes, fit, quality, bg, rot, zoom, still)
+
+    etag = '"%s"' % hashlib.sha256(
+        (sha + "clip" + repr(params)).encode("utf-8")
+    ).hexdigest()[:32]
+    if request.headers.get("If-None-Match") == etag:
+        return Response(status=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
+
+    key = (sha, params)
+    hit = _clip_cache.get(key)
+    if hit is None:
+        try:
+            hit = build_clip(body, w, h, fps, max_bytes, (fit, quality, bg, rot, zoom), still)
+        except ClipTooLarge:
+            abort(413, "the first frame alone exceeds max")
+        _clip_cache[key] = hit
+        while len(_clip_cache) > CLIP_CACHE_SIZE:
+            _clip_cache.popitem(last=False)
+    else:
+        _clip_cache.move_to_end(key)
+    out, count = hit
+    return Response(
+        out,
+        content_type="application/octet-stream",
+        headers={
+            "ETag": etag,
+            "Cache-Control": "no-cache",
+            "Content-Length": str(len(out)),
+            "X-Frame-Count": str(count),
+        },
+    )
+
+
 @app.get("/d/<device>/frame")
 def get_frame(device: str):
     """One frame of the screen's clip, framed exactly like a still would be.
@@ -642,18 +805,7 @@ def get_frame(device: str):
     if fmt not in ("jpeg", "png", "qoi", "rgb565"):
         abort(400, "fmt must be jpeg, png, qoi or rgb565")
 
-    # Framing follows the screen's own preferences, so video is cropped and
-    # rotated the same way its stills are.
-    prefs = read_prefs(device)
-    fit = FIT_ALIASES.get(str(prefs.get("fit", "cover")).lower(),
-                          str(prefs.get("fit", "cover")).lower())
-    if fit not in FIT_MODES:
-        fit = "cover"
-    rot = int(prefs.get("rot", 0)) % 360
-    if rot not in ROTATIONS:
-        rot = 0
-    zoom = max(ZOOM_MIN, min(ZOOM_MAX, int(prefs.get("zoom", 100))))
-    bg = str(prefs.get("bg", "black"))
+    fit, rot, zoom, bg = _framing(device)
 
     meta = read_meta(device)
     body = lib(library.body_of, meta["id"]) if meta else None

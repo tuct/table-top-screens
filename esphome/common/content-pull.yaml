@@ -23,13 +23,17 @@
 
 # Capability defaults for a screen that has only this package: JPEG stills
 # over the network, no animation, nothing on SD. Packages that add a
-# capability override these -- sd-still.yaml, sd-clip.yaml, video-cache.yaml --
+# capability override these -- sd-still.yaml, sd-clip.yaml, video-cache.yaml,
+# mjpeg-clip.yaml --
 # and must therefore be listed AFTER this one in the device file: between
 # packages, the later one's substitutions win.
 substitutions:
   image_formats: jpeg
   anim_formats: none
   sd_still: "0"
+  # How clips arrive: "frames" (fetched one by one) or "mjpeg" (one
+  # /clip.mjpeg download played from memory, see common/mjpeg-clip.yaml).
+  clip_transport: frames
 
 http_request:
   verify_ssl: false
@@ -71,10 +75,12 @@ mdns:
         #          -- anything else gets the first frame as a still
         #   sd     1 if stills are stored on and shown from an SD card when one
         #          is mounted (the screen falls back to the network otherwise)
+        #   clip   frames | mjpeg -- how this firmware takes clips
         round: ${display_round}
         img: ${image_formats}
         anim: ${anim_formats}
         sd: ${sd_still}
+        clip: ${clip_transport}
 
 globals:
   # Only set when something has gone wrong; shown under the boot checklist.
@@ -164,6 +170,14 @@ globals:
     initial_value: 'false'
 
   - id: content_on_sd
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # A package shows content itself -- common/mjpeg-clip.yaml, from its own
+  # cache -- so fetches go to it (via still_fetch_pending) instead of
+  # online_image, and content_on_sd marks the panel as that package's.
+  - id: content_external
     type: bool
     restore_value: false
     initial_value: 'false'
@@ -332,7 +346,7 @@ script:
       - lambda: 'id(loading) = true;'
       - if:
           condition:
-            lambda: 'return id(still_to_sd);'
+            lambda: 'return id(still_to_sd) || id(content_external);'
           then:
             - lambda: 'id(still_fetch_pending) = true;'
           else:

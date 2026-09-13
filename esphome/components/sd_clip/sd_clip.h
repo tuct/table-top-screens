@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
@@ -11,6 +12,11 @@
 #include "esphome/components/sd_spi/sd_spi.h"
 
 #ifdef USE_ESP32
+
+// JPEGDEC's header defines the class; forward declarations keep it out of
+// every translation unit that includes this one.
+class JPEGDEC;
+struct jpeg_draw_tag;
 
 namespace esphome {
 namespace sd_clip {
@@ -137,7 +143,9 @@ class SdClip : public Component {
   /// 768 KB transfer. Returns false if a fetch could not be started; the result
   /// of one that was is reported through take_still_event().
   bool start_still(const std::string &url);
-  bool still_busy() const { return this->still_http_ != nullptr; }
+  /// True while ANY download is running. Stills and clips share one download
+  /// slot, so a still cannot start while a clip is downloading either.
+  bool still_busy() const { return this->fetch_.http != nullptr; }
   /// Returns and clears the last StillEvent.
   int take_still_event() {
     const int e = this->still_event_;
@@ -148,12 +156,148 @@ class SdClip : public Component {
   /// Blit the still on the card. Returns false if there is none.
   bool show_still();
 
+  // -- MJPEG content: stills and clips ---------------------------------------
+  //
+  // Compressed frames, shown from MEMORY and decoded straight to the panel.
+  //
+  // The raw paths above avoid decoding because ESPHome's image decoder costs
+  // ~1.8 s per 800x480 frame. That cost is not JPEGDEC: runtime_image asks it
+  // for RGB8888 and then pushes every pixel through a virtual draw_pixel()
+  // with float scaling. Asking for RGB565 and handing each decoded block to
+  // draw_pixels_at() -- the approach of github.com/derdacavga/video-Player --
+  // is fast enough to play from, so content can stay compressed: ~3-8 KB a
+  // frame at 240x240 instead of 115 KB raw.
+  //
+  // Everything is an ITEM: a TTMJ file whose frames are JPEGs. A still is an
+  // item with one frame, a clip one with many. Items are named by a key -- the
+  // server's content token, which covers the picture AND its framing -- so an
+  // item with a key we already hold is never downloaded again:
+  //
+  //   memory   PSRAM, least recently used evicted past cache_bytes
+  //   card     /mjpeg/cache/<key>.mjp, kept for good (when a card is mounted)
+  //   network  only for a key in neither
+  //
+  // Files copied onto the card by hand sit in /mjpeg and are items too. Two
+  // formats are accepted:
+  //   TTMJ  "TTMJ" u16 version, u16 w, u16 h, u16 fps, u32 count, then count x
+  //         (u32 len, JPEG). Little-endian. What the server sends.
+  //   raw   JPEGs back to back, as ffmpeg -c:v mjpeg writes them, optionally
+  //         after video-Player's one-byte fps prefix.
+
+  /// What the last request did. Read once with take_item_event().
+  enum ItemEvent {
+    ITEM_NONE = 0,
+    ITEM_SHOWN,    ///< the requested item is on the panel
+    ITEM_FAILED,   ///< it could not be downloaded or read; the panel is unchanged
+  };
+
+  /// Show content `key`: from memory if it is there, else from the card, else
+  /// downloaded from `url` (onto the card when one is mounted, into memory
+  /// otherwise). Content already held never touches the network.
+  ///
+  /// Returns true if the item is shown or on its way (the outcome arrives as
+  /// an ItemEvent), false if nothing could start yet -- the download slot is
+  /// busy, or the item is not local and `url` is empty -- so ask again later.
+  bool request_item(const std::string &key, const std::string &url);
+  /// Show /mjpeg/<name>, a file copied onto the card by hand.
+  bool request_file(const std::string &name);
+  /// True if `key` can be shown without the network.
+  bool has_item(const std::string &key);
+  int take_item_event() {
+    const int e = this->item_event_;
+    this->item_event_ = ITEM_NONE;
+    return e;
+  }
+
+  /// Clip files in /mjpeg (.mjp, .mjpg, .mjpeg), sorted by name.
+  std::vector<std::string> list_mjpegs();
+
+  /// Playback rate for clips. A file's own fps is ignored: the server
+  /// resamples to this rate, and a hand-copied file simply plays at it.
+  void set_fps(float fps) { this->fps_ = fps; }
+  void set_playing(bool playing);
+  bool is_playing() const { return this->playing_; }
+
+  /// Key of the item on the panel ("file:<name>" for a hand-copied file), or
+  /// empty.
+  std::string shown_key() const { return this->shown_ != nullptr ? this->shown_->key : ""; }
+  int shown_frames() const { return this->shown_ != nullptr ? (int) this->shown_->off.size() : 0; }
+  size_t shown_bytes() const { return this->shown_ != nullptr ? this->shown_->len : 0; }
+  size_t cache_count() const { return this->cache_.size(); }
+  size_t cache_used() const;
+  /// Frames decoded since boot; the caller diffs it for a rate.
+  uint32_t frames_shown() const { return this->frames_shown_; }
+  float last_decode_ms() const { return this->last_decode_us_ / 1000.0f; }
+  float last_load_ms() const { return this->last_load_ms_; }
+
+  /// Largest single item held in memory; longer clips are cut to whole frames.
+  void set_max_bytes(size_t max_bytes) { this->max_bytes_ = max_bytes; }
+  size_t max_bytes() const { return this->max_bytes_; }
+  /// PSRAM for all items together.
+  void set_cache_bytes(size_t cache_bytes) { this->cache_bytes_ = cache_bytes; }
+
  protected:
   bool ensure_buffer_();
   /// Banded read-and-blit of one raw frame file. Shared by clips and stills.
   bool blit_file_(const std::string &full, const char *what);
-  void finish_still_(bool ok);
   std::string still_path_(const char *name) const;
+
+  /// One HTTP body streamed to a card file or a PSRAM buffer, a bounded amount
+  /// per loop() tick. Raw stills and MJPEG items both use it.
+  enum FetchKind { FETCH_STILL, FETCH_ITEM };
+  struct Fetch {
+    std::shared_ptr<http_request::HttpContainer> http;
+    FetchKind kind{FETCH_STILL};
+    std::string key;         ///< item key (FETCH_ITEM)
+    FILE *file{nullptr};     ///< card target, or nullptr when streaming to memory
+    uint8_t *mem{nullptr};   ///< memory target (PSRAM), owned until finished
+    std::string dir;         ///< absolute directory, e.g. "/sd/still"
+    std::string live;        ///< final file name inside dir
+    std::string etag_file;   ///< file inside dir that holds the ETag, or empty
+    std::string etag;
+    size_t expected{0};
+    size_t written{0};
+    uint32_t last_data{0};
+    uint32_t started{0};
+  };
+  bool start_fetch_(FetchKind kind, const std::string &key, const std::string &url,
+                    const std::string &dir, const std::string &live, const std::string &etag_file,
+                    bool offer_etag, bool to_memory);
+  void pump_fetch_();
+  void finish_fetch_(bool ok);
+  /// Drop a download without reporting anything, e.g. when the screen has
+  /// been switched to something else meanwhile.
+  void abort_fetch_();
+  void fetch_failed_(FetchKind kind, const std::string &key, bool unchanged = false);
+
+  /// An item in PSRAM.
+  struct Item {
+    std::string key;
+    uint8_t *buf{nullptr};
+    size_t len{0};
+    std::vector<uint32_t> off;
+    std::vector<uint32_t> size;
+    uint32_t used{0};  ///< millis() of last show, for LRU eviction
+    ~Item();
+  };
+  Item *find_item_(const std::string &key);
+  /// Make room for `len` more bytes in memory and allocate them. Evicts least
+  /// recently used items first, and the item on the panel only as a last
+  /// resort. nullptr if even an empty cache cannot fit it.
+  uint8_t *reserve_(size_t len);
+  void evict_(Item *item);
+  bool start_load_(const std::string &key, const std::string &path);
+  void pump_load_();
+  void abort_load_();
+  /// Index `buf` into a cached item; takes ownership of `buf` either way.
+  void adopt_(const std::string &key, uint8_t *buf, size_t len, uint32_t started);
+  void activate_(Item *item);
+  void update_high_freq_();
+  void pump_playback_();
+  bool show_frame_(size_t index);
+  static int jpeg_draw_(jpeg_draw_tag *draw);
+  /// Card path of cached item `key`, relative to the mount point.
+  std::string cache_path_(const std::string &key) const;
   std::string frame_path_(int index) const;
   /// Absolute path of frame `index`, including the card's mount point.
   std::string full_path_(int index) const;
@@ -176,14 +320,47 @@ class SdClip : public Component {
   uint32_t last_write_us_{0};
   uint32_t last_http_us_{0};
 
-  std::shared_ptr<http_request::HttpContainer> still_http_;
-  std::unique_ptr<uint8_t[]> still_chunk_;
-  FILE *still_file_{nullptr};
-  std::string still_etag_;
-  size_t still_written_{0};
-  uint32_t still_last_data_{0};
-  uint32_t still_started_{0};
+  Fetch fetch_;
+  std::unique_ptr<uint8_t[]> fetch_chunk_;
   int still_event_{STILL_NONE};
+
+  // -- item state --
+  struct Load {
+    int fd{-1};
+    uint8_t *buf{nullptr};
+    size_t cap{0};
+    size_t got{0};
+    std::string key;
+    std::string path;
+    uint32_t started{0};
+  } load_;
+
+  size_t max_bytes_{4000000};
+  size_t cache_bytes_{5000000};
+  std::vector<std::unique_ptr<Item>> cache_;
+  Item *shown_{nullptr};
+  /// The item most recently asked for. Work that finishes for any other key
+  /// is cached but not shown.
+  std::string want_key_;
+
+  JPEGDEC *jpeg_{nullptr};
+  /// Where the decoded image's top-left lands on the panel. Negative when the
+  /// item is larger than the panel: it is centre-cropped in jpeg_draw_().
+  int draw_ox_{0};
+  int draw_oy_{0};
+
+  float fps_{15.0f};
+  bool playing_{true};
+  size_t play_index_{0};
+  uint32_t next_due_{0};
+  uint32_t frames_shown_{0};
+  uint32_t last_decode_us_{0};
+  float last_load_ms_{0};
+  uint32_t decode_errors_{0};
+  int item_event_{ITEM_NONE};
+  /// Playback deadlines are tens of ms apart; ESPHome's default ~16 ms loop
+  /// cadence would add that much jitter to every frame.
+  HighFrequencyLoopRequester high_freq_;
 };
 
 }  // namespace sd_clip

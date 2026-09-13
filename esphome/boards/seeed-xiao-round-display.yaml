@@ -1,6 +1,7 @@
 # Seeed Studio Round Display for XIAO + XIAO ESP32S3
 #   240x240 round 1.28" GC9A01A over SPI, CHSC6X capacitive touch, BM8563 RTC
-#   and a microSD slot (neither used here).
+#   (not used here) and a microSD slot (used by common/sd-card.yaml, holding
+#   MJPEG clips).
 #
 # Pin mapping is not guesswork: it comes from Seeed's own driver header,
 # src/lv_xiao_round_screen.h in Seeed-Studio/Seeed_Arduino_RoundDisplay --
@@ -29,11 +30,29 @@ substitutions:
   dot_x: "111"
   dot_y: "16"
 
+  # microSD on the LCD's own SPI bus -- SCK D8, MOSI D10, MISO D9 -- with its
+  # own chip select on D2 (GPIO3). Seeed's example does exactly this
+  # (`tft.init(); SD.begin(D2);`), and sd_spi attaches the card as a second
+  # device on the bus ESPHome already initialised. Used by common/sd-card.yaml.
+  sd_spi_host: SPI2_HOST
+  sd_cs_pin: "3"
+
 esp32:
   board: seeed_xiao_esp32s3
   flash_size: 8MB
   framework:
     type: esp-idf
+    advanced:
+      # Needed by common/sd-card.yaml. ESPHome excludes these IDF components
+      # by default to keep builds small, and disables VFS features the FAT
+      # driver relies on.
+      include_builtin_idf_components: ["fatfs", "spiffs"]
+      disable_vfs_support_termios: false
+      disable_vfs_support_select: false
+      disable_vfs_support_dir: false
+    sdkconfig_options:
+      # Without long filenames every path is truncated to 8.3.
+      CONFIG_FATFS_LFN_STACK: "y"
 
 # The XIAO ESP32S3 is an ESP32-S3R8, so 8MB octal PSRAM. Not strictly needed
 # here -- a 240x240 RGB565 image is only 115 kB and would fit in internal RAM
@@ -51,8 +70,8 @@ logger:
 spi:
   clk_pin: GPIO7    # D8
   mosi_pin: GPIO9   # D10
-  # MISO (D9/GPIO8) is only needed for the microSD slot; the GC9A01A is
-  # write-only, so it is left out.
+  # Only the microSD slot reads; the GC9A01A is write-only.
+  miso_pin: GPIO8   # D9
 
 # Touch and the RTC share this bus.
 i2c:

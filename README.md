@@ -56,8 +56,8 @@ renders 240x240 from the same library that feeds the 800x480 screen.
 ### Capabilities
 
 Every screen advertises what it can do in its mDNS TXT record — `w`, `h`,
-`round`, `img` (still formats), `anim` (animation formats, or `none`) and `sd`
-— and the server adapts. The board declares the hardware facts (`w`, `h`,
+`round`, `img` (still formats), `anim` (animation formats, or `none`), `sd`
+and `clip` (`frames` or `mjpeg`) — and the server adapts. The board declares the hardware facts (`w`, `h`,
 `round`); the packages a device includes declare the rest, by overriding
 defaults set in `common/content-pull.yaml`. Between packages the later one's
 substitutions win, so **capability packages go after `content`** in the device
@@ -66,13 +66,52 @@ file.
 | Screen | Packages | Advertises |
 |---|---|---|
 | tabletop-01 (Waveshare 4.3) | `sd-card` + `sd-still` | `anim=none sd=1 img=jpeg,rgb565` |
-| tabletop-02 (round XIAO) | `video-test` + `video-cache` | `round=1 anim=gif,apng,webp sd=0` |
+| tabletop-02 (round XIAO) | `sd-card` + `mjpeg-clip` | `round=1 anim=gif,apng,webp sd=0 clip=mjpeg` |
 
 **The Waveshare 4.3 is stills only.** Its GIF path cached clips by
 JPEG-decoding every frame into a 768 KB buffer, which is exactly the memory
 this board should not spend on content. So it no longer includes
 `sd-clip.yaml`, advertises `anim=none`, and the server sends it the first
 frame of anything animated.
+
+### MJPEG content from memory (`common/mjpeg-clip.yaml`)
+
+This follows [derdacavga/video-Player](https://github.com/derdacavga/video-Player).
+Stills and clips both stay compressed as JPEG. They're held in PSRAM and on the
+card, and each frame is decoded straight to the panel.
+
+**Everything is an item.** The server's `/clip.mjpeg` returns one frame for a
+still and many for a clip. An item is named by the `v` token of the content
+URL, which covers the picture *and* its framing, plus Target FPS. The server
+pushes that URL on every switch, so the screen knows what it's switching to
+before it touches the network:
+
+```
+held in memory          ->  shown instantly, no network
+evicted, but on card    ->  /mjpeg/cache/<key>.mjp -> PSRAM, no network
+never seen              ->  downloaded once: to the card, or into PSRAM if no card
+```
+
+Memory holds `cache_bytes` (5 MB) of items and evicts the least recently shown
+first. A single item is at most `max_bytes` (4 MB); longer clips lose trailing
+frames. The card keeps every item. Refresh presses and background polls cost
+nothing for content the screen already holds.
+
+**Why decoding every frame is fine.** ESPHome's image decoder has JPEGDEC
+produce RGB8888, then pushes every pixel through a virtual `draw_pixel()` with
+float scaling. That per-pixel output, not the JPEG decode, is where the
+~1.8 s per frame goes. `sd_clip` asks JPEGDEC for RGB565 and blits whole
+blocks, as video-Player does.
+
+**How long a clip can be.** Real 240×240-equivalent video averages about
+2.8 KB per frame at ffmpeg `-q:v 7`, or roughly double at q80. 4 MB is about
+35–70 s at 20 fps. `Clip Seconds` reports the real figure.
+
+**Files on the card.** Put them in `/mjpeg`. Two formats work: the server's
+TTMJ, or plain back-to-back JPEGs such as `ffmpeg -c:v mjpeg` or
+video-Player's converter produce. Pick a file with **Next SD Clip** or by
+typing its name into **SD Clip**. The choice survives reboots, and new content
+from the server replaces it.
 
 ### Stills on the SD card (`common/sd-still.yaml`)
 
