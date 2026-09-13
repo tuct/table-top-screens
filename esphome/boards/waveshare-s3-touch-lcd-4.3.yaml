@@ -1,0 +1,213 @@
+# Waveshare ESP32-S3-Touch-LCD-4.3  (ESP32-S3-WROOM-1-N8R8 on our unit)
+#   800x480 ST7701 RGB565 parallel panel, GT911 touch, CH422G I/O expander.
+#
+# Every board package MUST define these substitutions -- common/ uses them to
+# size the content request and place the activity dot. This is the seam that
+# lets one content server feed screens of different sizes and shapes:
+#   display_width / display_height   panel size, sent to the server via mDNS
+#   default_fit                      contain | cover | width | height | stretch
+#   dot_x / dot_y                    initial activity-dot position (tunable at
+#                                    runtime via the Dot X / Dot Y numbers)
+# A board package also owns its display lambda, because the boot checklist has
+# to be laid out for the panel it is on.
+substitutions:
+  display_width: "800"
+  display_height: "480"
+  default_fit: contain      # 5:3 panel, letterboxing is reasonable
+  # mipi_rgb keeps its framebuffer little-endian RGB565. Getting this wrong
+  # shows red as blue, green as red and blue as green.
+  dot_x: "10"               # activity dot position; rectangular panel, so a
+  dot_y: "10"               # corner is fine
+
+  # TF card, per Waveshare's pin table. These are free: the RGB parallel panel
+  # uses no SPI, so nothing contends for them. Used by common/sd-card.yaml.
+  #   MOSI GPIO11, SCK GPIO12, MISO GPIO13, CS on CH422G EXIO4.
+  # CS is not a GPIO, so the board holds it asserted and sd_spi is told "none".
+  sd_spi_host: SPI2_HOST
+  sd_cs_pin: none
+
+esp32:
+  board: esp32-s3-devkitc-1
+  # 8MB, NOT the 16MB Waveshare's spec page advertises. Verified on hardware:
+  # `esptool --port COMx flash-id` reports GigaDevice c8:4017 (GD25Q64, 8MB)
+  # and an ESP32-S3-WROOM-1-N8R8 module. Setting 16MB here builds a 16MB
+  # partition table, and the bootloader then rejects it against the real chip
+  # ("partition 3 invalid - offset 0x7d0000 size 0x7c0000 exceeds flash chip
+  # size 0x800000") and bootloops forever. Check any new board before assuming.
+  flash_size: 8MB
+  framework:
+    type: esp-idf   # required by mipi_rgb
+    advanced:
+      # Needed by common/sd-card.yaml. ESPHome excludes these IDF components
+      # by default to keep builds small, and disables VFS features the FAT
+      # driver relies on.
+      include_builtin_idf_components: ["fatfs", "spiffs"]
+      disable_vfs_support_termios: false
+      disable_vfs_support_select: false
+      disable_vfs_support_dir: false
+    sdkconfig_options:
+      # Without long filenames every path is truncated to 8.3.
+      CONFIG_FATFS_LFN_STACK: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+# Panel reset (EXIO3), backlight/enable (EXIO2), touch reset (EXIO1) and
+# SD_CS (EXIO4) all hang off this expander -- not off ESP GPIOs.
+i2c:
+  sda: GPIO8
+  scl: GPIO9
+  scan: true
+  id: i2c_bus
+
+ch422g:
+  - id: ch422g_hub
+
+# The TF card lives on its own SPI bus. These pins are free: the RGB parallel
+# panel uses no SPI at all, so nothing contends for them.
+spi:
+  - id: sd_bus
+    clk_pin: GPIO12
+    mosi_pin: GPIO11
+    miso_pin: GPIO13
+
+display:
+  - platform: mipi_rgb
+    model: ESP32-S3-TOUCH-LCD-4.3   # built-in preset: pins, timings, porches
+    id: disp
+    # We drive redraws ourselves (only when content actually changes), so no
+    # polling. auto_clear off keeps the zero-copy image path clean -- see
+    # notes in common/content-pull.yaml.
+    update_interval: never
+    auto_clear_enabled: false
+    # Until the first image lands, show a boot checklist so a screen that is
+    # not working says why. Every line is derived from live state (globals
+    # mirrored by the 500ms interval in common/content-pull.yaml), so it
+    # cannot claim a stage succeeded when it has not.
+    lambda: |-
+      if (id(content_loaded) && id(content_image)->is_loaded()) {
+        // Direct blit, not it.image(): see the byte_order note in
+        // common/content-pull.yaml. One bulk write instead of 57,600
+        // per-pixel virtual calls.
+        id(disp)->draw_pixels_at(0, 0, id(content_image)->get_width(),
+                                 id(content_image)->get_height(),
+                                 id(content_image)->get_data_start(),
+                                 display::COLOR_ORDER_RGB,
+                                 display::COLOR_BITNESS_565, true, 0, 0, 0);
+        return;
+      }
+      it.fill(Color(0, 0, 0));
+      int y = it.get_height() / 2 - 90;
+      it.printf(60, y, id(status_font), Color(0x80, 0x80, 0x80),
+                display::TextAlign::TOP_LEFT, "${device_name}");
+      y += 50;
+      // Honest states. The server line distinguishes a URL a server pushed
+      // us this session ("ok") from one merely restored from flash
+      // ("saved"), and nothing reports progress before the step above it.
+      const char *wifi_s    = id(wifi_ok) ? "ok" : "...";
+      const char *server_s  = !id(wifi_ok)       ? ""
+                            : id(server_pushed)  ? "ok"
+                            : id(server_ok)      ? "saved"
+                                                 : "...";
+      const char *content_s = !id(server_ok) ? "" : "...";
+      auto step = [&](const char *label, const char *state) {
+        Color colour = !state[0]                   ? Color(0x50, 0x50, 0x50)
+                     : state[0] == 'o'             ? Color(0x50, 0xC0, 0x70)
+                     : state[0] == 's'             ? Color(0xC0, 0xB0, 0x50)
+                                                   : Color(0xE8, 0xE8, 0xE8);
+        it.printf(60, y, id(status_font), colour, display::TextAlign::TOP_LEFT,
+                  "%s ... %s", label, state);
+        y += 42;
+      };
+      step("Connecting to WiFi", wifi_s);
+      step("Searching for server", server_s);
+      step("Getting content", content_s);
+      if (!id(status_text).empty()) {
+        it.printf(60, y + 12, id(status_font), Color(0xE0, 0x70, 0x70),
+                  display::TextAlign::TOP_LEFT, "%s", id(status_text).c_str());
+      }
+
+touchscreen:
+  - platform: gt911
+    id: touch
+    display: disp
+    interrupt_pin: GPIO4
+    # EXIO1 confirmed correct on hardware: the GT911 comes up at address 0x5D
+    # and attaches a hardware interrupt. The GT911 samples CTP_RST/CTP_IRQ at
+    # boot to choose between 0x5D and 0x14, so a wrong reset pin shows up as
+    # "GT911 not found" -- if that happens on another unit, try number: 0.
+    # Without any reset pin the component may not come up at all.
+    reset_pin:
+      ch422g: ch422g_hub
+      number: 1
+      mode:
+        output: true
+
+# The card's chip select is on CH422G EXIO4, and it is ACTIVE LOW. Putting a
+# chip select behind an I2C expander only makes sense for SPI mode with CS
+# held asserted permanently, which is safe here because the card is the only
+# device on sd_bus.
+#
+# This is also why SDMMC could not work on this board: a card latches
+# SPI-vs-SD mode from the CS level at its first CMD0 after power-up, and this
+# pin idles LOW long before I2C is up -- so the card is already in SPI mode by
+# the time anything could drive it high. Observed as "Failed to mount card".
+switch:
+  - platform: gpio
+    name: SD CS Asserted
+    id: sd_cs
+    restore_mode: ALWAYS_ON
+    entity_category: config
+    pin:
+      ch422g: ch422g_hub
+      number: 4
+      inverted: true      # active low: ON drives the pin LOW
+      mode:
+        output: true
+
+font:
+  - file: "gfonts://Roboto"
+    id: status_font
+    size: 28
+
+# ---------------------------------------------------------------------------
+# Backlight: DO NOT add a light/output on CH422G EXIO2.
+#
+# On this board EXIO2 drives the AP3032 backlight driver AND the panel's
+# enable line -- they are the same pin. Turning "the backlight" off therefore
+# powers down the display logic while the graphics stack keeps rendering into
+# it. In openHASP this manifests as crash-and-reboot on wake, or a screen
+# that stays black:
+#   https://github.com/HASwitchPlate/openHASP/discussions/602
+#
+# We are safe from that by default only because the mipi_rgb preset claims
+# EXIO2 as `enable_pin` and asserts it once at setup -- nothing toggles it at
+# runtime. The cost is that brightness is not adjustable at all: it is on or
+# the panel is off.
+#
+# To get real dimming (useful for a tabletop screen at night) the pins have to
+# be decoupled in hardware: remove the resistor and capacitor coupling the
+# backlight driver to the display enable signal, and solder a wire from GPIO6
+# -- the pin labelled "Sensor AD" on the right-hand header -- to the AP3032
+# control pin. SMD rework; it can kill the board.
+#
+# Photo of this mod on our own board: ../../waveshare_4_4_bcl_hack.png
+# (red wire from the backlight driver area to Sensor AD on the header).
+#
+# THIS BOARD IS MODDED -- the wire is fitted, so GPIO6 is the only thing that
+# turns the backlight on. Without the block below the panel initialises
+# correctly but stays dark, because nothing drives GPIO6 and it floats low.
+output:
+  - platform: ledc
+    id: backlight_pwm
+    pin: GPIO6
+    frequency: 20000Hz       # above audible, avoids coil whine
+
+light:
+  - platform: monochromatic
+    name: Backlight
+    id: backlight
+    output: backlight_pwm
+    restore_mode: ALWAYS_ON  # never boot dark; brightness is still settable
+    default_transition_length: 500ms

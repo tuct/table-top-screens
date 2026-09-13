@@ -1,0 +1,319 @@
+# Raw RGB565 clip playback from the SD card, cached over a COMPRESSED transport.
+#
+# This is the third and fastest of the three playback paths in this project,
+# and the only one without a hard ceiling:
+#
+#   common/video-test.yaml   fetch + JPEG-decode every frame  ~0.33 fps @ 800x480
+#   common/video-cache.yaml  decode once into PSRAM           bounded to ~40 frames
+#   this file                decode once onto the CARD        no decode, no bound
+#
+# The insight is that "no decode" only has to apply at PLAYBACK time. Sending
+# raw RGB565 over WiFi measured at ~16 s per 800x480 frame, which made caching
+# a 40-frame clip unusable. So the transport is compressed and the decode is
+# paid exactly once, when the frame is cached:
+#
+#   fetch JPEG (~130 KB)  ->  online_image decodes to RGB565  ->  write to card
+#   card read (768 KB)    ->  draw_pixels_at()                     <- playback
+#
+# online_image is reused as the decoder rather than writing a new one: it
+# already produces RGB565 in the same big-endian order the blit path needs (see
+# the long note in common/content-pull.yaml), and it downloads incrementally
+# from loop(), so playback keeps running while the next frame is being fetched.
+#
+# Requires common/sd-card.yaml (the mount) and common/content-pull.yaml (the
+# content_url the frame URL is derived from, and video_active).
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [sd_clip]
+
+sd_clip:
+  id: clip
+  # Must match the panel: frames are blitted at 0,0 with no scaling.
+  width: ${display_width}
+  height: ${display_height}
+
+online_image:
+  # A second slot, separate from content_image, so caching a clip never
+  # disturbs the still that content-pull owns.
+  - id: clip_fetch
+    url: http://127.0.0.1/awaiting-clip
+    format: JPEG
+    type: RGB565
+    # Same convention as content_image: these bytes go straight to the card and
+    # from there straight to the panel, so they must be in the DISPLAY's order.
+    byte_order: BIG_ENDIAN
+    resize: ${display_width}x${display_height}
+    update_interval: never
+    buffer_size: 32768
+    request_headers:
+      X-Device-Name: ${device_name}
+    on_download_finished:
+      - lambda: |-
+          if (!id(sd_caching)) return;
+          if (id(clip)->write_frame(id(sd_cache_index),
+                                    id(clip_fetch)->get_data_start(),
+                                    id(clip)->frame_bytes())) {
+            id(sd_cache_index)++;
+          } else {
+            id(sd_caching) = false;
+            ESP_LOGW("sd_clip", "Caching stopped: could not write frame %d",
+                     id(sd_cache_index));
+          }
+          id(sd_fetching) = false;
+    on_error:
+      - lambda: |-
+          // Stop rather than hammer a failing server frame by frame.
+          if (id(sd_caching)) {
+            ESP_LOGW("sd_clip", "Caching stopped: fetch failed at frame %d",
+                     id(sd_cache_index));
+          }
+          id(sd_caching) = false;
+          id(sd_fetching) = false;
+
+globals:
+  # Next frame index to display.
+  - id: sd_clip_index
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  # Next frame index to download. Separate from sd_clip_index because caching
+  # and playback advance independently -- playback loops over what is already
+  # on the card while the tail is still downloading.
+  - id: sd_cache_index
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  - id: sd_caching
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # Exactly one fetch in the air at a time. Without this the interval would
+  # call update() mid-download, online_image would log "Image already being
+  # updated" and drop it, and caching would stall silently.
+  - id: sd_fetching
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: sd_frames_shown
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  - id: sd_fps_window
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+number:
+  # The server sets this when it has a clip for us. Values > 1 start caching
+  # automatically: there is no Home Assistant here, so nothing may depend on
+  # someone pressing a button.
+  - platform: template
+    name: SD Clip Frames
+    id: sd_clip_frames
+    optimistic: true
+    restore_value: true
+    initial_value: "0"
+    min_value: 0
+    max_value: 600
+    step: 1
+    mode: box
+    entity_category: config
+    on_value:
+      - lambda: |-
+          // Restart caching from the top whenever the server announces a new
+          // clip length. Frames already on the card are skipped below, so this
+          // is cheap when the clip has not actually changed.
+          id(sd_cache_index) = 0;
+          id(sd_clip_index) = 0;
+          id(sd_fetching) = false;
+          id(sd_caching) = x > 1;
+
+  # Quality of the CACHE transport, not of playback. The decoded pixels are
+  # what gets stored, so this trades network time against permanent fidelity:
+  # 85 is roughly half the bytes of 95 and hard to tell apart on these panels.
+  # Tunable at runtime because the right value depends on the clip.
+  - platform: template
+    name: SD Clip Quality
+    id: sd_clip_quality
+    optimistic: true
+    restore_value: true
+    initial_value: "85"
+    min_value: 40
+    max_value: 95
+    step: 5
+    mode: box
+    entity_category: config
+
+interval:
+  # Drive caching: one fetch at a time, started here and completed in
+  # on_download_finished above. The work itself happens incrementally inside
+  # online_image's loop(), which is what lets playback continue meanwhile.
+  - interval: 200ms
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: 'return id(sd_caching) && !id(sd_fetching);'
+              # No card, nothing to cache to. Without this the device would
+              # download frame after frame and throw every one away.
+              - binary_sensor.is_on: sd_mounted
+              - wifi.connected:
+              - lambda: 'return !id(content_url).state.empty();'
+          then:
+            - lambda: |-
+                const int want = (int) id(sd_clip_frames).state;
+
+                // Drop the cache if it belongs to a different clip: frames are
+                // named by index alone, so a new animation of the same length
+                // would otherwise replay the previous one's pixels.
+                id(clip)->ensure_clip(id(content_url).state);
+
+                // Adopt whatever is on the card. This both skips frames we
+                // already have -- which is what makes a reboot free rather than
+                // a 30 MB re-download -- and sets the component's cached count.
+                // has_frame() alone would not: it is a pure query, so playback
+                // would stay stopped even with a full clip sitting on the card.
+                id(sd_cache_index) = id(clip)->rescan();
+                if (id(sd_cache_index) >= want) {
+                  id(sd_caching) = false;
+                  ESP_LOGI("sd_clip", "Clip cached: %d frames", want);
+                  return;
+                }
+
+                // Derive the frame URL from the still URL the server pushed, so
+                // clips are framed (size, fit, rotation, background) exactly
+                // like the still is.
+                std::string u = id(content_url).state;
+                auto pos = u.find("/image?");
+                if (pos == std::string::npos) return;
+                u.replace(pos, 7, "/frame?");
+
+                // Force JPEG: whatever the still uses, the cache transport is
+                // compressed on purpose. Replace rather than append -- a second
+                // fmt= would leave the server reading the first one.
+                auto f = u.find("fmt=");
+                if (f != std::string::npos) {
+                  auto end = u.find('&', f);
+                  if (end == std::string::npos) end = u.size();
+                  u.replace(f, end - f, "fmt=jpeg");
+                } else {
+                  u += "&fmt=jpeg";
+                }
+                auto q = u.find("q=");
+                if (q != std::string::npos) {
+                  auto end = u.find('&', q);
+                  if (end == std::string::npos) end = u.size();
+                  u.replace(q, end - q, "q=" + to_string((int) id(sd_clip_quality).state));
+                } else {
+                  u += "&q=" + to_string((int) id(sd_clip_quality).state);
+                }
+
+                id(sd_fetching) = true;
+                id(clip_fetch)->set_url(u + "&n=" + to_string(id(sd_cache_index)));
+                id(clip_fetch)->update();
+
+  # Playback. The interval is short on purpose: show() blocks for roughly the
+  # card read time, so the real rate is set by the hardware and this just means
+  # "as soon as the last frame finished".
+  - interval: 50ms
+    then:
+      - if:
+          condition:
+            lambda: 'return id(sd_clip_play).state && id(clip)->cached() > 0;'
+          then:
+            - lambda: |-
+                const int have = id(clip)->cached();
+                if (id(sd_clip_index) >= have) id(sd_clip_index) = 0;
+                if (id(clip)->show(id(sd_clip_index))) {
+                  id(sd_clip_index)++;
+                  id(sd_frames_shown)++;
+                }
+
+  # Publish the achieved rate once a second. Achieved, not requested -- this is
+  # the number that says whether the SD path was worth building.
+  - interval: 1s
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          if (id(sd_fps_window) != 0) {
+            const float secs = (now - id(sd_fps_window)) / 1000.0f;
+            if (secs > 0) id(sd_clip_fps).publish_state(id(sd_frames_shown) / secs);
+          }
+          id(sd_fps_window) = now;
+          id(sd_frames_shown) = 0;
+          id(sd_clip_cached).publish_state(id(clip)->cached());
+          if (id(clip)->cached() > 0) {
+            id(sd_clip_read_ms).publish_state(id(clip)->last_read_ms());
+            id(sd_clip_blit_ms).publish_state(id(clip)->last_blit_ms());
+            id(sd_clip_write_ms).publish_state(id(clip)->last_write_ms());
+          }
+
+switch:
+  - platform: template
+    name: Play SD Clip
+    id: sd_clip_play
+    optimistic: true
+    # ON by default: with no Home Assistant and no API, a clip that needed a
+    # button press to start would never start.
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: 'id(video_active) = true;'
+    turn_off_action:
+      - lambda: 'id(video_active) = false;'
+      # Put the still back rather than leaving a frozen frame on the panel.
+      - if:
+          condition:
+            lambda: 'return !id(content_url).state.empty();'
+          then:
+            - online_image.set_url:
+                id: content_image
+                url: !lambda 'return id(content_url).state;'
+                update: true
+
+sensor:
+  - platform: template
+    name: SD Clip Frames Cached
+    id: sd_clip_cached
+    accuracy_decimals: 0
+    entity_category: diagnostic
+
+  - platform: template
+    name: SD Clip FPS
+    id: sd_clip_fps
+    unit_of_measurement: fps
+    accuracy_decimals: 2
+    entity_category: diagnostic
+
+  # Read, blit and write split out separately, because which one dominates
+  # decides what to optimise next: a slow read means raising the SPI clock, a
+  # slow blit means the panel is the limit, and a slow write means the card
+  # itself is -- in which case compressing the transport cannot help, since the
+  # same 768 KB lands on the card either way.
+  - platform: template
+    name: SD Clip Read
+    id: sd_clip_read_ms
+    unit_of_measurement: ms
+    accuracy_decimals: 1
+    entity_category: diagnostic
+
+  - platform: template
+    name: SD Clip Blit
+    id: sd_clip_blit_ms
+    unit_of_measurement: ms
+    accuracy_decimals: 1
+    entity_category: diagnostic
+
+  - platform: template
+    name: SD Clip Write
+    id: sd_clip_write_ms
+    unit_of_measurement: ms
+    accuracy_decimals: 1
+    entity_category: diagnostic

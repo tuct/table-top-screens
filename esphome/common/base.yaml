@@ -1,0 +1,94 @@
+# Shared plumbing for every mini screen: connectivity + control surfaces.
+# Board-independent on purpose.
+
+logger:
+  level: DEBUG   # bring-up: show component setup + dump_config
+
+#api:
+#  encryption:
+#    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # fast_connect is deliberately OFF. It was added when the configured SSID
+  # looked hidden; in fact that SSID simply was not in range, and the one in
+  # use is visible with three BSSIDs (a mesh). With fast_connect on, the saved
+  # BSSID is tried first and -- once that AP is no longer the best or has
+  # roamed -- fails, costing ~24s of retries before a scan finds a good one.
+  # Turn it on only for a genuinely hidden SSID or a single-AP network.
+  # fast_connect: true
+
+  # Mains-powered screen that must react to pushes promptly, so don't let the
+  # radio sleep between beacons.
+  power_save_mode: none
+
+  ap:
+    ssid: ${device_name}-setup
+    password: !secret wifi_ap_password
+
+captive_portal:
+
+# Gives us a local REST + SSE surface independent of Home Assistant, which is
+# the standalone-Android-app path from the research notes. Coexists with the
+# native API above, so both options stay open.
+web_server:
+  version: 3
+  port: 80
+
+button:
+  - platform: restart
+    name: Restart
+    entity_category: config
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: IP Address
+      entity_category: diagnostic
+
+sensor:
+  - platform: wifi_signal
+    name: WiFi Signal
+    update_interval: 60s
+    entity_category: diagnostic
+  - platform: uptime
+    name: Uptime
+    entity_category: diagnostic
+
+  # Heap diagnostics. Added because an SD mount started failing right after a
+  # second 768 KB online_image was introduced, and without these there was no
+  # way to tell memory pressure apart from a hardware fault. Largest block
+  # matters as much as the total: allocations fail on fragmentation long
+  # before free memory runs out.
+  - platform: template
+    name: Free Internal Heap
+    id: free_internal_heap
+    unit_of_measurement: B
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'return heap_caps_get_free_size(MALLOC_CAP_INTERNAL);'
+
+  - platform: template
+    name: Largest Internal Block
+    id: largest_internal_block
+    unit_of_measurement: B
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);'
+
+  - platform: template
+    name: Free PSRAM
+    id: free_psram
+    unit_of_measurement: B
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'return heap_caps_get_free_size(MALLOC_CAP_SPIRAM);' 

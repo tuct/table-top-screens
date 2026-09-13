@@ -1,0 +1,458 @@
+# The network content path. Zero configuration on either side: being on the
+# same network is the only requirement.
+#
+# How the two halves find each other:
+#
+#   server finds screens : we advertise `_minidisplay._tcp` below, with our
+#                          name and panel size in the TXT records. The server
+#                          browses mDNS and gets a complete registry.
+#
+#   screens find server  : we never need to know. On discovering us the server
+#                          POSTs our content URL -- with an address we can
+#                          actually reach it on -- into the `content_url` text
+#                          entity via web_server's REST API.
+#
+# That same REST surface is the push channel: the server presses
+# `refresh_content` when new content arrives, so it lands in well under a
+# second. The interval below is only a safety net for a missed push.
+#
+# Why pull for the image itself: ESPHome cannot receive a pushed image
+# (web_server exposes fixed per-entity endpoints, not upload routes), but
+# online_image implements ETag / Last-Modified caching, so a background poll
+# costs one 304 with an empty body when nothing changed.
+
+http_request:
+  verify_ssl: false
+  timeout: 10s
+  # ESPHome defaults buffer_size_rx to 512 BYTES on esp-idf, and passes it
+  # straight to esp_http_client's config.buffer_size. At that size a 768 KB
+  # frame is read in 1500 separate chunks, which measured at ~48 KB/s despite
+  # a -34 dBm signal and a server that serves the same bytes at 19 MB/s
+  # locally. The radio was never the limit; the read size was.
+  buffer_size_rx: 8192
+
+# Entity NAMES here are a contract with the server: it POSTs to
+# "/text/Content URL/set" and "/button/Refresh Content/press". ESPHome
+# deprecated the object-ID forms (/text/content_url) and removes them in
+# 2026.7.0, so discovery.py uses the name form and only falls back to the old
+# one. Renaming either entity means updating discovery.py.
+mdns:
+  services:
+    - service: _minidisplay
+      protocol: _tcp
+      port: 80        # our web_server, which is how the server talks back
+      txt:
+        name: ${device_name}
+        w: ${display_width}
+        h: ${display_height}
+        fmt: jpeg
+        # Declared by the board package: a round panel wants `cover`, since
+        # its corners are behind the bezel and letterboxing would be wasted.
+        fit: ${default_fit}
+        # Degrees clockwise, for a panel mounted turned. The server rotates
+        # when rendering, which keeps the device on its zero-copy draw path --
+        # ESPHome's display `rotation:` would force the buffered path instead.
+        # Overridable per device from the server's own page.
+        rot: "0"
+
+globals:
+  # Only set when something has gone wrong; shown under the boot checklist.
+  - id: status_text
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  # Boot checklist state. Mirrored into globals by the interval below rather
+  # than read from C++ in the display lambda, so the lambda needs no direct
+  # access to the wifi component.
+  - id: wifi_ok
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # We have a content URL from somewhere -- possibly just restored from flash.
+  - id: server_ok
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # A server actually pushed us a URL *this session*. Distinct from server_ok
+  # because restore_value replays the content_url trigger during setup(), so a
+  # remembered URL would otherwise report "server found" before WiFi is even
+  # associated -- claiming a stage succeeded that had not run at all.
+  - id: server_pushed
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # Activity indicator state.
+  - id: loading
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # Frame-loop state. Declared here, used by the optional
+  # common/video-test.yaml. Keeping them in the shared file means the
+  # dependency points one way: video-test needs content-pull, never the
+  # reverse. (Referencing video-test's own ids from here broke every device
+  # that did not include it.)
+  - id: frame_in_flight
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: frames_done
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  # Set by video-test's Play Video switch. A plain bool rather than a
+  # reference to that switch, so this file stands alone.
+  - id: video_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: dot_phase
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  # Has a download ever succeeded? Needed because online_image.get_width() is
+  # non-zero from boot (`resize` pre-sizes the buffer), so it cannot be used
+  # to tell "loaded" from "not loaded yet".
+  - id: content_loaded
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+# NOTE: on ESPHome >= ~2026.7 this moves under `image:` as
+#   image:
+#     - platform: online_image
+#       ...
+# The top-level key below is deprecated there and removed in 2027.1.0. All the
+# options are identical, so migration is just the two lines of nesting.
+online_image:
+  - id: content_image
+    # Placeholder only. Never fetched: update_interval is `never`, and the
+    # first real fetch happens when the server pushes a URL below.
+    url: http://127.0.0.1/awaiting-discovery
+    format: JPEG
+    # RGB565 so the decoded buffer is already in the panel's pixel format and
+    # can be handed to draw_pixels_at() as-is, with no per-pixel conversion.
+    type: RGB565
+    # BIG_ENDIAN, because the board lambdas blit this buffer STRAIGHT to the
+    # panel with draw_pixels_at() instead of calling it.image().
+    #
+    # Why not it.image(): Image::draw() for RGB565 loops per pixel --
+    #     for x: for y: display->draw_pixel_at(x, y, get_rgb565_pixel_(x, y))
+    # which is 57,600 virtual calls for a 240x240 frame and measured out at
+    # 2 fps on the round panel. A single draw_pixels_at() is one DMA-able
+    # write of the same bytes.
+    #
+    # Byte order follows from that choice. it.image() would need
+    # LITTLE_ENDIAN, because image.cpp hardcodes `encode_uint16(read(pos+1),
+    # read(pos))` and RuntimeImage does not override it. The blit path
+    # instead needs the DISPLAY's convention, which is big-endian for both
+    # mipi_rgb (whose framebuffer is big-endian) and mipi_spi (whose
+    # IS_BIG_ENDIAN defaults true). So: blit => BIG_ENDIAN, and the same
+    # value the activity dot uses. One convention everywhere.
+    byte_order: BIG_ENDIAN
+    resize: ${display_width}x${display_height}
+    update_interval: never
+    buffer_size: 32768
+    request_headers:
+      X-Device-Name: ${device_name}
+    on_download_finished:
+      - lambda: |-
+          id(loading) = false;
+          // video-test.yaml, when included, clears these through us so the
+          // frame loop and the still path share one completion hook.
+          id(frame_in_flight) = false;
+          id(frames_done)++;
+      # Erase first and unconditionally: a full repaint below would also cover
+      # it, but on an unchanged fetch (304) there is no repaint, and this way
+      # the dot cannot survive either path. Skipped while playing video: a dot
+      # blit per frame is pure overhead and would flicker at frame rate.
+      - if:
+          condition:
+            lambda: 'return !id(video_active);'
+          then:
+            - script.execute:
+                id: paint_dot
+                phase: -1
+      - if:
+          condition:
+            lambda: 'return !cached;'
+          then:
+            - logger.log: "New content downloaded, redrawing"
+            - lambda: |-
+                id(content_loaded) = true;
+                id(status_text) = "";
+            - component.update: disp
+    on_error:
+      - lambda: |-
+          id(loading) = false;
+          id(frame_in_flight) = false;
+          id(status_text) = "Could not load content";
+      - script.execute:
+          id: paint_dot
+          phase: -1
+      - component.update: disp
+
+# Every fetch is guarded on wifi.connected. Without that guard the first
+# attempt races WiFi association and fails with "Not connected to network":
+# the restored content_url fires on_value during setup(), and an `interval`
+# also fires once immediately at startup rather than after its period.
+interval:
+  # Activity dot: a small square top-left while a fetch is in flight, cycling
+  # three colours. Drawn with draw_pixels_at() straight to the panel rather
+  # than through the display writer -- that is a 512-byte DMA instead of a
+  # 768 KB full-frame repaint, so blinking is essentially free and does not
+  # disturb the picture underneath.
+  #
+  # Honest caveat: online_image streams the download across loop() calls, so
+  # this animates then -- but JPEG cannot decode until it has every byte, and
+  # that final decode blocks for ~1.7s, during which the dot necessarily
+  # freezes. It is an "in progress" light, not a smooth spinner.
+  - interval: 200ms
+    then:
+      - if:
+          condition:
+            lambda: 'return id(loading);'
+          then:
+            - script.execute:
+                id: paint_dot
+                phase: !lambda 'return id(dot_phase)++;'
+
+  # Boot progress: refresh the checklist until the first image lands, then
+  # stop entirely. Cheap (text into the buffer) and only ever runs at startup
+  # or while something is broken.
+  - interval: 500ms
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(content_loaded);'
+          then:
+            - if:
+                condition:
+                  - wifi.connected:
+                then:
+                  - lambda: 'id(wifi_ok) = true;'
+                else:
+                  - lambda: 'id(wifi_ok) = false;'
+            # Gate on wifi_ok so the checklist can never show a later step as
+            # done while an earlier one is still pending.
+            - lambda: 'id(server_ok) = id(wifi_ok) && !id(content_url).state.empty();'
+            - component.update: disp
+
+  # Boot / recovery: retry quickly until the first image has landed. Once
+  # content_loaded is true this condition is false, so it costs nothing.
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            - wifi.connected:
+            - lambda: 'return !id(content_loaded) && !id(content_url).state.empty();'
+          then:
+            - lambda: 'id(loading) = true;'
+            - component.update: content_image
+
+  # Safety net -- the server pushes on change, so this only recovers a missed
+  # push. Cheap when nothing changed: a 304 with an empty body, because
+  # component.update (unlike set_url) preserves the stored ETag. But a fetch
+  # that DOES return an image costs ~2s of blocking decode and visibly
+  # disturbs the panel, so keep this rare and make it switchable at runtime.
+  #
+  # NB do NOT set poll_interval to 0s to disable it: `interval:` takes
+  # positive_time_period, and 0 makes the PollingComponent fire every loop
+  # iteration -- continuous HTTP, the exact opposite of off. `never` is not
+  # accepted here either. Use the switch below, or a long period.
+  - interval: ${poll_interval}
+    then:
+      - if:
+          condition:
+            - switch.is_on: background_poll
+            - wifi.connected:
+            - lambda: 'return !id(content_url).state.empty();'
+          then:
+            - lambda: 'id(loading) = true;'
+            - component.update: content_image
+
+script:
+  # Draws the activity dot, or erases it when phase < 0.
+  #
+  # Round, so it has to composite: pixels outside the circle are taken from
+  # the image buffer underneath (or black before the first image), which is
+  # also exactly how the dot is erased -- redrawing the same 18x18 block with
+  # no circle restores the picture. That costs 648 bytes of DMA instead of a
+  # 768 KB full-frame repaint, and means erasing cannot be forgotten: draw and
+  # erase are the same code path.
+  - id: paint_dot
+    parameters:
+      phase: int
+    then:
+      - lambda: |-
+          // The display may not exist yet: Dot X / Dot Y have restore_value,
+          // so their on_value replays during setup() and calls us before the
+          // panel is initialised. Without this guard the LCD driver logs
+          // "esp_lcd_panel_draw_bitmap(34): invalid panel handle" twice at
+          // every boot.
+          if (!id(disp)->is_ready())
+            return;
+
+          constexpr int D = 18;            // diameter / block size
+          // Position is adjustable at runtime via the Dot X / Dot Y numbers,
+          // seeded from the board package. On a round panel the visible area
+          // is a circle, so where the dot actually shows takes a couple of
+          // tries -- worth nudging from Home Assistant rather than reflashing.
+          const int X0 = (int) id(dot_x_pos).state;
+          const int Y0 = (int) id(dot_y_pos).state;
+          if (id(disp)->get_width() < X0 + D || id(disp)->get_height() < Y0 + D)
+            return;
+
+          static const uint8_t COLOURS[3][3] = {
+              {0xFF, 0xB4, 0x00},   // amber
+              {0x00, 0xC8, 0xFF},   // cyan
+              {0xFF, 0x00, 0x8C},   // magenta
+          };
+          // Unlike an image, the dot really does go through draw_pixels_at(),
+          // so it needs the DISPLAY's convention -- big-endian for both
+          // drivers here. mipi_spi refuses to draw on a flag mismatch; mipi_rgb
+          // ignores the flag but assumes big-endian data. Note this is the
+          // opposite of the image's LITTLE_ENDIAN above, and correctly so:
+          // they are different code paths.
+          constexpr bool big = true;
+
+          uint16_t ink = 0;
+          if (phase >= 0) {
+            const auto *c = COLOURS[((phase % 3) + 3) % 3];
+            ink = ((c[0] & 0xF8) << 8) | ((c[1] & 0xFC) << 3) | (c[2] >> 3);
+            if (big)
+              ink = (uint16_t) ((ink >> 8) | (ink << 8));
+          }
+
+          // Background comes from the decoded image when there is one.
+          // is_loaded() is the authoritative check that the buffer exists.
+          const uint8_t *base = nullptr;
+          size_t stride = 0;
+          if (id(content_image)->is_loaded() &&
+              id(content_image)->get_width() >= X0 + D &&
+              id(content_image)->get_height() >= Y0 + D) {
+            base = id(content_image)->get_data_start();
+            stride = id(content_image)->get_width_stride();
+          }
+
+          static uint16_t block[D * D];
+          for (int y = 0; y < D; y++) {
+            const uint16_t *row =
+                base ? reinterpret_cast<const uint16_t *>(base + (Y0 + y) * stride)
+                     : nullptr;
+            for (int x = 0; x < D; x++) {
+              // Integer circle test: (2x-(D-1))^2 + (2y-(D-1))^2 <= (D-1)^2
+              const int dx = 2 * x - (D - 1), dy = 2 * y - (D - 1);
+              const bool inside = dx * dx + dy * dy <= (D - 1) * (D - 1);
+              block[y * D + x] = (phase >= 0 && inside)
+                                     ? ink
+                                     : (row ? row[X0 + x] : 0);
+            }
+          }
+          // Background pixels are copied straight from the image buffer, so
+          // they are already in the panel's order; `ink` was swapped to match.
+          id(disp)->draw_pixels_at(X0, Y0, D, D, (const uint8_t *) block,
+                                   display::COLOR_ORDER_RGB,
+                                   display::COLOR_BITNESS_565, big, 0, 0, 0);
+
+number:
+  # Runtime dot placement. A round panel shows only a circle, so finding a
+  # spot that is actually visible is a matter of nudging these rather than
+  # rebuilding. Seeded from the board package.
+  - platform: template
+    name: Dot X
+    id: dot_x_pos
+    optimistic: true
+    restore_value: true
+    initial_value: ${dot_x}
+    min_value: 0
+    max_value: ${display_width}
+    step: 1
+    mode: box
+    entity_category: config
+    on_value:
+      - script.execute:
+          id: paint_dot
+          phase: 0
+
+  - platform: template
+    name: Dot Y
+    id: dot_y_pos
+    optimistic: true
+    restore_value: true
+    initial_value: ${dot_y}
+    min_value: 0
+    max_value: ${display_height}
+    step: 1
+    mode: box
+    entity_category: config
+    on_value:
+      - script.execute:
+          id: paint_dot
+          phase: 0
+
+switch:
+  # Off = rely purely on the server's push. Turn it off if the periodic
+  # refresh is disturbing the display and the server is reliable.
+  - platform: template
+    name: Background Poll
+    id: background_poll
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+
+button:
+  - platform: template
+    name: Refresh Content
+    id: refresh_content
+    on_press:
+      - lambda: 'id(loading) = true;'
+      - component.update: content_image
+
+# Set by the server on discovery. restore_value keeps it across reboots, so a
+# screen keeps working even if the server is down when it powers up.
+text:
+  - platform: template
+    name: Content URL
+    id: content_url
+    optimistic: true
+    restore_value: true
+    mode: text
+    min_length: 0
+    max_length: 255
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !x.empty();'
+          then:
+            - logger.log:
+                format: "Content source set to %s"
+                args: ['x.c_str()']
+            # update: false -- fetching here would race WiFi at boot, because
+            # restore_value replays this trigger during setup(). The 5s
+            # interval above picks it up as soon as the network is up.
+            - online_image.set_url:
+                id: content_image
+                url: !lambda 'return x;'
+                update: false
+            - if:
+                condition:
+                  - wifi.connected:
+                then:
+                  # A URL arriving while WiFi is up came over the network, so
+                  # this really was a push. A URL restored during setup() has
+                  # WiFi down and correctly does not count.
+                  - lambda: |-
+                      id(server_pushed) = true;
+                      id(status_text) = "Loading...";
+                      id(loading) = true;
+                  - component.update: disp
+                  - component.update: content_image

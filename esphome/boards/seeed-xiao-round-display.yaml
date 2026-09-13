@@ -1,0 +1,166 @@
+# Seeed Studio Round Display for XIAO + XIAO ESP32S3
+#   240x240 round 1.28" GC9A01A over SPI, CHSC6X capacitive touch, BM8563 RTC
+#   and a microSD slot (neither used here).
+#
+# Pin mapping is not guesswork: it comes from Seeed's own driver header,
+# src/lv_xiao_round_screen.h in Seeed-Studio/Seeed_Arduino_RoundDisplay --
+#   CHSC6X_I2C_ID 0x2e, TOUCH_INT D7, XIAO_BL D6, XIAO_DC D3, XIAO_CS D1,
+#   SCREEN 240x240, SPI_FREQ 20 MHz
+# and no RST define, because the panel's reset is tied on the board.
+#
+# XIAO silkscreen -> ESP32-S3 GPIO:
+#   D0/A0 1   D1 2    D2 3    D3 4    D4/SDA 5   D5/SCL 6
+#   D6/TX 43  D7/RX 44   D8/SCK 7   D9/MISO 8   D10/MOSI 9
+#
+# See boards/waveshare-s3-touch-lcd-4.3.yaml for the substitution contract
+# every board package has to satisfy.
+substitutions:
+  display_width: "240"
+  display_height: "240"
+  # Round panel: the corners sit behind the bezel, so letterboxing would put
+  # bars where nothing is visible anyway. Fill and crop instead.
+  default_fit: cover
+  # Must equal the display's byte_order below: mipi_spi::draw_pixels_at()
+  # compares the caller's flag against its own IS_BIG_ENDIAN and, on a
+  # mismatch, logs "Unsupported color depth or bit order" and draws nothing.
+  # Agreeing with each other is necessary but not sufficient -- they also have
+  # to agree with what the panel wants. See the note on byte_order below.
+  dot_x: "111"
+  dot_y: "16"
+
+esp32:
+  board: seeed_xiao_esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+# The XIAO ESP32S3 is an ESP32-S3R8, so 8MB octal PSRAM. Not strictly needed
+# here -- a 240x240 RGB565 image is only 115 kB and would fit in internal RAM
+# -- but keeping the decode buffer off internal SRAM leaves more headroom.
+# ignore_not_found is the default, so a variant without PSRAM still builds.
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  # D6 is GPIO43 = U0TXD, and we drive the backlight with it below. The XIAO
+  # has native USB, so log over that instead of fighting for the pin.
+  hardware_uart: USB_SERIAL_JTAG
+
+spi:
+  clk_pin: GPIO7    # D8
+  mosi_pin: GPIO9   # D10
+  # MISO (D9/GPIO8) is only needed for the microSD slot; the GC9A01A is
+  # write-only, so it is left out.
+
+# Touch and the RTC share this bus.
+i2c:
+  sda: GPIO5        # D4
+  scl: GPIO6        # D5
+  scan: true
+  id: i2c_bus
+
+display:
+  - platform: mipi_spi
+    model: GC9A01A          # built-in preset: 240x240, init sequence, mirror_x
+    id: disp
+    cs_pin: GPIO2           # D1
+    dc_pin: GPIO4           # D3
+    data_rate: 20MHz        # what Seeed's own driver uses
+    # This panel needs display inversion. Confirmed the honest way: with the
+    # driver's plain defaults and nothing else overridden, the picture came
+    # out a photographic negative, so this is the single change that fixes it.
+    # ESPHome's GC9A01A model sets neither invert_colors nor 0x21 (INVON)
+    # anywhere in its init sequence, so it has to be asked for here.
+    #
+    invert_colors: true
+    # byte_order deliberately NOT set: the default (big_endian) is correct.
+    # Setting little_endian rotated EVERY colour, text included -- with
+    # IS_BIG_ENDIAN=false, convert_color() emits a native RGB565 uint16 whose
+    # little-endian memory layout is raw-blitted to a panel that reads MSB
+    # first, so pure red arrives as 77% blue. big_endian makes convert_color
+    # pre-swap, and red arrives as red.
+    # color_order left at the driver default (BGR). It can only exchange R and
+    # B -- green is untouched -- so it cannot cause a three-way rotation, and
+    # setting it did not help. Kept out of the way so that if R and B alone
+    # come out swapped after this, adding `color_order: RGB` is an unambiguous
+    # one-line fix rather than another confounded variable.
+    # No reset_pin: the panel's RES is tied on the board, which is why Seeed's
+    # header has no RST define and their TFT_eSPI setup uses TFT_RST -1.
+    update_interval: never
+    auto_clear_enabled: false
+    # Same contract as the other board, laid out for 240x240: short labels and
+    # a small font, kept well inside the circle.
+    lambda: |-
+      if (id(content_loaded) && id(content_image)->is_loaded()) {
+        // Direct blit, not it.image(): see the byte_order note in
+        // common/content-pull.yaml. One bulk write instead of 57,600
+        // per-pixel virtual calls.
+        id(disp)->draw_pixels_at(0, 0, id(content_image)->get_width(),
+                                 id(content_image)->get_height(),
+                                 id(content_image)->get_data_start(),
+                                 display::COLOR_ORDER_RGB,
+                                 display::COLOR_BITNESS_565, true, 0, 0, 0);
+        return;
+      }
+      it.fill(Color(0, 0, 0));
+      const int cx = it.get_width() / 2;
+      int y = 58;
+      it.printf(cx, y, id(status_font), Color(0x80, 0x80, 0x80),
+                display::TextAlign::TOP_CENTER, "${device_name}");
+      y += 30;
+      // Honest states. The server line distinguishes a URL a server pushed
+      // us this session ("ok") from one merely restored from flash
+      // ("saved"), and nothing reports progress before the step above it.
+      const char *wifi_s    = id(wifi_ok) ? "ok" : "...";
+      const char *server_s  = !id(wifi_ok)       ? ""
+                            : id(server_pushed)  ? "ok"
+                            : id(server_ok)      ? "saved"
+                                                 : "...";
+      const char *content_s = !id(server_ok) ? "" : "...";
+      auto step = [&](const char *label, const char *state) {
+        Color colour = !state[0]       ? Color(0x50, 0x50, 0x50)
+                     : state[0] == 'o' ? Color(0x50, 0xC0, 0x70)
+                     : state[0] == 's' ? Color(0xC0, 0xB0, 0x50)
+                                       : Color(0xE8, 0xE8, 0xE8);
+        it.printf(cx, y, id(status_font), colour, display::TextAlign::TOP_CENTER,
+                  "%s %s", label, state);
+        y += 26;
+      };
+      step("WiFi", wifi_s);
+      step("Server", server_s);
+      step("Content", content_s);
+      if (!id(status_text).empty()) {
+        it.printf(cx, y + 6, id(status_font), Color(0xE0, 0x70, 0x70),
+                  display::TextAlign::TOP_CENTER, "%s", id(status_text).c_str());
+      }
+
+touchscreen:
+  - platform: chsc6x
+    id: touch
+    display: disp
+    interrupt_pin: GPIO44   # D7 / TOUCH_INT
+    # address defaults to 0x2E, which matches CHSC6X_I2C_ID in Seeed's header.
+
+font:
+  - file: "gfonts://Roboto"
+    id: status_font
+    size: 16
+
+# Backlight on D6 (GPIO43). Unlike the Waveshare 4.3 this needs no hardware
+# mod -- but note the Round Display v1.1 added a switch shared between A0 and
+# D6 (backlight vs battery-voltage sense). If the backlight does not respond,
+# check that switch before suspecting the config.
+output:
+  - platform: ledc
+    id: backlight_pwm
+    pin: GPIO43
+    frequency: 20000Hz
+
+light:
+  - platform: monochromatic
+    name: Backlight
+    id: backlight
+    output: backlight_pwm
+    restore_mode: ALWAYS_ON
+    default_transition_length: 500ms

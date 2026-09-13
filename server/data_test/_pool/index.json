@@ -1,0 +1,36 @@
+[
+  {
+    "id": "7e9b0b1ec9171435",
+    "sha256": "7e9b0b1ec91714359aa37ec89b924c08f729b9c4f8970ae461f3a3e3a062ecc5",
+    "bytes": 1011,
+    "content_type": "image/gif",
+    "filename": "clip.gif",
+    "source_format": "GIF",
+    "source_size": [
+      80,
+      80
+    ],
+    "uploaded_at": 1789322186.9775558,
+    "animated": true,
+    "frames": 6,
+    "duration_ms": 540,
+    "browser_playable": true
+  },
+  {
+    "id": "ce7fd71ec1a8adcc",
+    "sha256": "ce7fd71ec1a8adcc2aa3bc0b8fd028bec262d371b673d7ebe58e30979c648568",
+    "bytes": 5151,
+    "content_type": "image/png",
+    "filename": "x.png",
+    "source_format": "PNG",
+    "source_size": [
+      1200,
+      900
+    ],
+    "uploaded_at": 1789322186.9019861,
+    "animated": false,
+    "frames": 1,
+    "duration_ms": 0,
+    "browser_playable": false
+  }
+]

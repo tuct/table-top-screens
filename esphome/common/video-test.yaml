@@ -1,0 +1,127 @@
+# MJPEG experiment: fetch frame n, n+1, n+2... as fast as the device manages.
+#
+# This is the cheap path on purpose -- no new C++ component. It pays one HTTP
+# round trip per frame, which a real streaming component would not, so the
+# frame rate it reaches is a LOWER bound on what is achievable. The point is
+# to get a real number for decode + draw on this panel before deciding
+# whether writing that component is worth it.
+#
+# Include alongside common/content-pull.yaml; it reuses that file's
+# content_url, content_image, content_loaded and the display.
+#
+# What we already know, before measuring:
+#   * SPI floor on the 240x240 round panel: 240*240*2 = 115,200 bytes at
+#     20 MHz = 46 ms/frame, so ~21 fps is the ceiling just to push pixels.
+#   * Decode is the unknown. Our 800x480 figure worked out at ~0.2 Mpx/s,
+#     but JPEGDEC on an S3 has been measured at ~3.2 Mpx/s -- a 16x gap that
+#     is probably PSRAM contention with the RGB panel's 23 MB/s scanout. An
+#     SPI panel has no continuous scanout, so this is exactly what the
+#     experiment settles.
+
+# frame_in_flight, frames_done and video_active live in content-pull.yaml,
+# because its download-finished hook has to touch them and it must not depend
+# on this optional file.
+#
+# frame_in_flight is what keeps exactly one request in the air: without it a
+# fast interval would call update() mid-decode, online_image would log "Image
+# already being updated" and drop it, and the measured rate would be noise.
+globals:
+  - id: frame_n
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  - id: last_frame_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+switch:
+  - platform: template
+    name: Play Video
+    id: video_playing
+    optimistic: true
+    restore_mode: ALWAYS_OFF   # never start playing on its own after a reboot
+    turn_on_action:
+      - lambda: 'id(video_active) = true;'
+    turn_off_action:
+      # Put the still back when we stop, rather than leaving the last frame.
+      - lambda: |-
+          id(video_active) = false;
+          id(frame_in_flight) = false;
+      - if:
+          condition:
+            lambda: 'return !id(content_url).state.empty();'
+          then:
+            - online_image.set_url:
+                id: content_image
+                url: !lambda 'return id(content_url).state;'
+                update: true
+
+number:
+  - platform: template
+    name: Target FPS
+    id: target_fps
+    optimistic: true
+    restore_value: true
+    initial_value: "15"
+    min_value: 1
+    max_value: 30
+    step: 1
+    mode: box
+    entity_category: config
+
+sensor:
+  # Achieved rate, not requested: frames actually decoded and drawn in the
+  # last second. This is the number the experiment exists to produce.
+  - platform: template
+    name: Video FPS
+    id: video_fps
+    unit_of_measurement: fps
+    accuracy_decimals: 1
+    update_interval: never
+
+interval:
+  # Drive the frames. A fixed short interval with a time check inside, because
+  # an ESPHome interval period is fixed at compile time and the target rate
+  # needs to be adjustable while it runs.
+  - interval: 20ms
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: video_playing
+              - wifi.connected:
+              - lambda: |-
+                  if (id(frame_in_flight))
+                    return false;
+                  // The server pushes us an /image URL; the frame endpoint is
+                  // the same URL with a different path, so if that pattern is
+                  // missing we cannot build one and should not try.
+                  if (id(content_url).state.find("/image?") == std::string::npos)
+                    return false;
+                  const uint32_t target = (uint32_t) id(target_fps).state;
+                  const uint32_t period = target > 0 ? 1000u / target : 1000u;
+                  return millis() - id(last_frame_ms) >= period;
+          then:
+            - lambda: |-
+                id(frame_in_flight) = true;
+                id(last_frame_ms) = millis();
+            - online_image.set_url:
+                id: content_image
+                url: !lambda |-
+                  std::string u = id(content_url).state;
+                  auto pos = u.find("/image?");
+                  u.replace(pos, 7, "/frame?");
+                  // q=70 for frames: a still is worth 95, but at video rates
+                  // the download is part of the frame budget and 240x240 at
+                  // q70 is a third the bytes.
+                  return u + "&q=70&n=" + to_string(id(frame_n)++);
+                update: true
+
+  # Publish the achieved rate once a second.
+  - interval: 1s
+    then:
+      - lambda: |-
+          id(video_fps).publish_state(id(frames_done));
+          id(frames_done) = 0;

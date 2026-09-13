@@ -1,0 +1,34 @@
+# Device instance: one file per physical screen.
+# Everything board-specific lives in boards/, everything shared in common/.
+# To add a second screen: copy this file, change device_name, point `board:`
+# at the right board package.
+
+substitutions:
+  device_name: tabletop-01
+  friendly_name: Tabletop 01
+
+  # No server address: the screen advertises itself over mDNS and the content
+  # server pushes it a URL. Same network is the only requirement.
+  #
+  # Safety-net poll only: the server pushes on change, so this exists purely
+  # to recover a missed push -- hence rare. An unchanged image costs just a
+  # 304, but one that HAS changed costs ~2s of blocking JPEG decode that
+  # visibly disturbs the panel, so do not make this frequent.
+  #
+  # Do NOT use 0s to disable it -- that means "every loop iteration". Use the
+  # "Background Poll" switch the device exposes, or a long period here.
+  poll_interval: 30min
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+packages:
+  board: !include boards/waveshare-s3-touch-lcd-4.3.yaml
+  base: !include common/base.yaml
+  content: !include common/content-pull.yaml
+  # SD card over SPI, chip select held low on the CH422G -- see the note in
+  # components/sd_spi/__init__.py for why SDMMC cannot work on this board.
+  sd: !include common/sd-card.yaml
+  # Raw RGB565 clip playback off that card: no JPEG decode, no PSRAM bound.
+  clip: !include common/sd-clip.yaml

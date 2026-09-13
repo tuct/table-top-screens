@@ -1,0 +1,58 @@
+# SD card over SPI, using components/sd_spi.
+#
+# Not the SDMMC component (n-serrette/esphome_sd_card): that drives the SDMMC
+# peripheral, and neither board here can use it --
+#
+#   * Seeed round display: its card shares the LCD's SPI pins, so SDMMC would
+#     have to take those pins away from the panel.
+#   * Waveshare 4.3: its card is on free pins, but the chip select is on an
+#     I2C expander. An SD card latches SPI-vs-SD mode from the CS level at its
+#     first CMD0 after power-up, and that pin idles LOW long before I2C is
+#     initialised -- so the card is already in SPI mode before anything could
+#     drive it high. Tried it; "Failed to mount card".
+#
+# The board package must declare:
+#   sd_spi_bus_id   the SPI bus the card is on
+#   sd_cs_pin       chip select: a GPIO number, or "none" when the board holds
+#                   it asserted itself (the Waveshare, via CH422G EXIO4)
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [sd_spi]
+
+sd_spi:
+  id: sd
+  spi_host: ${sd_spi_host}
+  cs_pin: ${sd_cs_pin}
+  mount_point: /sd
+  # Never reformat on a failed mount: a failure here is far more likely to be
+  # wiring or chip select than a genuinely unformatted card, and the recovery
+  # for that must not be "erase the user's card".
+  format_if_mount_failed: false
+
+button:
+  # Press this first after flashing: it proves the card mounted AND that a
+  # directory read works, before anything depends on it.
+  - platform: template
+    name: SD List Root
+    id: sd_list_root
+    on_press:
+      - lambda: |-
+          if (!id(sd)->is_mounted()) {
+            ESP_LOGW("sd", "not mounted");
+            return;
+          }
+          auto entries = id(sd)->list_directory("/", 32);
+          ESP_LOGI("sd", "%u entries in /", (unsigned) entries.size());
+          for (auto &e : entries)
+            ESP_LOGI("sd", "  %s (%u bytes)", e.c_str(),
+                     (unsigned) id(sd)->file_size("/" + e));
+
+binary_sensor:
+  - platform: template
+    name: SD Mounted
+    id: sd_mounted
+    entity_category: diagnostic
+    lambda: 'return id(sd)->is_mounted();'
