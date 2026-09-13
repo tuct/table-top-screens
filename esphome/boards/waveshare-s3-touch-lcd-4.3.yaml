@@ -5,6 +5,7 @@
 # size the content request and place the activity dot. This is the seam that
 # lets one content server feed screens of different sizes and shapes:
 #   display_width / display_height   panel size, sent to the server via mDNS
+#   display_round                    "1" if the visible area is a circle, else "0"
 #   default_fit                      contain | cover | width | height | stretch
 #   dot_x / dot_y                    initial activity-dot position (tunable at
 #                                    runtime via the Dot X / Dot Y numbers)
@@ -13,6 +14,7 @@
 substitutions:
   display_width: "800"
   display_height: "480"
+  display_round: "0"
   default_fit: contain      # 5:3 panel, letterboxing is reasonable
   # mipi_rgb keeps its framebuffer little-endian RGB565. Getting this wrong
   # shows red as blue, green as red and blue as green.
@@ -86,6 +88,11 @@ display:
     # mirrored by the 500ms interval in common/content-pull.yaml), so it
     # cannot claim a stage succeeded when it has not.
     lambda: |-
+      // A still blitted from the SD card is already on the panel, and there
+      // is no copy in RAM to redraw it from. Painting anything here would
+      // only overwrite it.
+      if (id(content_on_sd))
+        return;
       if (id(content_loaded) && id(content_image)->is_loaded()) {
         // Direct blit, not it.image(): see the byte_order note in
         // common/content-pull.yaml. One bulk write instead of 57,600
@@ -123,6 +130,15 @@ display:
       step("Connecting to WiFi", wifi_s);
       step("Searching for server", server_s);
       step("Getting content", content_s);
+      // Not a step -- it never blocks boot -- so its own colours: green when
+      // stills go to the card, amber for a card that is there but unused or
+      // missing.
+      if (!id(sd_status).empty()) {
+        it.printf(60, y, id(status_font),
+                  id(still_to_sd) ? Color(0x50, 0xC0, 0x70) : Color(0xC0, 0xB0, 0x50),
+                  display::TextAlign::TOP_LEFT, "SD card ... %s", id(sd_status).c_str());
+        y += 42;
+      }
       if (!id(status_text).empty()) {
         it.printf(60, y + 12, id(status_font), Color(0xE0, 0x70, 0x70),
                   display::TextAlign::TOP_LEFT, "%s", id(status_text).c_str());

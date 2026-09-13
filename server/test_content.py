@@ -11,13 +11,18 @@ Run: ./.venv/Scripts/python.exe test_content.py
 from __future__ import annotations
 
 import io
+import os
 import shutil
 import sys
 from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-import app as srv
+# Before importing app: this suite uses real screen names (tabletop-01), and
+# with discovery on it pushed test content to the real screen of that name.
+os.environ["SCREENS_DISCOVERY"] = "0"
+
+import app as srv  # noqa: E402
 
 DATA_TEST = Path("./data_test")
 results: list[bool] = []
@@ -370,6 +375,13 @@ def main() -> int:
         r.headers["Content-Type"] == "application/octet-stream",
         r.headers["Content-Type"],
     )
+    # The SD still path sends If-None-Match with the ETag it stored alongside
+    # the file; an unchanged picture must not re-send 768 KB.
+    etag = r.headers.get("ETag")
+    check("rgb565 carries an ETag", bool(etag), str(etag))
+    r2 = c.get("/d/tabletop-01/image?w=800&h=480&fmt=rgb565", headers={"If-None-Match": etag})
+    check("rgb565 repeat with ETag is an empty 304",
+          r2.status_code == 304 and not r2.data, str(r2.status_code))
     r = c.get("/d/tabletop-01/image?w=240&h=240&fmt=rgb565")
     check("rgb565 honours size", len(r.data) == 240 * 240 * 2, str(len(r.data)))
     check(

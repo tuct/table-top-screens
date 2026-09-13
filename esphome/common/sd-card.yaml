@@ -56,3 +56,68 @@ binary_sensor:
     id: sd_mounted
     entity_category: diagnostic
     lambda: 'return id(sd)->is_mounted();'
+
+  # Whether stills are actually being stored on and shown from the card right
+  # now (common/sd-still.yaml, with a card mounted). Entity NAMES "SD Mounted",
+  # "SD In Use", "SD Total" and "SD Free" are read by the server
+  # (discovery.py SD_STATE_PATHS); rename them there too.
+  - platform: template
+    name: SD In Use
+    id: sd_in_use
+    entity_category: diagnostic
+    lambda: 'return id(still_to_sd);'
+
+# Megabytes, not bytes: web_server reports a float, which cannot hold a 32 GB
+# byte count exactly. Rarely polled -- see SdSpi::space() -- and refreshed by
+# the interval below as soon as a card mounts.
+sensor:
+  - platform: template
+    name: SD Total
+    id: sd_total_mb
+    unit_of_measurement: MB
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      uint64_t total, free;
+      if (!id(sd)->space(total, free)) return NAN;
+      return total / (1024.0f * 1024.0f);
+
+  - platform: template
+    name: SD Free
+    id: sd_free_mb
+    unit_of_measurement: MB
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      uint64_t total, free;
+      if (!id(sd)->space(total, free)) return NAN;
+      return free / (1024.0f * 1024.0f);
+
+# One line for the boot checklist, built from the sensors above so the display
+# never waits on the card. Requires common/content-pull.yaml (sd_status,
+# still_to_sd).
+interval:
+  - interval: 2s
+    then:
+      - lambda: |-
+          if (!id(sd)->is_mounted()) {
+            id(sd_status) = "no card";
+            return;
+          }
+          // First reading right after a (possibly late) mount, instead of
+          // waiting up to a minute for the sensors' own interval.
+          if (std::isnan(id(sd_total_mb).state)) {
+            id(sd_total_mb).update();
+            id(sd_free_mb).update();
+          }
+          const char *use = id(still_to_sd) ? "stills on card" : "mounted, unused";
+          char buf[64];
+          if (std::isnan(id(sd_total_mb).state)) {
+            snprintf(buf, sizeof(buf), "%s", use);
+          } else {
+            snprintf(buf, sizeof(buf), "%s, %.1f of %.1f GB free", use,
+                     id(sd_free_mb).state / 1024.0f, id(sd_total_mb).state / 1024.0f);
+          }
+          id(sd_status) = buf;

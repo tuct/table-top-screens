@@ -282,6 +282,13 @@ std::string SdSpi::resolve_(const std::string &path) const {
   return this->mount_point_ + "/" + path;
 }
 
+bool SdSpi::space(uint64_t &total, uint64_t &free) {
+  total = free = 0;
+  if (!this->mounted_)
+    return false;
+  return esp_vfs_fat_info(this->mount_point_.c_str(), &total, &free) == ESP_OK;
+}
+
 size_t SdSpi::file_size(const std::string &path) {
   if (!this->mounted_)
     return 0;

@@ -17,6 +17,7 @@
 substitutions:
   display_width: "240"
   display_height: "240"
+  display_round: "1"
   # Round panel: the corners sit behind the bezel, so letterboxing would put
   # bars where nothing is visible anyway. Fill and crop instead.
   default_fit: cover
@@ -92,6 +93,9 @@ display:
     # Same contract as the other board, laid out for 240x240: short labels and
     # a small font, kept well inside the circle.
     lambda: |-
+      // See the Waveshare board: an SD still is already on the panel.
+      if (id(content_on_sd))
+        return;
       if (id(content_loaded) && id(content_image)->is_loaded()) {
         // Direct blit, not it.image(): see the byte_order note in
         // common/content-pull.yaml. One bulk write instead of 57,600

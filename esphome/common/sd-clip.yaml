@@ -23,6 +23,11 @@
 # Requires common/sd-card.yaml (the mount) and common/content-pull.yaml (the
 # content_url the frame URL is derived from, and video_active).
 
+# Capability, advertised over mDNS: the server sends this screen clips from
+# these source formats; anything else animated arrives as its first frame.
+substitutions:
+  anim_formats: gif,apng,webp
+
 external_components:
   - source:
       type: local
@@ -35,10 +40,11 @@ sd_clip:
   width: ${display_width}
   height: ${display_height}
 
-online_image:
+image:
   # A second slot, separate from content_image, so caching a clip never
   # disturbs the still that content-pull owns.
-  - id: clip_fetch
+  - platform: online_image
+    id: clip_fetch
     url: http://127.0.0.1/awaiting-clip
     format: JPEG
     type: RGB565

@@ -55,6 +55,16 @@ NUMBER_SET_PATHS = (
     f"/number/{quote('Clip Frames')}/set",
     "/number/clip_frames/set",
 )
+# Read from screens that advertise `sd=1`, published by common/sd-card.yaml.
+# key -> web_server route; sizes are in MB there.
+SD_STATE_PATHS = {
+    "mounted": f"/binary_sensor/{quote('SD Mounted')}",
+    "in_use": f"/binary_sensor/{quote('SD In Use')}",
+    "total_mb": f"/sensor/{quote('SD Total')}",
+    "free_mb": f"/sensor/{quote('SD Free')}",
+}
+# Free space changes slowly and the device only re-measures once a minute.
+SD_POLL_INTERVAL = 30.0
 CONFIGURE_RETRIES = 5
 CONFIGURE_BACKOFF = 3.0
 
@@ -76,6 +86,19 @@ class Screen:
     # Degrees clockwise, for a panel mounted turned. Declared via a `rot` TXT
     # record; the server applies it when rendering.
     rot: int = 0
+    # Capabilities, from the `round`, `img`, `anim` and `sd` TXT records.
+    round: bool = False
+    # Still formats the firmware accepts.
+    img: tuple[str, ...] = ("jpeg",)
+    # Animation source formats it can play ("gif", "apng", "webp"). None means
+    # the firmware predates the record, so nothing is known and clips are
+    # offered as before; an empty tuple means stills only.
+    anim: tuple[str, ...] | None = None
+    # Stores stills on an SD card (when one is mounted).
+    sd: bool = False
+    # Live card state read back from the screen (see Registry.refresh_sd):
+    # {"mounted", "in_use", "total_mb", "free_mb", "at"}, or None if never read.
+    sd_state: dict | None = None
     first_seen: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
     configured_url: str | None = None
@@ -91,10 +114,40 @@ class Screen:
             "fit": self.fit,
             "quality": self.quality,
             "rot": self.rot,
+            "caps": self.caps(),
+            "sd_state": self.sd_state,
             "last_seen": self.last_seen,
             "configured_url": self.configured_url,
             "last_error": self.last_error,
         }
+
+    def caps(self) -> dict:
+        return {
+            "x": self.width,
+            "y": self.height,
+            "round": self.round,
+            "img": list(self.img),
+            "anim": None if self.anim is None else list(self.anim),
+            "sd": self.sd,
+        }
+
+    def can_animate(self, source_format: str) -> bool:
+        """Whether this screen plays a clip whose source is `source_format`
+        ("gif", "apng", "webp"). Unknown firmware gets the benefit of the doubt."""
+        return self.anim is None or source_format in self.anim
+
+    def config_key(self) -> tuple:
+        """Everything that, when it changes, means the screen needs re-pushing."""
+        return (self.host, self.port, self.width, self.height, self.fmt,
+                self.quality, self.rot, self.round, self.img, self.anim, self.sd)
+
+
+def _csv(value: str | None) -> tuple[str, ...] | None:
+    """A comma-separated TXT value as a tuple; "none" or empty is ()."""
+    if value is None:
+        return None
+    items = tuple(v.strip().lower() for v in value.split(",") if v.strip())
+    return () if items in ((), ("none",)) else items
 
 
 def local_ip_toward(host: str) -> str:
@@ -119,7 +172,8 @@ class Registry:
 
     def __init__(self, content_port: int) -> None:
         self.content_port = content_port
-        # Set by app.py: device name -> frame count of whatever it is showing.
+        # Set by app.py: Screen -> frame count of whatever it is showing, as
+        # that screen should play it (1 if it cannot animate the source).
         # A callback rather than a lookup, so discovery keeps knowing nothing
         # about the library.
         self.frames_provider = None
@@ -146,19 +200,16 @@ class Registry:
         """Store a screen. Returns it if it needs (re)configuring."""
         with self._lock:
             existing = self._screens.get(key)
-            if existing and (
-                existing.host == screen.host
-                and existing.port == screen.port
-                and existing.width == screen.width
-                and existing.height == screen.height
-                and existing.fmt == screen.fmt
-                and existing.quality == screen.quality
-                and existing.rot == screen.rot
+            if (
+                existing
+                and existing.config_key() == screen.config_key()
                 and existing.configured_url
             ):
                 existing.last_seen = time.time()
                 return None  # unchanged and already configured
             screen.first_seen = existing.first_seen if existing else time.time()
+            if existing and screen.sd:
+                screen.sd_state = existing.sd_state  # keep showing it meanwhile
             self._screens[key] = screen
             return screen
 
@@ -218,6 +269,7 @@ class Registry:
                     log.info("configured %s -> %s", screen.name, url)
                     self.mark(key, url, None)
                     self.push_frames(screen)
+                    self.refresh_sd(screen)  # so the page has it right away
                     return
                 if r.status_code == 404:
                     err = (
@@ -243,7 +295,7 @@ class Registry:
         if self.frames_provider is None:
             return False
         try:
-            count = int(self.frames_provider(screen.name))
+            count = int(self.frames_provider(screen))
         except Exception as exc:  # noqa: BLE001 - provider is app-supplied
             log.warning("frames_provider failed for %s: %s", screen.name, exc)
             return False
@@ -262,6 +314,53 @@ class Registry:
             if r.status_code != 404:
                 return False
         return False  # no such entity: this screen has no clip cache
+
+    def refresh_sd(self, screen: Screen) -> dict | None:
+        """Read the card state from a screen that stores stills on SD.
+
+        Stored on the screen and returned; None (and the old state kept) when
+        the screen does not answer, so one missed poll does not blank the page.
+        A 404 means firmware without the SD entities, which is not an error.
+        """
+        if not screen.sd:
+            return None
+        base = f"http://{screen.host}:{screen.port}"
+        state: dict = {}
+        for key, path in SD_STATE_PATHS.items():
+            try:
+                r = requests.get(base + path, timeout=HTTP_TIMEOUT)
+            except requests.RequestException as exc:
+                log.debug("sd state from %s failed: %s", screen.name, exc)
+                return None
+            if r.status_code == 404:
+                state[key] = None
+                continue
+            if r.status_code != 200:
+                return None
+            try:
+                value = r.json().get("value")
+            except ValueError:
+                return None
+            if key in ("mounted", "in_use"):
+                state[key] = bool(value)
+            else:
+                # NaN (no card) arrives as null or a non-number.
+                state[key] = (
+                    float(value)
+                    if isinstance(value, (int, float)) and value == value
+                    else None
+                )
+        state["at"] = time.time()
+        with self._lock:
+            screen.sd_state = state
+        return state
+
+    def poll_sd_forever(self, interval: float = SD_POLL_INTERVAL) -> None:
+        while True:
+            for screen in self.all():
+                if screen.sd:
+                    self.refresh_sd(screen)
+            time.sleep(interval)
 
     def notify(self, device: str) -> int:
         """Push: make every screen for `device` fetch now. Returns how many."""
@@ -288,8 +387,13 @@ class Registry:
 
 
 class _Listener(ServiceListener):
-    def __init__(self, registry: Registry) -> None:
+    def __init__(self, registry: Registry, only: set[str] | None = None) -> None:
         self.registry = registry
+        # When set, every other screen on the network is ignored -- never
+        # configured, never pushed to. Tests need this: they run on the real
+        # LAN, and without it a test run re-pointed a real screen at the test
+        # process and hammered its Refresh button.
+        self.only = only
 
     def _handle(self, zc: Zeroconf, type_: str, name: str) -> None:
         info = zc.get_service_info(type_, name, timeout=3000)
@@ -317,6 +421,8 @@ class _Listener(ServiceListener):
         # mDNS instance string -- the device states its own identity, so the
         # content path can never drift from what the screen thinks it is.
         device = txt.get("name") or name.split(".")[0]
+        if self.only is not None and device not in self.only:
+            return
         screen = Screen(
             name=device,
             host=addresses[0],
@@ -327,6 +433,10 @@ class _Listener(ServiceListener):
             fit=txt.get("fit", "contain"),
             quality=as_int("q", 0) or None,
             rot=as_int("rot", 0) % 360,
+            round=txt.get("round", "0") in ("1", "true", "yes"),
+            img=_csv(txt.get("img")) or (txt.get("fmt", "jpeg"),),
+            anim=_csv(txt.get("anim")),
+            sd=txt.get("sd", "0") in ("1", "true", "yes"),
         )
 
         if (needs_config := self.registry.put(name, screen)) is not None:
@@ -353,9 +463,18 @@ class _Listener(ServiceListener):
         self.registry.drop(name)
 
 
-def start(content_port: int) -> tuple[Registry, Zeroconf]:
+def start(
+    content_port: int, browse: bool = True, only: set[str] | None = None
+) -> tuple[Registry, Zeroconf | None]:
+    """Start discovery. `browse=False` gives an empty registry that never
+    touches the network; `only` restricts it to the named screens."""
     registry = Registry(content_port)
+    if not browse:
+        log.info("discovery disabled")
+        return registry, None
     zc = Zeroconf()
-    ServiceBrowser(zc, SERVICE_TYPE, _Listener(registry))
-    log.info("browsing for %s", SERVICE_TYPE)
+    ServiceBrowser(zc, SERVICE_TYPE, _Listener(registry, only))
+    threading.Thread(target=registry.poll_sd_forever, daemon=True).start()
+    log.info("browsing for %s%s", SERVICE_TYPE,
+             f" (only {', '.join(sorted(only))})" if only is not None else "")
     return registry, zc

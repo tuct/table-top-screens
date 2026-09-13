@@ -1,0 +1,163 @@
+# Stills stored on the SD card and shown from there.
+#
+# For boards that cannot spare memory for content. The network path decodes a
+# JPEG into a full-frame buffer -- 768 KB at 800x480, which on an S3 means
+# PSRAM -- and blocks for ~1.9 s doing it. This path never decodes and never
+# holds more than one band of rows:
+#
+#   GET ...&fmt=rgb565  ->  streamed to /still/new.565 a chunk per loop tick
+#                       ->  renamed over /still/image.565
+#   /still/image.565    ->  read a band at a time into internal RAM -> panel
+#
+# A conditional GET (If-None-Match with the stored ETag) makes an unchanged
+# still cost one 304, and because the picture lives on the card the screen
+# shows it at power-up before WiFi or the server are up at all.
+#
+# "If available": the route is chosen per fetch. With no card mounted,
+# common/content-pull.yaml's fetch_content falls back to online_image.
+#
+# Requires common/sd-card.yaml and common/content-pull.yaml, and must be listed
+# AFTER content-pull in the device file so the capability substitutions below
+# override its defaults.
+
+substitutions:
+  sd_still: "1"
+  image_formats: jpeg,rgb565
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [sd_clip]
+
+# Same declaration as common/sd-clip.yaml, so the two packages merge into one
+# component if a board includes both.
+sd_clip:
+  id: clip
+  width: ${display_width}
+  height: ${display_height}
+
+interval:
+  - interval: 200ms
+    then:
+      - lambda: |-
+          // Pacing. A fetch request is only a flag (still_fetch_pending), so
+          // any number of pushes arriving together -- or a misbehaving client
+          // pressing Refresh in a loop -- collapse into one fetch, and fetches
+          // are never closer together than MIN_GAP_MS. On failure: three quick
+          // retries, then exponential backoff to a 5 minute ceiling.
+          static const uint32_t MIN_GAP_MS = 2000;
+          static uint32_t next_ms = 0;
+          static uint32_t failures = 0;
+          static std::string last_url;
+          // Power-up show happens once per card insertion, never per tick.
+          static bool boot_shown = false;
+          const uint32_t now = millis();
+
+          // Route stills by whether a card is actually there right now. The
+          // mount can arrive late (sd_spi retries), and a card can be pulled.
+          id(still_to_sd) = id(sd)->is_mounted();
+          if (!id(still_to_sd) && id(content_on_sd)) {
+            // Card gone under a still that came from it: hand the panel back
+            // to the network path and fetch there.
+            id(content_on_sd) = false;
+            id(content_loaded) = false;
+            id(still_fetch_pending) = false;
+            boot_shown = false;
+          }
+
+          // Power-up: show what the card holds before anything else happens.
+          if (!boot_shown && id(still_to_sd) && !id(content_loaded) &&
+              id(clip)->has_still()) {
+            boot_shown = true;
+            if (id(clip)->show_still()) {
+              ESP_LOGI("sd_still", "Showing the still from the card");
+              id(content_on_sd) = true;
+              id(content_loaded) = true;
+              // content_loaded switches off content-pull's boot retry, and the
+              // server does not re-push an unchanged screen after a reboot --
+              // so check once ourselves. Costs a 304 if the card is current.
+              id(still_fetch_pending) = true;
+            }
+          }
+
+          switch (id(clip)->take_still_event()) {
+            case esphome::sd_clip::SdClip::STILL_UPDATED:
+              failures = 0;
+              next_ms = now + MIN_GAP_MS;
+              id(loading) = false;
+              if (id(clip)->show_still()) {
+                id(content_on_sd) = true;
+                id(content_loaded) = true;
+                id(status_text) = "";
+              } else {
+                id(status_text) = "Could not read the still from the card";
+              }
+              break;
+            case esphome::sd_clip::SdClip::STILL_UNCHANGED:
+              failures = 0;
+              next_ms = now + MIN_GAP_MS;
+              id(loading) = false;
+              // Never re-blit what is already on the panel: an unchanged
+              // picture must not flicker, however often it is asked for.
+              if (!id(content_on_sd) && id(clip)->show_still()) {
+                id(content_on_sd) = true;
+                id(content_loaded) = true;
+                id(status_text) = "";
+              }
+              break;
+            case esphome::sd_clip::SdClip::STILL_FAILED: {
+              failures++;
+              // 2 s, 4 s, 6 s; then 30 s, 1 min, 2 min, 4 min, 5 min, 5 min...
+              uint32_t delay_ms = failures <= 3
+                  ? MIN_GAP_MS * failures
+                  : std::min<uint32_t>(30000u << std::min<uint32_t>(failures - 4, 4), 300000u);
+              next_ms = now + delay_ms;
+              id(still_fetch_pending) = true;  // retry by itself
+              ESP_LOGW("sd_still", "Fetch failed (%u in a row); retrying in %u s",
+                       (unsigned) failures, (unsigned) (delay_ms / 1000));
+              id(loading) = false;
+              if (!id(content_on_sd))
+                id(status_text) = "Could not load content";
+              break;
+            }
+            default:
+              break;
+          }
+
+          // No card: stills go over the network now (fetch_content routes them
+          // there), so a request still parked here -- e.g. a retry -- is moot.
+          if (!id(still_to_sd)) {
+            id(still_fetch_pending) = false;
+            return;
+          }
+          if (!id(still_fetch_pending) || id(clip)->still_busy())
+            return;
+          // Guarded on WiFi like every other fetch (README trap 5).
+          if (!wifi::global_wifi_component->is_connected() || id(content_url).state.empty())
+            return;
+          // A different URL is new content from the server: skip any backoff
+          // left over from failures against the old one.
+          if (id(content_url).state != last_url) {
+            last_url = id(content_url).state;
+            failures = 0;
+            next_ms = now;
+          }
+          // Signed difference, so this survives millis() wrapping.
+          if ((int32_t) (now - next_ms) < 0)
+            return;
+          id(still_fetch_pending) = false;
+
+          // Same URL the network path uses, asking for raw RGB565 instead:
+          // framing (size, fit, rotation, zoom, background) stays identical.
+          std::string u = id(content_url).state;
+          auto f = u.find("fmt=");
+          if (f != std::string::npos) {
+            auto end = u.find('&', f);
+            if (end == std::string::npos) end = u.size();
+            u.replace(f, end - f, "fmt=rgb565");
+          } else {
+            u += (u.find('?') == std::string::npos ? "?" : "&");
+            u += "fmt=rgb565";
+          }
+          id(clip)->start_still(u);

@@ -13,13 +13,17 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
 
 from PIL import Image
 
-import app as srv
+# Before importing app: never discover, configure or push to real screens.
+os.environ["SCREENS_DISCOVERY"] = "0"
+
+import app as srv  # noqa: E402
 
 DATA_TEST = Path("./data_lib_test")
 FORM = "application/x-www-form-urlencoded"

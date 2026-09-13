@@ -24,6 +24,7 @@ import io
 import json
 import logging
 import mimetypes
+import os
 import re
 import time
 from collections import OrderedDict
@@ -69,22 +70,62 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD
 
 # Screens announce themselves over mDNS; this browses for them and pushes each
 # one its content URL. Nothing here needs to be told an address.
-registry, _zc = discovery.start(PORT)
+#
+# SCREENS_DISCOVERY=0 turns that off and SCREENS_ONLY=a,b limits it to named
+# screens. Both exist for the tests: importing this module used to start real
+# discovery, which pushed test content to -- and pressed Refresh on -- any real
+# screen on the LAN sharing a test's device name.
+registry, _zc = discovery.start(
+    PORT,
+    browse=os.environ.get("SCREENS_DISCOVERY", "1") != "0",
+    only=(
+        {n.strip() for n in os.environ["SCREENS_ONLY"].split(",") if n.strip()}
+        if os.environ.get("SCREENS_ONLY")
+        else None
+    ),
+)
 
 
-def _frames_for(device: str) -> int:
-    """Frame count of whatever `device` is currently showing; 0 if nothing.
+def anim_format(item: dict) -> str | None:
+    """The capability name for an animated item's source: gif, apng or webp.
+
+    Pillow calls an APNG "PNG", so the name is mapped rather than lowercased.
+    None for a still or a format no screen could advertise.
+    """
+    if not item.get("animated"):
+        return None
+    return {"GIF": "gif", "PNG": "apng", "WEBP": "webp"}.get(
+        str(item.get("source_format", "")).upper()
+    )
+
+
+def plays_as_still(screen, item: dict | None) -> bool:
+    """True when `item` is animated but `screen` cannot play it, so it shows
+    the first frame instead."""
+    if not item or not item.get("animated"):
+        return False
+    fmt = anim_format(item)
+    return fmt is None or not screen.can_animate(fmt)
+
+
+def _frames_for(screen) -> int:
+    """Frame count of what `screen` is showing, as it should play it; 0 if
+    nothing.
 
     Comes from the metadata recorded at upload, so a still is 1 and a clip is
     its real length -- no decoding here. The device caches and auto-plays when
-    this is > 1, which is what makes animation need no button press.
+    this is > 1, which is what makes animation need no button press. A screen
+    that did not advertise the clip's format gets 1: `/image` already renders
+    frame 0, so it simply shows a still.
     """
     try:
-        item = library.current(DATA_DIR, device)
+        item = library.current(DATA_DIR, screen.name)
     except library.LibraryError:
         return 0
     if not item:
         return 0
+    if plays_as_still(screen, item):
+        return 1
     return int(item.get("frames", 1) or 1)
 
 
@@ -190,6 +231,51 @@ def motion_badge(item: dict) -> str:
         f'<span class="anim" title="Animated {item.get("source_format", "")}">'
         f'&#9658; {m.get("frames", "?")} frames{length}</span>'
     )
+
+
+def caps_html(screen) -> str:
+    """One line of what a screen can do, for its card and page."""
+    if screen.anim is None:
+        motion = "animation unknown"
+    elif screen.anim:
+        motion = "plays " + "/".join(screen.anim)
+    else:
+        motion = "stills only"
+    parts = [f"{screen.width}x{screen.height}"]
+    if screen.round:
+        parts.append("round")
+    parts += [motion, "img " + "/".join(screen.img)]
+    html = '<small class="caps">' + " &middot; ".join(parts) + "</small>"
+    if screen.sd:
+        html += "<br>" + sd_html(screen.sd_state)
+    return html
+
+
+def sd_html(state: dict | None) -> str:
+    """The screen's SD card: whether stills are on it, and free of total."""
+    if not state:
+        return '<small class="caps">SD card: not read yet</small>'
+    if not state.get("mounted"):
+        return '<small class="sdwarn">SD card: none mounted &mdash; stills over the network</small>'
+    use = ('<span class="sdon">stills on card</span>' if state.get("in_use")
+           else '<span class="sdwarn">mounted, not used</span>')
+    total, free = state.get("total_mb"), state.get("free_mb")
+    if total and free is not None:
+        pct = 100 * (total - free) / total
+        size = (f" &middot; {free / 1024:.1f} of {total / 1024:.1f} GB free"
+                f' <meter min="0" max="100" value="{pct:.0f}" '
+                f'title="{pct:.0f}% used"></meter>')
+    else:
+        size = ""
+    return f'<small class="caps">SD card: {use}{size}</small>'
+
+
+def still_badge(screen, item: dict | None) -> str:
+    if screen is None or not plays_as_still(screen, item):
+        return ""
+    return ('<span class="still" title="This screen does not play '
+            f'{anim_format(item) or "this format"}; it shows the first frame">'
+            "still here</span>")
 
 
 def redirect_target(default: str) -> str:
@@ -949,7 +1035,9 @@ def device_page(device: str):
     # screen. Prefs override query params, so the preview shows the same fit
     # and rotation the device will get.
     screens = registry.for_device(device)
-    pw, ph = (screens[0].width, screens[0].height) if screens else (800, 480)
+    screen = screens[0] if screens else None
+    pw, ph = (screen.width, screen.height) if screen else (800, 480)
+    shape = "border-radius:50%;" if screen and screen.round else ""
     scale = min(1.0, 520 / max(pw, 1))
     vw, vh = max(1, round(pw * scale)), max(1, round(ph * scale))
 
@@ -963,7 +1051,7 @@ def device_page(device: str):
             f'data-base="/d/{device}/image?w={vw}&h={vh}&fmt=png" '
             f'src="/d/{device}/image?w={vw}&h={vh}&fmt=png&t={int(meta["uploaded_at"])}" '
             f'width="{vw}" height="{vh}" '
-            f'style="max-width:100%;border:1px solid #ccc;background:#eee"></p>'
+            f'style="max-width:100%;border:1px solid #ccc;background:#eee;{shape}"></p>'
             f'<p style="color:#666" id="pstatus">Showing what is on the screen '
             f'now, at the panel aspect ratio {pw}x{ph}.</p>'
         )
@@ -1003,7 +1091,8 @@ def device_page(device: str):
             f'<li{attrs} data-id="{it["id"]}">'
             f'{grip}'
             f'<img src="{thumb_src(it)}" width="80" height="48" alt="" loading="lazy">'
-            f'<span class="who"><b>{num}{it["filename"]}</b> {motion_badge(it)}<br>'
+            f'<span class="who"><b>{num}{it["filename"]}</b> {motion_badge(it)} '
+            f'{still_badge(screen, it)}<br>'
             f'<small>{it["source_size"][0]}x{it["source_size"][1]}, '
             f'{it["bytes"] // 1024} kB, {when}'
             f'{" &mdash; <b>on screen</b>" if is_current else ""}</small></span>'
@@ -1104,8 +1193,15 @@ def device_page(device: str):
   .acts button {{ font-size: .85rem; padding: .3rem .6rem; }}
   .anim {{ font-size: .75rem; color: #0a5; border: 1px solid #0a5;
            border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
+  .still {{ font-size: .75rem; color: #a60; border: 1px solid #a60;
+            border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
+  .caps {{ color: #666; }}
+  .sdon {{ color: #1a7f37; }}
+  .sdwarn {{ color: #a60; }}
+  meter {{ width: 4rem; height: .7rem; vertical-align: middle; }}
 </style>
 <h1>{device}</h1>
+<p>{caps_html(screen) if screen else '<small class="caps">offline &mdash; capabilities unknown</small>'}</p>
 {current}
 
 <fieldset>
@@ -1182,23 +1278,25 @@ def index():
         items = lib(library.used_items, name) or lib(library.pool)
         cur = next((i for i in items if i["id"] == state["current"]), None)
 
+        # A round panel shows only the inscribed circle, so preview exactly that.
+        shape = "border-radius:50%;" if sc and sc.round else ""
         if state["current"]:
             preview = (
                 f'<img class="preview" data-base="/d/{name}/image?w={tw}&h={th}&fmt=png"'
                 f' src="/d/{name}/image?w={tw}&h={th}&fmt=png"'
                 f' width="{tw}" height="{th}" alt=""'
-                f' style="border:1px solid #ccc;background:#eee">'
+                f' style="border:1px solid #ccc;background:#eee;{shape}">'
             )
         else:
             preview = (
-                f'<a href="/d/{name}/" class="empty" style="width:{tw}px;height:{th}px">'
+                f'<a href="/d/{name}/" class="empty" style="width:{tw}px;height:{th}px;{shape}">'
                 "nothing on screen</a>"
             )
 
         if sc:
             status = (
                 f'<span class="on">&#9679; online</span> '
-                f"<small>{sc.host} &middot; {sc.width}x{sc.height}</small>"
+                f"<small>{sc.host}</small><br>{caps_html(sc)}"
             )
             if sc.last_error:
                 status += f' <small class="err">({sc.last_error})</small>'
@@ -1230,7 +1328,7 @@ def index():
             f'<div class="card"><h2><a href="/d/{name}/">{name}</a></h2>'
             f"<p>{status}</p>{preview}"
             f'<p><small class="caption">{cur["filename"] if cur else "&mdash;"}</small> '
-            f'{motion_badge(cur) if cur else ""}</p>'
+            f'{motion_badge(cur) if cur else ""} {still_badge(sc, cur)}</p>'
             f"{switcher}</div>"
         )
 
@@ -1285,6 +1383,12 @@ def index():
   .pick.busy button {{ opacity: .4; }}
   .anim {{ font-size: .75rem; color: #0a5; border: 1px solid #0a5;
            border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
+  .still {{ font-size: .75rem; color: #a60; border: 1px solid #a60;
+            border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
+  .caps {{ color: #666; }}
+  .sdon {{ color: #1a7f37; }}
+  .sdwarn {{ color: #a60; }}
+  meter {{ width: 4rem; height: .7rem; vertical-align: middle; }}
   form {{ display: inline; }}
   fieldset {{ border: 1px solid #ddd; margin: 1.5rem 0; padding: 1rem; }}
   ul#scenes {{ list-style: none; margin: 0; padding: 0; }}

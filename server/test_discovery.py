@@ -9,8 +9,8 @@ configure proves the entity-name route was used.
 
 Not hermetic, by nature: the stub advertises on the real network, so any
 other content server running on the LAN will also discover it and probe it.
-For the same reason this test's own Registry discovers real screens and will
-re-push them their (unchanged) content URL.
+The reverse is prevented: SCREENS_ONLY limits this test's own Registry to the
+stub, so real screens are never configured or pushed to.
 
 Run: ./.venv/Scripts/python.exe test_discovery.py
 """
@@ -18,7 +18,9 @@ Run: ./.venv/Scripts/python.exe test_discovery.py
 from __future__ import annotations
 
 import io
+import json
 import logging
+import os
 import socket
 import sys
 import threading
@@ -29,10 +31,12 @@ from urllib.parse import parse_qs, unquote, urlparse
 from PIL import Image
 from zeroconf import ServiceInfo, Zeroconf
 
-import app as srv
-import discovery
-
 DEVICE = "faketop-01"
+# Before importing app: discover the stub and nothing else on the LAN.
+os.environ["SCREENS_ONLY"] = DEVICE
+
+import app as srv  # noqa: E402
+import discovery  # noqa: E402
 received: dict[str, list] = {"set_url": [], "press": [], "paths": [], "frames": []}
 
 
@@ -63,6 +67,25 @@ class StubScreen(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    # What web_server answers for the SD entities in common/sd-card.yaml.
+    # Mutable so a test can pull the card out.
+    sd = {"SD Mounted": True, "SD In Use": True, "SD Total": 30436.0, "SD Free": 28057.6}
+
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
+        path = unquote(urlparse(self.path).path)
+        name = path.rsplit("/", 1)[-1]
+        if path.startswith(("/sensor/", "/binary_sensor/")) and name in self.sd:
+            value = self.sd[name]
+            body = json.dumps({"value": value, "state": str(value)}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+        else:
+            body = b""
+            self.send_response(404)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, *args):  # keep test output readable
         pass
 
@@ -92,6 +115,11 @@ def main() -> int:
             "h": "480",
             "fmt": "jpeg",
             "fit": "contain",
+            # Capabilities: this stub plays GIFs but not APNGs, and has SD.
+            "round": "0",
+            "img": "jpeg,rgb565",
+            "anim": "gif",
+            "sd": "1",
         },
     )
 
@@ -154,6 +182,46 @@ def main() -> int:
             check("registry recorded panel size from mDNS", (screen.width, screen.height) == (800, 480))
         )
         results.append(check("registry recorded no error", screen.last_error is None, str(screen.last_error)))
+        caps = screen.caps()
+        results.append(
+            check("capabilities parsed from mDNS",
+                  caps == {"x": 800, "y": 480, "round": False, "img": ["jpeg", "rgb565"],
+                           "anim": ["gif"], "sd": True},
+                  str(caps))
+        )
+        r = client.get("/devices")
+        results.append(
+            check("/devices reports capabilities",
+                  any(d["name"] == DEVICE and d["caps"] == caps for d in r.get_json()))
+        )
+
+        print("\nSD card state read back from the screen")
+        state = srv.registry.refresh_sd(screen)
+        results.append(check("SD state read", state is not None, str(state)))
+        results.append(
+            check("mounted, in use, sizes in MB",
+                  bool(state) and state["mounted"] and state["in_use"]
+                  and state["total_mb"] == 30436.0 and state["free_mb"] == 28057.6,
+                  str(state))
+        )
+        r = client.get("/")
+        results.append(
+            check("overview shows free of total",
+                  b"stills on card" in r.data and b"27.4 of 29.7 GB free" in r.data)
+        )
+        StubScreen.sd = {"SD Mounted": False, "SD In Use": False,
+                         "SD Total": None, "SD Free": None}
+        state = srv.registry.refresh_sd(screen)
+        results.append(
+            check("no card: not mounted, no sizes",
+                  bool(state) and not state["mounted"] and state["total_mb"] is None,
+                  str(state))
+        )
+        results.append(check("overview says no card", b"none mounted" in client.get("/").data))
+        results.append(
+            check("a screen without sd=1 is not polled",
+                  srv.registry.refresh_sd(discovery.Screen(name="x", host="127.0.0.1")) is None)
+        )
 
         print("\npush on upload")
         img = Image.new("RGB", (1200, 900), (40, 90, 160))
@@ -214,6 +282,24 @@ def main() -> int:
                   received["frames"][-1] == "6", str(received["frames"][-1:]))
         )
 
+        # An APNG: this screen advertised anim=gif only, so it gets a still.
+        apng = [Image.new("RGB", (80, 80), (200, i * 40 % 256, 60)) for i in range(5)]
+        abuf = io.BytesIO()
+        apng[0].save(abuf, "PNG", save_all=True, append_images=apng[1:], duration=90, loop=0)
+        before = len(received["frames"])
+        client.post(
+            f"/d/{DEVICE}/content",
+            data={"file": (io.BytesIO(abuf.getvalue()), "clip.png")},
+            content_type="multipart/form-data",
+        )
+        results.append(
+            check("a format the screen cannot play is sent as 1 frame",
+                  len(received["frames"]) > before and received["frames"][-1] == "1",
+                  str(received["frames"][-2:]))
+        )
+        r = client.get(f"/d/{DEVICE}/")
+        results.append(check("device page badges it as a still", b"still here" in r.data))
+
         print("\nserving what the screen was told to fetch")
         path = urlparse(url).path + "?" + urlparse(url).query
         r = client.get(path)
@@ -271,6 +357,20 @@ def main() -> int:
                   "/image?" in srv.registry.content_url_for(screen))
         )
         srv.registry.version_provider = None
+
+        print("\ncapabilities without the network")
+        gif_item = {"animated": True, "source_format": "GIF", "frames": 6}
+        stills = discovery.Screen(name="x", host="127.0.0.1", anim=discovery._csv("none"))
+        legacy = discovery.Screen(name="x", host="127.0.0.1")
+        results.append(check("anim=none parses as stills only", stills.anim == ()))
+        results.append(check("stills-only screen shows a GIF as a still",
+                             srv.plays_as_still(stills, gif_item)))
+        results.append(check("firmware without `anim` still gets clips",
+                             not srv.plays_as_still(legacy, gif_item)))
+        results.append(check("a still is never 'played as still'",
+                             not srv.plays_as_still(stills, {"animated": False})))
+        results.append(check("capability change forces a re-push",
+                             stills.config_key() != legacy.config_key()))
 
     finally:
         advertiser.close()

@@ -38,6 +38,7 @@ A board package owns everything panel-specific and must declare:
 | Substitution | Meaning |
 |---|---|
 | `display_width` / `display_height` | panel size, sent to the server via mDNS |
+| `display_round` | `"1"` for a circular panel, sent to the server via mDNS |
 | `default_fit` | `contain` / `cover` / `width` / `height` / `stretch` |
 | `dot_x` / `dot_y` | where the activity dot goes |
 
@@ -51,6 +52,67 @@ new `boards/*.yaml` and a three-line device file — and **no change at all** to
 put bars where nothing is visible) and moves the activity dot to top-centre
 for the same reason; the server picks both up from the mDNS TXT records and
 renders 240x240 from the same library that feeds the 800x480 screen.
+
+### Capabilities
+
+Every screen advertises what it can do in its mDNS TXT record — `w`, `h`,
+`round`, `img` (still formats), `anim` (animation formats, or `none`) and `sd`
+— and the server adapts. The board declares the hardware facts (`w`, `h`,
+`round`); the packages a device includes declare the rest, by overriding
+defaults set in `common/content-pull.yaml`. Between packages the later one's
+substitutions win, so **capability packages go after `content`** in the device
+file.
+
+| Screen | Packages | Advertises |
+|---|---|---|
+| tabletop-01 (Waveshare 4.3) | `sd-card` + `sd-still` | `anim=none sd=1 img=jpeg,rgb565` |
+| tabletop-02 (round XIAO) | `video-test` + `video-cache` | `round=1 anim=gif,apng,webp sd=0` |
+
+**The Waveshare 4.3 is stills only.** Its GIF path cached clips by
+JPEG-decoding every frame into a 768 KB buffer, which is exactly the memory
+this board should not spend on content. So it no longer includes
+`sd-clip.yaml`, advertises `anim=none`, and the server sends it the first
+frame of anything animated.
+
+### Stills on the SD card (`common/sd-still.yaml`)
+
+When a card is mounted, a still never touches a decode buffer:
+
+```
+GET …/image?…&fmt=rgb565   →  streamed to /still/new.565, ≤64 KB per loop tick
+                           →  renamed over /still/image.565, ETag kept alongside
+/still/image.565           →  read a band at a time into internal RAM → panel
+```
+
+- **Conditional GET.** The stored ETag goes out as `If-None-Match`, so an
+  unchanged picture costs one empty 304.
+- **Works offline at power-up.** The picture is on the card, so it shows
+  before WiFi or the server are up.
+- **"If available" is decided per fetch.** With no card mounted,
+  `fetch_content` falls back to `online_image` and JPEG; pulling the card
+  under a still hands the panel back to that path.
+- **Non-blocking.** The body is streamed from `SdClip::loop()`, so web_server
+  and pushes stay responsive during a 768 KB transfer.
+- **Paced.** A fetch request is a flag, so a burst of pushes collapses into one
+  fetch, fetches are at least 2 s apart, and an unchanged (304) picture is
+  never re-blitted. Failures retry after 2 s, 4 s and 6 s, then back off
+  30 s → 1 min → 2 min → 4 min → 5 min; new content from the server skips the
+  wait.
+- **Card status.** Mounted and in-use state, plus free and total space, are
+  published as `SD Mounted`, `SD In Use`, `SD Free` and `SD Total`. The boot
+  checklist shows them (`SD card ... stills on card, 27.4 of 29.7 GB free`),
+  and so does the server's overview.
+- No activity dot on an SD still: there is no copy of the picture in RAM to
+  composite the dot against or erase it back to.
+
+Caveat, so nobody over-reads "no PSRAM": `mipi_rgb` hardcodes
+`fb_in_psram = 1`, so the panel's own framebuffer still lives in PSRAM. What
+this path removes is PSRAM use **for content**: no decode buffer, no clip cache.
+
+**Not yet measured on hardware:** raw transfer time for 768 KB, now that
+`buffer_size_rx` is 8192. The ~16 s figure in `sd-clip.yaml` matches the old
+512-byte read size (~48 KB/s), so it may well predate that fix — check the
+`Still: N KB stored in M ms` log line.
 
 ## Phase 1 — S3 + still images (working on hardware)
 

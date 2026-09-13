@@ -13,7 +13,11 @@
 # 40 x 115,200 = 4.39 MB of the 8 MB PSRAM. Raise N until that stops
 # being comfortable; the XIAO also needs PSRAM for WiFi buffers and the heap.
 #
-# Requires common/content-pull.yaml (for content_url and the display).
+# Requires common/content-pull.yaml (for content_url and the display), and
+# must be listed after it so the capability below overrides its default.
+
+substitutions:
+  anim_formats: gif,apng,webp
 
 globals:
   - id: clip_loading
@@ -53,8 +57,9 @@ globals:
     restore_value: false
     initial_value: '0'
 
-online_image:
-  - id: f00
+image:
+  - platform: online_image
+    id: f00
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -71,7 +76,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f01
+  - platform: online_image
+    id: f01
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -88,7 +94,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f02
+  - platform: online_image
+    id: f02
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -105,7 +112,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f03
+  - platform: online_image
+    id: f03
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -122,7 +130,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f04
+  - platform: online_image
+    id: f04
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -139,7 +148,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f05
+  - platform: online_image
+    id: f05
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -156,7 +166,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f06
+  - platform: online_image
+    id: f06
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -173,7 +184,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f07
+  - platform: online_image
+    id: f07
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -190,7 +202,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f08
+  - platform: online_image
+    id: f08
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -207,7 +220,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f09
+  - platform: online_image
+    id: f09
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -224,7 +238,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f10
+  - platform: online_image
+    id: f10
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -241,7 +256,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f11
+  - platform: online_image
+    id: f11
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -258,7 +274,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f12
+  - platform: online_image
+    id: f12
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -275,7 +292,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f13
+  - platform: online_image
+    id: f13
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -292,7 +310,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f14
+  - platform: online_image
+    id: f14
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -309,7 +328,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f15
+  - platform: online_image
+    id: f15
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -326,7 +346,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f16
+  - platform: online_image
+    id: f16
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -343,7 +364,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f17
+  - platform: online_image
+    id: f17
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -360,7 +382,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f18
+  - platform: online_image
+    id: f18
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -377,7 +400,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f19
+  - platform: online_image
+    id: f19
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -394,7 +418,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f20
+  - platform: online_image
+    id: f20
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -411,7 +436,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f21
+  - platform: online_image
+    id: f21
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -428,7 +454,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f22
+  - platform: online_image
+    id: f22
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -445,7 +472,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f23
+  - platform: online_image
+    id: f23
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -462,7 +490,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f24
+  - platform: online_image
+    id: f24
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -479,7 +508,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f25
+  - platform: online_image
+    id: f25
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -496,7 +526,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f26
+  - platform: online_image
+    id: f26
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -513,7 +544,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f27
+  - platform: online_image
+    id: f27
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -530,7 +562,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f28
+  - platform: online_image
+    id: f28
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -547,7 +580,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f29
+  - platform: online_image
+    id: f29
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -564,7 +598,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f30
+  - platform: online_image
+    id: f30
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -581,7 +616,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f31
+  - platform: online_image
+    id: f31
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -598,7 +634,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f32
+  - platform: online_image
+    id: f32
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -615,7 +652,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f33
+  - platform: online_image
+    id: f33
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -632,7 +670,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f34
+  - platform: online_image
+    id: f34
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -649,7 +688,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f35
+  - platform: online_image
+    id: f35
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -666,7 +706,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f36
+  - platform: online_image
+    id: f36
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -683,7 +724,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f37
+  - platform: online_image
+    id: f37
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -700,7 +742,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f38
+  - platform: online_image
+    id: f38
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565
@@ -717,7 +760,8 @@ online_image:
           id(clip_in_flight) = false;
           id(clip_error) = true;
 
-  - id: f39
+  - platform: online_image
+    id: f39
     url: http://127.0.0.1/frame-cache-slot
     format: JPEG
     type: RGB565

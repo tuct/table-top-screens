@@ -30,5 +30,8 @@ packages:
   # SD card over SPI, chip select held low on the CH422G -- see the note in
   # components/sd_spi/__init__.py for why SDMMC cannot work on this board.
   sd: !include common/sd-card.yaml
-  # Raw RGB565 clip playback off that card: no JPEG decode, no PSRAM bound.
-  clip: !include common/sd-clip.yaml
+  # Stills only on this screen: they are stored on that card and blitted from
+  # it, with no decode buffer. No animation package, so it advertises
+  # anim=none and the server sends GIFs / APNGs as their first frame.
+  # Must come after `content`: its substitutions override content-pull's.
+  still: !include common/sd-still.yaml

@@ -22,6 +22,25 @@ without a config file. The name comes from a TXT record rather than being
 parsed out of the mDNS instance string — the device states its own identity,
 so the content path can't drift from what the screen thinks it is.
 
+### Capabilities
+
+Each screen also says what it can do, in the same TXT record:
+
+| Key | Example | Meaning |
+|---|---|---|
+| `w`, `h` | `800`, `480` | panel size in pixels |
+| `round` | `0` / `1` | visible area is a circle |
+| `img` | `jpeg,rgb565` | still formats the firmware accepts |
+| `anim` | `gif,apng,webp` or `none` | animation sources it can play |
+| `sd` | `0` / `1` | stores stills on an SD card when one is mounted |
+
+The server acts on these. An animated item whose format is not in `anim` is
+pushed as **1 frame**, so the screen never starts a clip cache and simply shows
+frame 0 (which is what `/image` renders anyway). The pages show each screen's
+capabilities, badge such items "still here", and draw round screens' previews
+as circles. A screen with no `anim` record at all is older firmware: it is
+offered clips as before. `/devices` includes a `caps` object per screen.
+
 **Screens find the server** by not needing to. On discovery the server POSTs
 the content URL into the screen's `content_url` text entity over
 `web_server`'s REST API, filling in *the address that screen can actually
@@ -62,14 +81,30 @@ transient fault, so it fails loudly instead of retrying forever.
 ## Run it
 
 ```bash
+# macOS / Linux
+cd server
+python3 -m venv .venv
+./.venv/bin/python -m pip install -r requirements.txt
+./.venv/bin/python app.py
+
+# Windows
 cd server
 python -m venv .venv
-./.venv/Scripts/python.exe -m pip install -r requirements.txt   # Windows
-# source .venv/bin/activate && pip install -r requirements.txt  # Linux/macOS
+./.venv/Scripts/python.exe -m pip install -r requirements.txt
 ./.venv/Scripts/python.exe app.py
 ```
 
 Listens on `0.0.0.0:8099`. Open it and screens appear on their own.
+
+Two environment variables limit discovery. `SCREENS_DISCOVERY=0` turns it
+off, and `SCREENS_ONLY=tabletop-01,tabletop-02` ignores every other screen.
+The tests set these themselves. Without them, a test run on the same network
+re-pointed a real screen at the test process and pressed its Refresh button
+dozens of times.
+
+For screens advertising `sd=1`, the server also reads `SD Mounted`,
+`SD In Use`, `SD Total` and `SD Free` every 30 s and shows them on the
+overview ("SD card: stills on card · 27.4 of 29.7 GB free").
 
 Notes for a permanent install:
 
@@ -226,10 +261,12 @@ in a 32-entry in-memory LRU keyed by `(image sha, parameters)`.
 ## Tests
 
 ```bash
-./.venv/Scripts/python.exe test_library.py      # 44 checks, no network
-./.venv/Scripts/python.exe test_content.py      # 76 checks, no network
-./.venv/Scripts/python.exe test_discovery.py    # 21 checks, uses real mDNS
+./.venv/bin/python test_library.py      # 140 checks, no network
+./.venv/bin/python test_content.py      # 121 checks, no network
+./.venv/bin/python test_discovery.py    # 38 checks, uses real mDNS
 ```
+
+(On Windows: `./.venv/Scripts/python.exe` instead of `./.venv/bin/python`.)
 
 `test_library.py` covers accumulation and ordering, thumbnails, selection
 following through to the rendered output, deleting the *current* item,

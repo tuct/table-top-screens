@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdio>
+#include <memory>
 #include <string>
 
 #include "esphome/core/component.h"
@@ -28,6 +30,7 @@ namespace sd_clip {
 class SdClip : public Component {
  public:
   void setup() override;
+  void loop() override;
   void dump_config() override;
   /// After sd_spi (DATA), because caching and playback both need the mount.
   float get_setup_priority() const override { return setup_priority::LATE; }
@@ -113,8 +116,44 @@ class SdClip : public Component {
   float last_read_ms() const { return this->last_read_us_ / 1000.0f; }
   float last_blit_ms() const { return this->last_blit_us_ / 1000.0f; }
 
+  // -- stills ---------------------------------------------------------------
+  //
+  // A still is a one-frame clip with its own file, and exists for boards that
+  // cannot afford a decode buffer: the raw frame streams from HTTP straight to
+  // the card, and is shown with the same banded read-and-blit as a clip. So no
+  // step ever holds more than one band in RAM -- no PSRAM needed for content.
+
+  /// What the last still fetch did. Read once with take_still_event().
+  enum StillEvent { STILL_NONE = 0, STILL_UPDATED, STILL_UNCHANGED, STILL_FAILED };
+
+  /// True if a complete still is on the card.
+  bool has_still();
+
+  /// Begin fetching a still. `url` must select raw RGB565 at the panel size.
+  ///
+  /// Sends If-None-Match with the ETag of the still already on the card, so an
+  /// unchanged picture costs one 304. The body is streamed to the card from
+  /// loop() a bounded amount per tick, so the device stays responsive during a
+  /// 768 KB transfer. Returns false if a fetch could not be started; the result
+  /// of one that was is reported through take_still_event().
+  bool start_still(const std::string &url);
+  bool still_busy() const { return this->still_http_ != nullptr; }
+  /// Returns and clears the last StillEvent.
+  int take_still_event() {
+    const int e = this->still_event_;
+    this->still_event_ = STILL_NONE;
+    return e;
+  }
+
+  /// Blit the still on the card. Returns false if there is none.
+  bool show_still();
+
  protected:
   bool ensure_buffer_();
+  /// Banded read-and-blit of one raw frame file. Shared by clips and stills.
+  bool blit_file_(const std::string &full, const char *what);
+  void finish_still_(bool ok);
+  std::string still_path_(const char *name) const;
   std::string frame_path_(int index) const;
   /// Absolute path of frame `index`, including the card's mount point.
   std::string full_path_(int index) const;
@@ -136,6 +175,15 @@ class SdClip : public Component {
   uint32_t last_blit_us_{0};
   uint32_t last_write_us_{0};
   uint32_t last_http_us_{0};
+
+  std::shared_ptr<http_request::HttpContainer> still_http_;
+  std::unique_ptr<uint8_t[]> still_chunk_;
+  FILE *still_file_{nullptr};
+  std::string still_etag_;
+  size_t still_written_{0};
+  uint32_t still_last_data_{0};
+  uint32_t still_started_{0};
+  int still_event_{STILL_NONE};
 };
 
 }  // namespace sd_clip

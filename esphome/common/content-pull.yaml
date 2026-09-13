@@ -21,6 +21,16 @@
 # online_image implements ETag / Last-Modified caching, so a background poll
 # costs one 304 with an empty body when nothing changed.
 
+# Capability defaults for a screen that has only this package: JPEG stills
+# over the network, no animation, nothing on SD. Packages that add a
+# capability override these -- sd-still.yaml, sd-clip.yaml, video-cache.yaml --
+# and must therefore be listed AFTER this one in the device file: between
+# packages, the later one's substitutions win.
+substitutions:
+  image_formats: jpeg
+  anim_formats: none
+  sd_still: "0"
+
 http_request:
   verify_ssl: false
   timeout: 10s
@@ -54,6 +64,17 @@ mdns:
         # ESPHome's display `rotation:` would force the buffered path instead.
         # Overridable per device from the server's own page.
         rot: "0"
+        # Capabilities, so the server never has to guess what a screen can do.
+        #   round  1 if the panel is circular (board package)
+        #   img    still formats the firmware can take, comma separated
+        #   anim   animation source formats it can play (gif,apng,webp), or none
+        #          -- anything else gets the first frame as a still
+        #   sd     1 if stills are stored on and shown from an SD card when one
+        #          is mounted (the screen falls back to the network otherwise)
+        round: ${display_round}
+        img: ${image_formats}
+        anim: ${anim_formats}
+        sd: ${sd_still}
 
 globals:
   # Only set when something has gone wrong; shown under the boot checklist.
@@ -126,14 +147,39 @@ globals:
     restore_value: false
     initial_value: 'false'
 
-# NOTE: on ESPHome >= ~2026.7 this moves under `image:` as
-#   image:
-#     - platform: online_image
-#       ...
-# The top-level key below is deprecated there and removed in 2027.1.0. All the
-# options are identical, so migration is just the two lines of nesting.
-online_image:
-  - id: content_image
+  # SD still path, driven by the optional common/sd-still.yaml. Declared here
+  # for the same reason as video_active: this file must stand alone.
+  #   still_to_sd          route fetches to the card (a card is mounted)
+  #   still_fetch_pending  a fetch was asked for; sd-still picks it up
+  #   content_on_sd        what is on the panel came from the card, so neither
+  #                        the display writer nor the dot may paint over it
+  - id: still_to_sd
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: still_fetch_pending
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: content_on_sd
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # SD line for the boot checklist, filled in by common/sd-card.yaml. Empty on
+  # a screen without a card slot configured, which hides the line.
+  - id: sd_status
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+# A platform of `image:` since ESPHome 2026.7; the old top-level
+# `online_image:` key is removed in 2027.1.0. Options are unchanged.
+image:
+  - platform: online_image
+    id: content_image
     # Placeholder only. Never fetched: update_interval is `never`, and the
     # first real fetch happens when the server pushes a URL below.
     url: http://127.0.0.1/awaiting-discovery
@@ -255,8 +301,7 @@ interval:
             - wifi.connected:
             - lambda: 'return !id(content_loaded) && !id(content_url).state.empty();'
           then:
-            - lambda: 'id(loading) = true;'
-            - component.update: content_image
+            - script.execute: fetch_content
 
   # Safety net -- the server pushes on change, so this only recovers a missed
   # push. Cheap when nothing changed: a 304 with an empty body, because
@@ -276,10 +321,23 @@ interval:
             - wifi.connected:
             - lambda: 'return !id(content_url).state.empty();'
           then:
-            - lambda: 'id(loading) = true;'
-            - component.update: content_image
+            - script.execute: fetch_content
 
 script:
+  # The one place a still is fetched from. With a card mounted and
+  # sd-still.yaml included, the fetch is handed over to it (raw frame straight
+  # to the card, no decode buffer); otherwise online_image decodes a JPEG.
+  - id: fetch_content
+    then:
+      - lambda: 'id(loading) = true;'
+      - if:
+          condition:
+            lambda: 'return id(still_to_sd);'
+          then:
+            - lambda: 'id(still_fetch_pending) = true;'
+          else:
+            - component.update: content_image
+
   # Draws the activity dot, or erases it when phase < 0.
   #
   # Round, so it has to composite: pixels outside the circle are taken from
@@ -299,6 +357,10 @@ script:
           // "esp_lcd_panel_draw_bitmap(34): invalid panel handle" twice at
           // every boot.
           if (!id(disp)->is_ready())
+            return;
+          // A still from the card has no buffer in RAM to composite against
+          // or erase back to, so the dot would leave a black square on it.
+          if (id(content_on_sd))
             return;
 
           constexpr int D = 18;            // diameter / block size
@@ -414,8 +476,7 @@ button:
     name: Refresh Content
     id: refresh_content
     on_press:
-      - lambda: 'id(loading) = true;'
-      - component.update: content_image
+      - script.execute: fetch_content
 
 # Set by the server on discovery. restore_value keeps it across reboots, so a
 # screen keeps working even if the server is down when it powers up.
@@ -453,6 +514,11 @@ text:
                   - lambda: |-
                       id(server_pushed) = true;
                       id(status_text) = "Loading...";
-                      id(loading) = true;
-                  - component.update: disp
-                  - component.update: content_image
+                  # Not while an SD still is up: the writer would draw nothing
+                  # anyway, and the checklist text belongs to boot only.
+                  - if:
+                      condition:
+                        lambda: 'return !id(content_on_sd);'
+                      then:
+                        - component.update: disp
+                  - script.execute: fetch_content

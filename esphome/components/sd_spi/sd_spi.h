@@ -47,6 +47,12 @@ class SdSpi : public Component {
   /// assuming "/sd".
   const std::string &mount_point() const { return this->mount_point_; }
 
+  /// Filesystem capacity and free space in bytes. False if not mounted or
+  /// the query failed. FATFS caches the free-cluster count after the first
+  /// call, so only that first one can be slow (a FAT scan on a card with no
+  /// valid FSINFO) -- poll this rarely, never from a display lambda.
+  bool space(uint64_t &total, uint64_t &free);
+
   /// Size in bytes, or 0 if missing/unmounted.
   size_t file_size(const std::string &path);
 
