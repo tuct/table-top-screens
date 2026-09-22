@@ -408,6 +408,19 @@ def main() -> int:
     check("a budget below one frame is 413",
           c.get("/d/vid/clip.mjpeg?w=240&h=240&max=64").status_code == 413)
     check("bad fps rejected", c.get("/d/vid/clip.mjpeg?fps=0").status_code == 400)
+    # The quality control on the device page has to reach clips, not just
+    # /image -- it is folded into the content token either way, so if it did
+    # not, changing it would force a re-download of identical bytes.
+    plain = c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=10&q=80")
+    c.post("/d/vid/prefs", json={"q": 20})
+    lowq = c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=10&q=80")
+    check("a stored quality pref overrides the screen's own q",
+          len(lowq.data) < len(plain.data),
+          f"{len(lowq.data)} vs {len(plain.data)} bytes")
+    check("and it is a different clip to the screen", lowq.headers["ETag"] != plain.headers["ETag"])
+    c.post("/d/vid/prefs", json={"reset": 1})
+    check("clearing it restores the original bytes",
+          c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=10&q=80").data == plain.data)
     still = parse_clip(c.get("/d/tabletop-01/clip.mjpeg?w=64&h=64&fps=5").data)
     check("a still is a one-frame clip", still is not None and len(still["frames"]) == 1,
           str(still and len(still["frames"])))

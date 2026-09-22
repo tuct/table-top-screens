@@ -174,8 +174,12 @@ record   u32 len, then len bytes of JPEG                (count times)
 - **Capped at `max` bytes.** Trailing frames are dropped whole to fit the
   screen's memory budget. `X-Frame-Count` says how many were kept, and 413 means
   even the first frame is too big.
-- **Framed like a still.** It uses the screen's stored fit, rotation, zoom and
-  background. An `ETag` makes an unchanged clip a 304.
+- **Framed like a still.** It uses the screen's stored fit, rotation, zoom,
+  background **and quality** — the screen sends the quality it wants as `q`,
+  and a stored pref overrides it, the same precedence as everywhere else.
+  Quality is the most direct lever on clip length, since it sets bytes per
+  frame and the screen caches a fixed number of bytes. An `ETag` makes an
+  unchanged clip a 304.
 - **A still is one frame.** So is a clip in a format the screen didn't
   advertise. Only a screen with no content gets the synthetic test clip.
 

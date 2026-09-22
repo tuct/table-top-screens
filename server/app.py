@@ -588,6 +588,7 @@ def render_image(
     bg: str,
     rot: int = 0,
     zoom: int = 100,
+    subsampling: int = 0,
 ) -> tuple[bytes, str]:
     """Fit, rotate and encode an already-open image. Shared by the still and
     the frame paths so a video frame is framed exactly like a photo."""
@@ -621,9 +622,14 @@ def render_image(
             abort(503, "QOI support not installed (pip install qoi numpy)")
         return qoi_lib.encode(np.asarray(img)), "image/qoi"
     # baseline JPEG -- progressive is NOT decodable by ESPHome's decoder.
-    # subsampling=0 forces 4:4:4; see the note in the original render().
+    #
+    # subsampling: 0 is 4:4:4, which a still wants -- it keeps colour edges
+    # (text, line art) crisp, and a still is fetched once. Clip frames pass 2
+    # (4:2:0) instead: chroma detail is what nobody sees at 15 fps, and bytes
+    # per frame are exactly what limits how long a clip the screen can hold.
     img.save(
-        out, "JPEG", quality=quality, optimize=True, progressive=False, subsampling=0
+        out, "JPEG", quality=quality, optimize=True, progressive=False,
+        subsampling=subsampling,
     )
     return out.getvalue(), "image/jpeg"
 
@@ -790,6 +796,22 @@ def _framing(device: str) -> tuple[str, int, int, str]:
     return fit, rot, zoom, bg
 
 
+def _quality(device: str, fallback) -> int:
+    """JPEG quality for this screen: its stored pref, else `fallback`.
+
+    Same precedence as everywhere else -- a stored pref beats the query
+    string -- so the quality control on the device page reaches clips too, not
+    only the `/image` path. Without this it changed the content token (which
+    folds in every pref) and so forced a re-download of identical bytes.
+    """
+    prefs = read_prefs(device)
+    try:
+        quality = int(prefs["q"]) if "q" in prefs else int(fallback)
+    except (TypeError, ValueError):
+        quality = DEFAULT_QUALITY
+    return max(1, min(100, quality))
+
+
 # TTMJ: the clip container the screens load into PSRAM. Little-endian:
 #   header   "TTMJ" u16 version, u16 w, u16 h, u16 fps, u32 count
 #   record   u32 len, then len bytes of baseline JPEG      (count times)
@@ -815,6 +837,9 @@ def build_clip(body: bytes | None, w: int, h: int, fps: int, max_bytes: int,
     to a high rate repeats frames, and repeats reuse the same JPEG bytes.
     """
     fit, quality, bg, rot, zoom = framing
+    # A clip is many frames in a fixed byte budget, so its frames are encoded
+    # 4:2:0. A one-frame item is a still and keeps 4:4:4.
+    subsampling = 0 if still else 2
     if still:
         # A still is a one-frame clip, so a screen can hold stills and clips in
         # the same cache and show both through one decoder.
@@ -826,7 +851,8 @@ def build_clip(body: bytes | None, w: int, h: int, fps: int, max_bytes: int,
     indices = frames.resample(frames.durations(body), fps)
     encoded: dict[int, bytes] = {}
     for n, img in frames.iter_frames(body, indices, w, h):
-        encoded[n], _ = render_image(img, w, h, "jpeg", fit, quality, bg, rot, zoom)
+        encoded[n], _ = render_image(img, w, h, "jpeg", fit, quality, bg, rot, zoom,
+                                     subsampling)
 
     parts: list[bytes] = []
     used = CLIP_HEADER.size
@@ -857,7 +883,6 @@ def get_clip(device: str):
     try:
         w = int(request.args.get("w", 240))
         h = int(request.args.get("h", 240))
-        quality = int(request.args.get("q", CLIP_QUALITY))
         fps = int(request.args.get("fps", 15))
         max_bytes = int(request.args.get("max", 4_000_000))
     except (TypeError, ValueError):
@@ -868,7 +893,8 @@ def get_clip(device: str):
         abort(400, "fps must be 1-60")
     if not CLIP_HEADER.size < max_bytes <= CLIP_MAX_BYTES:
         abort(400, f"max must be up to {CLIP_MAX_BYTES} bytes")
-    quality = max(1, min(100, quality))
+    # The screen sends the quality it wants; a stored pref overrides it.
+    quality = _quality(device, request.args.get("q", CLIP_QUALITY))
 
     fit, rot, zoom, bg = _framing(device)
     meta = read_meta(device)
@@ -927,12 +953,11 @@ def get_frame(device: str):
         n = int(request.args.get("n", 0))
         w = int(request.args.get("w", 240))
         h = int(request.args.get("h", 240))
-        quality = int(request.args.get("q", DEFAULT_QUALITY))
     except (TypeError, ValueError):
-        abort(400, "n, w, h and q must be integers")
+        abort(400, "n, w and h must be integers")
     if not (0 < w <= 4096 and 0 < h <= 4096):
         abort(400, "w/h out of range")
-    quality = max(1, min(100, quality))
+    quality = _quality(device, request.args.get("q", DEFAULT_QUALITY))
 
     fmt = request.args.get("fmt", "jpeg").lower()
     if fmt == "jpg":
@@ -1423,7 +1448,18 @@ def device_page(device: str):
         ("stretch", "stretch — distort to fill"),
     ])
     rot_sel = sel("rot", 0, [(0, "0°"), (90, "90° CW"), (180, "180°"), (270, "270° CW")])
-    q_sel = sel("q", DEFAULT_QUALITY, [(85, "85"), (95, "95 (default)"), (100, "100")])
+    # Lower values are there for clips: quality sets bytes per frame, and a
+    # screen caches a fixed number of BYTES, so dropping it is what buys a
+    # longer clip (and a faster download).
+    q_sel = sel("q", DEFAULT_QUALITY, [
+        (35, "35 — longest clips"),
+        (50, "50"),
+        (65, "65"),
+        (75, "75"),
+        (85, "85"),
+        (95, "95 (default)"),
+        (100, "100"),
+    ])
     bg_sel = sel("bg", "black", [
         ("auto", "auto — match the picture edge"),
         ("black", "black"),
