@@ -109,6 +109,21 @@ def plays_as_still(screen, item: dict | None) -> bool:
     return fmt is None or not screen.can_animate(fmt)
 
 
+def screen_shape(screen) -> str:
+    """A screen's panel shape, as variants are keyed: "480x800", "240x240r"."""
+    return f"{screen.width}x{screen.height}" + ("r" if screen.round else "")
+
+
+def note_shape(screen) -> None:
+    """Record the shape a screen actually has, so its variants are made for
+    it. Recorded rather than looked up per render, so framing still works
+    while the screen is offline."""
+    try:
+        library.set_shape(DATA_DIR, screen.name, screen_shape(screen))
+    except library.LibraryError:
+        pass  # an odd size is not worth failing a push over
+
+
 def _frames_for(screen) -> int:
     """Frame count of what `screen` is showing, as it should play it; 0 if
     nothing.
@@ -119,6 +134,9 @@ def _frames_for(screen) -> int:
     that did not advertise the clip's format gets 1: `/image` already renders
     frame 0, so it simply shows a still.
     """
+    # Every push comes through here, which makes it the one place that always
+    # sees a live Screen and can keep its panel shape current.
+    note_shape(screen)
     try:
         item = library.current(DATA_DIR, screen.name)
     except library.LibraryError:
@@ -131,7 +149,7 @@ def _frames_for(screen) -> int:
 
 
 def _version_for(device: str) -> str | None:
-    """A token that names exactly what `device` is showing: item + framing.
+    """A token that names exactly what `device` is showing: variant + framing.
 
     The pool stores items under a content hash, so the item id already names
     the picture. The screen's stored prefs (fit, rotation, zoom, background,
@@ -142,20 +160,16 @@ def _version_for(device: str) -> str | None:
     back to something it has without pulling it again.
     """
     try:
-        item = library.current(DATA_DIR, device)
+        entry = library.current_variant(DATA_DIR, device)
+        config = library.config_for(DATA_DIR, device)
     except library.LibraryError:
         return None
-    item_id = (item or {}).get("id")
-    if not item_id:
+    if not entry:
         return None
-    try:
-        prefs = library.prefs(DATA_DIR, device)
-    except library.LibraryError:
-        prefs = {}
-    if not prefs:
-        return item_id
-    digest = hashlib.sha256(json.dumps(prefs, sort_keys=True).encode("utf-8")).hexdigest()
-    return f"{item_id}.{digest[:8]}"
+    # The variant id alone would not change when its framing is edited, and
+    # the source id alone cannot tell two variants of one picture apart.
+    digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"{entry['src']}.{entry['id']}.{digest[:8]}" if config else f"{entry['src']}.{entry['id']}"
 
 
 registry.frames_provider = _frames_for
@@ -229,6 +243,8 @@ def thumb_src(item: dict) -> str:
     For a clip the browser can play, that is the original file, so the
     thumbnail animates with no server-side clip encoding at all.
     """
+    # Pool routes are per SOURCE; a row's `id` is its variant.
+    item = {**item, "id": item.get("src_id", item["id"])}
     m = motion_of(item)
     if (
         m.get("animated")
@@ -293,16 +309,27 @@ def sd_html(state: dict | None) -> str:
 def parse_cache_key(key: str) -> dict:
     """What a screen's cache key names.
 
-    Keys are `<item id>[.<prefs hash>]-f<fps>-q<quality>` for server content
-    (see mjpeg-clip.yaml) and `file:<name>` for a file copied onto the card.
+    Keys are `<source>.<variant>[.<framing hash>]-f<fps>-q<quality>` for
+    server content (the token from _version_for, plus what the screen adds in
+    mjpeg-clip.yaml) and `file:<name>` for a file copied onto the card.
     """
     if key.startswith("file:"):
-        return {"file": key[5:], "item_id": None, "fps": None, "framed": False}
-    m = re.match(r"^([0-9A-Za-z]+)(\.[0-9a-f]+)?(?:-f(\d+))?", key)
+        return {"file": key[5:], "item_id": None, "variant": None, "fps": None,
+                "framed": False}
+    m = re.match(r"^([0-9A-Za-z]+)((?:\.[0-9a-f]+)*)(?:-f(\d+))?", key)
     if not m:
-        return {"file": None, "item_id": None, "fps": None, "framed": False}
-    return {"file": None, "item_id": m.group(1), "fps": int(m.group(3)) if m.group(3) else None,
-            "framed": bool(m.group(2))}
+        return {"file": None, "item_id": None, "variant": None, "fps": None,
+                "framed": False}
+    parts = [p for p in m.group(2).split(".") if p]
+    return {
+        "file": None,
+        "item_id": m.group(1),
+        "variant": parts[0] if parts else None,
+        "fps": int(m.group(3)) if m.group(3) else None,
+        # A framing hash rides along only when the variant has framing of its
+        # own, so two parts means "not just the plain picture".
+        "framed": len(parts) > 1,
+    }
 
 
 def cache_entries(state: dict | None) -> list[dict]:
@@ -778,12 +805,14 @@ def video_info(device: str):
 
 
 def _framing(device: str) -> tuple[str, int, int, str]:
-    """(fit, rot, zoom, bg) from the screen's own preferences.
+    """(fit, rot, zoom, bg) for what this screen is showing.
 
-    Clips follow them so video is cropped and rotated the same way the screen's
-    stills are. Bad stored values fall back rather than failing a clip.
+    From the current VARIANT's config, over the screen's defaults -- so two
+    pictures on one screen can be framed differently. Clips and stills read
+    the same thing, so video is cropped and rotated like the stills are. Bad
+    stored values fall back rather than failing a render.
     """
-    prefs = read_prefs(device)
+    prefs = lib(library.config_for, device)
     fit = str(prefs.get("fit", "cover")).lower()
     fit = FIT_ALIASES.get(fit, fit)
     if fit not in FIT_MODES:
@@ -797,14 +826,14 @@ def _framing(device: str) -> tuple[str, int, int, str]:
 
 
 def _quality(device: str, fallback) -> int:
-    """JPEG quality for this screen: its stored pref, else `fallback`.
+    """JPEG quality for what this screen shows: variant config, else `fallback`.
 
     Same precedence as everywhere else -- a stored pref beats the query
     string -- so the quality control on the device page reaches clips too, not
     only the `/image` path. Without this it changed the content token (which
     folds in every pref) and so forced a re-download of identical bytes.
     """
-    prefs = read_prefs(device)
+    prefs = lib(library.config_for, device)
     try:
         quality = int(prefs["q"]) if "q" in prefs else int(fallback)
     except (TypeError, ValueError):
@@ -1088,9 +1117,15 @@ def pool_thumb(item_id: str):
 @app.get("/d/<device>/items")
 def list_items(device: str):
     """This screen's two lists, plus which item is on it."""
+    state = lib(library.used, device)
+    current = lib(library.variant, state["current"]) if state["current"] else None
     return jsonify(
         {
-            "current": lib(library.used, device)["current"],
+            # The variant on the screen, and the source it came from: callers
+            # that care about "which picture" want the second.
+            "current": state["current"],
+            "current_src": (current or {}).get("src"),
+            "shape": state["shape"],
             "used": lib(library.used_items, device),
             "unused": lib(library.unused_items, device),
         }
@@ -1107,6 +1142,22 @@ def select_item(device: str, item_id: str):
             status=303, headers={"Location": redirect_target(f"/d/{device}/")}
         )
     return jsonify({"current": item_id, "pushed_to": pushed})
+
+
+@app.post("/d/<device>/variants/<variant_id>/duplicate")
+def duplicate_variant(device: str, variant_id: str):
+    """A second framing of the same picture on this screen.
+
+    The copy starts from the original's framing, is put on the screen, and is
+    what the framing controls then edit -- so "keep this crop, try another"
+    is two clicks rather than a re-upload.
+    """
+    entry = lib(library.variant_duplicate, variant_id, request.form.get("name", ""))
+    lib(library.select, device, entry["id"])
+    pushed = registry.notify(device)
+    if from_browser_form():
+        return Response(status=303, headers={"Location": f"/d/{device}/"})
+    return jsonify({"variant": entry, "pushed_to": pushed})
 
 
 @app.post("/d/<device>/items/<item_id>/add")
@@ -1141,14 +1192,28 @@ def reorder_items(device: str):
     if not isinstance(ids, list):
         abort(400, 'expected {"ids": [...]}')
     state = lib(library.reorder, device, [str(i) for i in ids])
-    return jsonify({"order": state["used"]})
+    by_variant = {v["id"]: v for v in lib(library.variants)}
+    return jsonify({
+        "order": state["used"],
+        # The same order as sources, for callers that dragged pictures rather
+        # than variants.
+        "order_src": [by_variant[i]["src"] for i in state["used"] if i in by_variant],
+    })
 
 
 @app.post("/d/<device>/prefs")
 def post_prefs(device: str):
-    """Set render overrides, then push a refresh so the change is visible."""
+    """Frame what this screen is showing, then push so it is visible.
+
+    Writes to the CURRENT VARIANT -- framing belongs to the picture, not the
+    screen, so reframing one does not move the rest. The same values are kept
+    as the screen's defaults, which seed the next picture put on it; that is
+    what makes "set this screen to cover" still a single action.
+    """
     device_dir(device)  # validates the name
-    prefs = read_prefs(device)
+    # Start from what is actually in effect, so a relative zoom step adds to
+    # the variant's zoom rather than the screen default's.
+    prefs = lib(library.config_for, device)
     form = request.form if request.form else (request.get_json(silent=True) or {})
 
     if (fit := form.get("fit")) is not None:
@@ -1195,11 +1260,19 @@ def post_prefs(device: str):
         prefs = {}
 
     write_prefs(device, prefs)
+    entry = lib(library.current_variant, device)
+    if entry is not None:
+        lib(library.variant_set_config, entry["id"],
+            prefs if prefs else dict.fromkeys(library.CONFIG_KEYS))
+        if not prefs:
+            # Reset means "no framing of its own" -- an empty config, not keys
+            # set to None, which would render as garbage.
+            lib(library.variant_set_config_exact, entry["id"], {})
     pushed = registry.notify(device)
 
     if from_browser_form():
         return Response(status=303, headers={"Location": f"/d/{device}/"})
-    return jsonify({"prefs": prefs, "pushed_to": pushed})
+    return jsonify({"prefs": prefs, "variant": (entry or {}).get("id"), "pushed_to": pushed})
 
 
 @app.get("/d/<device>/meta")
@@ -1400,12 +1473,14 @@ def device_page(device: str):
         attrs = ' draggable="true"' if draggable else ""
         if klass:
             attrs += f' class="{klass}"'
+        # A row is a variant: same picture, possibly framed more than one way.
+        named = f'<span class="vname">{it["variant"]}</span>' if it.get("variant") else ""
         return (
             f'<li{attrs} data-id="{it["id"]}">'
             f'{grip}'
             f'<img src="{thumb_src(it)}" width="80" height="48" alt="" loading="lazy">'
-            f'<span class="who"><b>{num}{it["filename"]}</b> {motion_badge(it)} '
-            f'{still_badge(screen, it)} {cache_badge(cache_rows, it["id"])}<br>'
+            f'<span class="who"><b>{num}{it["filename"]}</b> {named} {motion_badge(it)} '
+            f'{still_badge(screen, it)} {cache_badge(cache_rows, it.get("src_id", it["id"]))}<br>'
             f'<small>{it["source_size"][0]}x{it["source_size"][1]}, '
             f'{it["bytes"] // 1024} kB, {when}'
             f'{" &mdash; <b>on screen</b>" if is_current else ""}</small></span>'
@@ -1488,6 +1563,24 @@ def device_page(device: str):
         '<p style="color:#666">No overrides — using what the device asked for.</p>'
     )
 
+    # Which picture the framing controls act on, and the button that gives it
+    # a second framing to switch between.
+    entry = lib(library.current_variant, device)
+    if entry is None:
+        framing_of = "nothing on screen"
+        duplicate_html = ""
+    else:
+        named = f' <span class="vname">{entry["name"]}</span>' if entry["name"] else ""
+        framing_of = f'<b>{meta.get("filename", "current picture")}</b>{named}'
+        duplicate_html = (
+            f'<form method="post" action="/d/{device}/variants/{entry["id"]}/duplicate" '
+            'style="display:inline">'
+            '<input name="name" placeholder="name, e.g. face" maxlength="60" '
+            'style="font-size:1rem;padding:.3rem">'
+            '<button type="submit" title="A second framing of this same picture">'
+            'Duplicate</button></form>'
+        )
+
     return f"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1522,6 +1615,8 @@ def device_page(device: str):
   .caps {{ color: #666; }}
   .cached {{ font-size: .75rem; color: #2458b3; border: 1px solid #2458b3;
              border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
+  .vname {{ font-size: .8rem; color: #6a3ab2; background: #f3eefc;
+            border-radius: 3px; padding: 0 .3rem; }}
   ul.cache {{ margin: .3rem 0; padding-left: 1.2rem; font-size: .9rem; }}
   .sdon {{ color: #1a7f37; }}
   .sdwarn {{ color: #a60; }}
@@ -1556,7 +1651,7 @@ def device_page(device: str):
 </fieldset>
 
 <fieldset>
-  <legend>Framing</legend>
+  <legend>Framing &mdash; {framing_of}</legend>
   <form method="post" action="/d/{device}/prefs" id="framing">
     <label>Fit {fit_sel}</label>
     <label>Rotate {rot_sel}</label>
@@ -1567,8 +1662,15 @@ def device_page(device: str):
       <button type="submit" name="reset" value="1">Reset</button>
     </div>
   </form>
+  {duplicate_html}
   <p style="margin-top:1rem">Zoom {zoom_html}</p>
   {override}
+  <p style="color:#666">Framing belongs to the <b>picture on this screen</b>,
+  not to the screen: reframing one does not move the others. The same values
+  become this screen's defaults, so the next picture you put on it starts
+  where you left off. <b>Duplicate</b> keeps the current framing and makes a
+  second version of the same picture, which you can then frame differently
+  and switch between.</p>
   <p style="color:#666">Zoom crops in above 100% and letterboxes below it, on
   top of whatever fit mode is selected. Rotate is for a panel mounted turned — it is applied
   after fitting, so content stays upright and fills the screen. Doing it here
@@ -1719,6 +1821,8 @@ def index():
   .caps {{ color: #666; }}
   .cached {{ font-size: .75rem; color: #2458b3; border: 1px solid #2458b3;
              border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
+  .vname {{ font-size: .8rem; color: #6a3ab2; background: #f3eefc;
+            border-radius: 3px; padding: 0 .3rem; }}
   ul.cache {{ margin: .3rem 0; padding-left: 1.2rem; font-size: .9rem; }}
   .sdon {{ color: #1a7f37; }}
   .sdwarn {{ color: #a60; }}

@@ -157,6 +157,29 @@ many live screens were told to refresh.
 | `GET` | `/d/<device>/state` | That last report, one row per cached item |
 | `GET` | `/healthz` | Liveness + whether QOI is available |
 
+### Variants: a picture plus how it is framed
+
+A screen does not show a source, it shows a **variant** — a pool source plus
+the framing to apply to it. Framing used to be one setting per screen, so
+"this photo needs a tighter crop" moved every picture on that screen.
+
+- **Keyed by source and panel shape** (`480x800`, `240x240r`), because that is
+  the distinction that always matters: a portrait panel and a round one want
+  different crops. Putting a picture on a screen auto-creates the variant for
+  that screen's shape, seeded from the screen's defaults, so nothing has to be
+  framed before it can be shown.
+- **Framing edits the variant.** The same values are kept as the screen's
+  defaults, which seed the next picture put on it.
+- **Duplicate** (`POST /d/<device>/variants/<id>/duplicate`) makes a second,
+  named variant of the same source and shape — two crops of one picture on one
+  screen, switchable like any other item.
+- The content token becomes `<source>.<variant>[.<framing hash>]`, so a screen
+  caches each framing separately and switching between them needs no download.
+
+Stored in `data/_variants.json`. Screens' `used.json` lists variant ids;
+lists that held pool ids from before variants are migrated on read, with each
+picture keeping the look it had.
+
 ### Clips as one file (`/clip.mjpeg`)
 
 A screen with `clip=mjpeg` downloads its clip in one request and plays it from

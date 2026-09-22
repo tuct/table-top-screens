@@ -307,17 +307,24 @@ def main() -> int:
         print("\nswitching pushes a URL that names the content")
         def v_of(u):
             return parse_qs(urlparse(u).query).get("v", [None])[0]
+
+        def src_of(u):
+            # The token is <source>.<variant>[.<framing hash>]: a screen shows
+            # a variant, and the framing can be edited in place.
+            return (v_of(u) or "").split(".")[0]
         items = client.get(f"/d/{DEVICE}/items").get_json()
         apng_url = received["set_url"][-1]
         results.append(check("the last upload pushed its own URL",
-                             v_of(apng_url) == items["current"], str(v_of(apng_url))))
-        gif_id = next(it["id"] for it in items["used"]
+                             src_of(apng_url) == items["current_src"], str(v_of(apng_url))))
+        # src_id, not id: a used row is a VARIANT, and the select/assign
+        # routes take either -- but the URL token names the source.
+        gif_id = next(it["src_id"] for it in items["used"]
                       if str(it.get("source_format", "")).upper() == "GIF")
         before = len(received["set_url"])
         client.post(f"/d/{DEVICE}/items/{gif_id}/select")
         results.append(check("a switch pushes the new URL",
                              len(received["set_url"]) == before + 1
-                             and v_of(received["set_url"][-1]) == gif_id,
+                             and src_of(received["set_url"][-1]) == gif_id,
                              str(received["set_url"][-1:])))
         gif_url = received["set_url"][-1]
         client.post(f"/d/{DEVICE}/items/{items['current']}/select")
@@ -331,7 +338,7 @@ def main() -> int:
         client.post(f"/d/{DEVICE}/prefs", json={"rot": 180})
         rot_url = received["set_url"][-1]
         results.append(check("a framing change is a different token",
-                             rot_url != gif_url and v_of(rot_url).startswith(gif_id + "."),
+                             rot_url != gif_url and src_of(rot_url) == gif_id,
                              str(v_of(rot_url))))
         client.post(f"/d/{DEVICE}/prefs", json={"reset": 1})
         results.append(check("and resetting it restores the original",

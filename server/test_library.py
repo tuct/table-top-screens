@@ -51,8 +51,13 @@ def upload(c, device, colour, name, size=(600, 400)):
 
 
 def lists(c, device):
+    """(payload, sources used, sources not used).
+
+    A screen shows VARIANTS, so `used` rows carry the variant id as `id` and
+    the picture as `src_id`; these tests are about which picture is where.
+    """
     j = c.get(f"/d/{device}/items").get_json()
-    return j, [i["id"] for i in j["used"]], [i["id"] for i in j["unused"]]
+    return j, [i["src_id"] for i in j["used"]], [i["id"] for i in j["unused"]]
 
 
 def main() -> int:
@@ -79,7 +84,7 @@ def main() -> int:
     j, used, unused = lists(c, "a")
     check("all three used by screen a", len(used) == 3, str(len(used)))
     check("nothing unused for a", unused == [], str(unused))
-    check("newest is on screen", j["current"] == used[-1])
+    check("newest is on screen", j["current_src"] == used[-1])
 
     print("\na second screen starts with everything unused")
     j, used_b, unused_b = lists(c, "b")
@@ -99,10 +104,10 @@ def main() -> int:
     check("the two lists are disjoint", not (set(used_b) & set(unused_b)))
     check("together they are the whole pool",
           sorted(used_b + unused_b) == sorted(pool_ids))
-    check("first add becomes current, there being nothing", j["current"] == pool_ids[0])
+    check("first add becomes current, there being nothing", j["current_src"] == pool_ids[0])
     c.post(f"/d/b/items/{pool_ids[1]}/add")
     check("a later add does NOT steal the screen",
-          c.get("/d/b/items").get_json()["current"] == pool_ids[0])
+          c.get("/d/b/items").get_json()["current_src"] == pool_ids[0])
     check("adding twice is harmless",
           c.post(f"/d/b/items/{pool_ids[1]}/add").status_code == 200)
     check("still two used", len(lists(c, "b")[1]) == 2)
@@ -113,7 +118,7 @@ def main() -> int:
     check("select accepted", c.post(f"/d/b/items/{pool_ids[2]}/select").status_code == 200)
     j, used_b, _ = lists(c, "b")
     check("select assigned it too", pool_ids[2] in used_b)
-    check("and put it on screen", j["current"] == pool_ids[2])
+    check("and put it on screen", j["current_src"] == pool_ids[2])
     shown = c.get("/d/b/image?w=80&h=48&fmt=png").data
     c.post(f"/d/b/items/{pool_ids[1]}/select")
     check("the render follows the selection",
@@ -161,20 +166,104 @@ def main() -> int:
     check("unknown thumb 404s", c.get("/pool/0000000000000000/thumb").status_code == 404)
     check("malformed thumb id 400s", c.get("/pool/nothex/thumb").status_code == 400)
 
+    print("\nframing belongs to the picture, not the screen")
+    pool_ids = [i["id"] for i in c.get("/pool").get_json()]
+    c.post(f"/d/f1/items/{pool_ids[0]}/add")
+    c.post(f"/d/f1/items/{pool_ids[1]}/add")
+    c.post(f"/d/f1/items/{pool_ids[0]}/select")
+    c.post("/d/f1/prefs", json={"fit": "cover", "rot": 90})
+    first = c.get("/d/f1/items").get_json()
+    c.post(f"/d/f1/items/{pool_ids[1]}/select")
+    second = c.get("/d/f1/items").get_json()
+    check("each picture carries its own framing",
+          first["used"][0]["config"].get("rot") == 90
+          and second["used"][1]["config"].get("rot") in (None, 90),
+          str(second["used"][1]["config"]))
+    c.post("/d/f1/prefs", json={"rot": 180})
+    after = c.get("/d/f1/items").get_json()["used"]
+    check("reframing one leaves the other alone",
+          after[0]["config"]["rot"] == 90 and after[1]["config"]["rot"] == 180,
+          str([u["config"].get("rot") for u in after]))
+    check("the screen's defaults follow the last framing",
+          c.get("/d/f1/meta") is not None
+          and srv.read_prefs("f1").get("rot") == 180, str(srv.read_prefs("f1")))
+
+    print("\na duplicate is the same picture framed twice")
+    current = c.get("/d/f1/items").get_json()["current"]
+    r = c.post(f"/d/f1/variants/{current}/duplicate", data={"name": "face"},
+               content_type=FORM)
+    check("duplicate accepted", r.status_code == 200, str(r.status_code))
+    copy_id = r.get_json()["variant"]["id"]
+    j = c.get("/d/f1/items").get_json()
+    check("it went on the screen", j["current"] == copy_id)
+    check("and is a separate row of the same source",
+          len([u for u in j["used"] if u["src_id"] == pool_ids[1]]) == 2,
+          str([(u["id"], u["src_id"]) for u in j["used"]]))
+    check("carrying its name", any(u["variant"] == "face" for u in j["used"]))
+    c.post("/d/f1/prefs", json={"zoom": 200})
+    rows = {u["id"]: u for u in c.get("/d/f1/items").get_json()["used"]}
+    check("framing the copy leaves the original crop alone",
+          rows[copy_id]["config"]["zoom"] == 200
+          and rows[current]["config"].get("zoom", 100) != 200,
+          str((rows[copy_id]["config"], rows[current]["config"])))
+
+    print("\nvariants are keyed by panel shape")
+    srv.library.set_shape(DATA_TEST, "f2", "240x240r")
+    c.post(f"/d/f2/items/{pool_ids[0]}/select")
+    round_row = c.get("/d/f2/items").get_json()["used"][0]
+    flat_row = next(u for u in c.get("/d/f1/items").get_json()["used"]
+                    if u["src_id"] == pool_ids[0])
+    check("a round screen gets its own variant of the same picture",
+          round_row["id"] != flat_row["id"] and round_row["src_id"] == flat_row["src_id"],
+          f'{round_row["shape"]} vs {flat_row["shape"]}')
+    check("each recorded against its shape",
+          round_row["shape"] == "240x240r" and flat_row["shape"] == "800x480",
+          f'{round_row["shape"]} / {flat_row["shape"]}')
+
+    print("\na screen that learns its real shape re-keys, keeping its framing")
+    # This is the migration case: lists converted before the screen was ever
+    # seen point at variants made for the default shape, which every other
+    # screen would then share.
+    c.post(f"/d/f3/items/{pool_ids[1]}/select")
+    c.post("/d/f3/prefs", json={"fit": "cover", "zoom": 120})
+    before = c.get("/d/f3/items").get_json()["used"][0]
+    check("starts at the default shape", before["shape"] == "800x480", before["shape"])
+    srv.library.set_shape(DATA_TEST, "f3", "240x240r")
+    after = c.get("/d/f3/items").get_json()["used"][0]
+    check("re-keyed to the panel it turned out to have",
+          after["shape"] == "240x240r" and after["id"] != before["id"],
+          f'{before["shape"]} -> {after["shape"]}')
+    check("carrying the framing across",
+          after["config"].get("zoom") == 120 and after["config"].get("fit") == "cover",
+          str(after["config"]))
+    check("and the same picture", after["src_id"] == before["src_id"])
+    others = {u["id"] for u in c.get("/d/f1/items").get_json()["used"]}
+    check("no longer sharing a variant with a differently shaped screen",
+          after["id"] not in others)
+
+    # Two screens of the SAME shape do share: one framing per source and
+    # shape is the whole point of keying them that way.
+    c.post(f"/d/f3/items/{pool_ids[0]}/select")
+    mine = c.get("/d/f3/items").get_json()["current"]
+    theirs = next(u["id"] for u in c.get("/d/f2/items").get_json()["used"]
+                  if u["src_id"] == pool_ids[0])
+    check("screens of one shape share a picture's framing", mine == theirs,
+          f"{mine} vs {theirs}")
+
     print("\nreordering only touches what the screen uses")
     for pid in [i["id"] for i in c.get("/pool").get_json()]:
         c.post(f"/d/a/items/{pid}/add")
     used_a = lists(c, "a")[1]
     r = c.post("/d/a/order", json={"ids": list(reversed(used_a))})
     check("reorder accepted", r.status_code == 200, str(r.status_code))
-    check("order applied", r.get_json()["order"] == list(reversed(used_a)))
+    check("order applied", r.get_json()["order_src"] == list(reversed(used_a)))
     r = c.post("/d/a/order", json={"ids": [used_a[0]]})
     check("partial reorder keeps everything",
-          sorted(r.get_json()["order"]) == sorted(used_a))
-    check("named id moved to the front", r.get_json()["order"][0] == used_a[0])
+          sorted(r.get_json()["order_src"]) == sorted(used_a))
+    check("named id moved to the front", r.get_json()["order_src"][0] == used_a[0])
     r = c.post("/d/a/order", json={"ids": ["0000000000000000"]})
     check("ids the screen does not use are ignored", r.status_code == 200)
-    check("nothing lost", sorted(r.get_json()["order"]) == sorted(used_a))
+    check("nothing lost", sorted(r.get_json()["order_src"]) == sorted(used_a))
     check("malformed reorder rejected",
           c.post("/d/a/order", json={"nope": 1}).status_code == 400)
 
@@ -214,7 +303,7 @@ def main() -> int:
     }), encoding="utf-8")
     j, used_o, _ = lists(c, "old1")
     check("adopted into the pool", len(used_o) == 1, str(used_o))
-    check("it is on the screen", j["current"] == used_o[0])
+    check("it is on the screen", j["current_src"] == used_o[0])
     check("filename survived", j["used"][0]["filename"] == "old-a.png")
     check("it renders", c.get("/d/old1/image?w=80&h=48&fmt=png").status_code == 200)
     check("old per-device file cleaned up",
@@ -254,12 +343,12 @@ def main() -> int:
     c.post("/d/b/items/" + ids[0] + "/select")
     c.post("/d/a/prefs", json={"reset": 1})
     check("state really changed",
-          c.get("/d/a/items").get_json()["current"] == ids[1])
+          c.get("/d/a/items").get_json()["current_src"] == ids[1])
 
     r = c.post(f"/scenes/{scene['id']}/apply")
     check("apply accepted", r.status_code == 200, str(r.status_code))
-    check("a restored", c.get("/d/a/items").get_json()["current"] == ids[0])
-    check("b restored", c.get("/d/b/items").get_json()["current"] == ids[1])
+    check("a restored", c.get("/d/a/items").get_json()["current_src"] == ids[0])
+    check("b restored", c.get("/d/b/items").get_json()["current_src"] == ids[1])
     check("prefs restored too",
           c.get("/d/a/items") is not None and
           json.loads((DATA_TEST / "a" / "prefs.json").read_text())["zoom"] == 150)
@@ -304,7 +393,7 @@ def main() -> int:
     r = c.post(f"/d/a/items/{ids[1]}/select", json={})
     check("JSON select returns JSON, no redirect", r.status_code == 200 and r.is_json,
           str(r.status_code))
-    check("and it really switched", c.get("/d/a/items").get_json()["current"] == ids[1])
+    check("and it really switched", c.get("/d/a/items").get_json()["current_src"] == ids[1])
 
     # no-JS fallback: a form post with return_to comes back to the main page
     r = c.post(f"/d/a/items/{ids[0]}/select", data={"return_to": "/"},
