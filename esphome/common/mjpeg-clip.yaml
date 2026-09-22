@@ -24,8 +24,10 @@
 # Pick one with "Next SD Clip" or by typing its name into "SD Clip". New content
 # from the server replaces the pick.
 #
-# Requires common/content-pull.yaml and common/sd-card.yaml, listed before this
-# file. Do not combine with sd-still.yaml: both would take the still fetches.
+# Requires common/content-pull.yaml, listed before this file. common/sd-card.yaml
+# is OPTIONAL: without a card (or on a board whose card is not on SPI, such as
+# an ESP32-P4) items live in PSRAM alone and are fetched again after a reboot.
+# Do not combine with sd-still.yaml: both would take the still fetches.
 
 substitutions:
   anim_formats: gif,apng,webp
@@ -38,7 +40,11 @@ external_components:
   - source:
       type: local
       path: components
-    components: [sd_clip]
+    # sd_spi is listed so sd_clip can import it even on a board that has no
+    # card configured (an ESP32-P4's card is on SDMMC, not SPI). Listing it
+    # does not configure it: without an `sd_spi:` block nothing is built, and
+    # sd_clip then holds content in PSRAM alone.
+    components: [sd_clip, sd_spi]
 
 sd_clip:
   id: clip
@@ -177,7 +183,7 @@ interval:
 
           bool started;
           if (!file.empty()) {
-            if (!id(sd)->is_mounted())
+            if (!id(clip)->sd_mounted())
               return;  // the card may still be mounting
             started = id(clip)->request_file(file);
           } else {
@@ -306,7 +312,7 @@ button:
           ESP_LOGI("mjpeg", "%u clip(s) in /mjpeg:", (unsigned) files.size());
           for (auto &f : files)
             ESP_LOGI("mjpeg", "  %s (%u KB)", f.c_str(),
-                     (unsigned) (id(sd)->file_size("/mjpeg/" + f) / 1024));
+                     (unsigned) (id(clip)->file_size("/mjpeg/" + f) / 1024));
           ESP_LOGI("mjpeg", "%u item(s) in memory, %u KB", (unsigned) id(clip)->cache_count(),
                    (unsigned) (id(clip)->cache_used() / 1024));
 

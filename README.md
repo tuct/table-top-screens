@@ -16,9 +16,12 @@ all fed from one place over the local network.
 esphome/
   tabletop-01.yaml                      device instance: identity only
   tabletop-02.yaml                      "
+  tabletop-03.yaml                      "
   boards/
     waveshare-s3-touch-lcd-4.3.yaml     800x480 RGB parallel, GT911, CH422G
     seeed-xiao-round-display.yaml       240x240 round SPI, GC9A01A, CHSC6X
+    waveshare-p4-wifi6-touch-lcd-4.3.yaml  480x800 MIPI-DSI ST7701, GT911,
+                                        ESP32-P4 + C6 radio over SDIO
   common/
     base.yaml                           wifi / api / ota / web_server / diagnostics
     content-pull.yaml                   mDNS advertisement + content path
@@ -67,12 +70,75 @@ file.
 |---|---|---|
 | tabletop-01 (Waveshare 4.3) | `sd-card` + `sd-still` | `anim=none sd=1 img=jpeg,rgb565` |
 | tabletop-02 (round XIAO) | `sd-card` + `mjpeg-clip` | `round=1 anim=gif,apng,webp sd=0 clip=mjpeg` |
+| tabletop-03 (Waveshare P4) | `mjpeg-clip` | `anim=gif,apng,webp sd=0 clip=mjpeg` |
 
 **The Waveshare 4.3 is stills only.** Its GIF path cached clips by
 JPEG-decoding every frame into a 768 KB buffer, which is exactly the memory
 this board should not spend on content. So it no longer includes
 `sd-clip.yaml`, advertises `anim=none`, and the server sends it the first
 frame of anything animated.
+
+### A second kind of chip: ESP32-P4 + ESP32-C6
+
+`tabletop-03` is the first board here whose main chip **has no radio**. The
+ESP32-P4 is a 400 MHz dual-core RISC-V with 32 MB of PSRAM and a MIPI-DSI
+display controller, but Wi-Fi and Bluetooth come from a *second* chip — an
+ESP32-C6 — reached over 4-bit SDIO and driven by ESP-IDF's `esp_hosted`.
+ESPHome wraps that as `esp32_hosted`, so the board package declares the link
+and **nothing above it changes**: the `wifi:` block, mDNS, `web_server` and
+`http_request` are the same as on an S3.
+
+```yaml
+esp32_hosted:
+  type: sdio
+  variant: ESP32C6
+  reset_pin: GPIO54           # C6 EN
+  clk_pin: GPIO18             # ESP-Hosted's default P4 pins; Waveshare's
+  cmd_pin: GPIO19             # own examples ship no overrides, which is
+  d0_pin: GPIO14              # what says this board follows them
+  ...
+```
+
+What this buys is room. The screen's content cache is PSRAM, and the P4 has
+32 MB of it against the S3's 8 MB, so `clip_cache_bytes` is set to 20 MB —
+minutes of video rather than tens of seconds.
+
+**Four traps, all found on hardware.** Each one produces a dead-looking board:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Bootloop, LP watchdog every ~3.3 s, nothing after the ROM's `entry 0x…` | ESPHome emits `CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y` + `REV_MIN_0` — a pre-rev3 image — on rev3 silicon | `board: esp32-p4_r3` and force `SELECTS_REV_LESS_V3: "n"` / `REV_MIN_300: "y"` |
+| Chip runs, no logs at all | ESPHome puts the P4 console on USB-Serial-JTAG; the socket that enumerates is a CH343 **USB-to-UART** bridge on UART0 | console and `logger` on `UART0` |
+| Silent panic in display setup, black panel | ESPHome hardcodes the DSI PHY clock source to the **legacy** (pre-rev3) `PLL_F20M`; the rev3 HAL has no case for it and calls `abort()` | the vendored `components/mipi_dsi` override below |
+| — | Waveshare's rev3_x profile pairs `REV_MIN_300` with **250 MHz** PSRAM; ESPHome caps the P4 at 200 | force `SPIRAM_SPEED_250M` |
+
+Check the silicon before assuming: `esptool --port … flash-id` prints
+`Chip type: ESP32-P4 (revision v3.2)`. An engineering sample below v3.0 wants
+the opposite settings.
+
+**`components/mipi_dsi` is a vendored copy of ESPHome's own component** with a
+single line changed: it leaves `phy_clk_src` unset so `esp_lcd_new_dsi_bus()`
+applies ESP-IDF's revision-aware default (XTAL on rev ≥ 3.0) instead of the
+legacy source. Espressif's and Waveshare's BSPs both rely on that default.
+Drop the override once ESPHome fixes it upstream.
+
+`esphome/p4-screen-test.yaml` is the bring-up config that found all of this:
+panel only, no radio, console on UART0, hardware test card.
+
+Three more things to know about the category:
+
+- **The C6 needs matching esp-hosted firmware.** Waveshare ships it flashed.
+  After an ESP-IDF jump it may need reflashing before Wi-Fi comes up at all.
+  The SDIO pins in the board package (CLK 18, CMD 19, D0-D3 14-17, reset
+  GPIO54) are **confirmed working** on this board: the screen associates and
+  gets an address.
+- **A dark panel needs the LDO.** The MIPI D-PHY is powered from the P4's own
+  LDO (`esp_ldo`, channel 3 at 2.5 V). Without it the DSI controller
+  initialises happily and the screen stays black.
+- **No SD card yet.** The P4 board's slot is wired for 4-bit SDMMC, and
+  `components/sd_spi` drives cards over SPI only. `mjpeg-clip.yaml` works
+  either way: with no card it keeps content in PSRAM and re-fetches after a
+  reboot. Giving this board its card needs an SDMMC component.
 
 ### MJPEG content from memory (`common/mjpeg-clip.yaml`)
 

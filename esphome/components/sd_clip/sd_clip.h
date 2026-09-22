@@ -9,14 +9,20 @@
 #include "esphome/core/helpers.h"
 #include "esphome/components/display/display.h"
 #include "esphome/components/http_request/http_request.h"
+#ifdef USE_SD_SPI
 #include "esphome/components/sd_spi/sd_spi.h"
+#endif
 
 #ifdef USE_ESP32
 
+#ifdef USE_SD_CLIP_HW_JPEG
+#include "driver/jpeg_decode.h"
+#else
 // JPEGDEC's header defines the class; forward declarations keep it out of
 // every translation unit that includes this one.
 class JPEGDEC;
 struct jpeg_draw_tag;
+#endif
 
 namespace esphome {
 namespace sd_clip {
@@ -41,7 +47,16 @@ class SdClip : public Component {
   /// After sd_spi (DATA), because caching and playback both need the mount.
   float get_setup_priority() const override { return setup_priority::LATE; }
 
+#ifdef USE_SD_SPI
   void set_sd(sd_spi::SdSpi *sd) { this->sd_ = sd; }
+#endif
+  /// The card, if this board has one on SPI and it is mounted. Everything
+  /// below works without one: content is then held in PSRAM only.
+  bool sd_mounted() const;
+  size_t file_size(const std::string &path);
+  std::string mount_point() const;
+  std::vector<std::string> list_directory(const std::string &path, size_t max_entries = 64);
+  bool card_space(uint64_t &total, uint64_t &free);
   void set_display(display::Display *disp) { this->display_ = disp; }
   void set_http(http_request::HttpRequestComponent *http) { this->http_ = http; }
   void set_size(int width, int height) {
@@ -245,6 +260,12 @@ class SdClip : public Component {
   bool push_report(const std::string &url);
 
   /// Largest single item held in memory; longer clips are cut to whole frames.
+  /// See the byte_order option: big-endian for mipi_rgb/mipi_spi, little for
+  /// mipi_dsi.
+  void set_big_endian(bool big_endian) { this->big_endian_ = big_endian; }
+  /// Hardware decoder only: BGR element order, which is what these DSI panels
+  /// want. See the element_order option.
+  void set_bgr_order(bool bgr) { this->bgr_order_ = bgr; }
   void set_max_bytes(size_t max_bytes) { this->max_bytes_ = max_bytes; }
   size_t max_bytes() const { return this->max_bytes_; }
   /// PSRAM for all items together.
@@ -255,6 +276,7 @@ class SdClip : public Component {
   /// Banded read-and-blit of one raw frame file. Shared by clips and stills.
   bool blit_file_(const std::string &full, const char *what);
   std::string still_path_(const char *name) const;
+  void make_dir_(const std::string &path);
 
   /// One HTTP body streamed to a card file or a PSRAM buffer, a bounded amount
   /// per loop() tick. Raw stills and MJPEG items both use it.
@@ -309,14 +331,26 @@ class SdClip : public Component {
   void update_high_freq_();
   void pump_playback_();
   bool show_frame_(size_t index);
+  /// Blit one decoded RGB565 image, centred and cropped to the panel.
+  /// `stride` is the source row length in PIXELS, which the hardware decoder
+  /// rounds up to a multiple of 16.
+  void blit_image_(const uint8_t *pixels, int img_w, int img_h, int stride);
+#ifdef USE_SD_CLIP_HW_JPEG
+  bool ensure_hw_jpeg_();
+  bool hw_decode_(const uint8_t *data, size_t len);
+#else
+  bool sw_decode_(const uint8_t *data, size_t len);
   static int jpeg_draw_(jpeg_draw_tag *draw);
+#endif
   /// Card path of cached item `key`, relative to the mount point.
   std::string cache_path_(const std::string &key) const;
   std::string frame_path_(int index) const;
   /// Absolute path of frame `index`, including the card's mount point.
   std::string full_path_(int index) const;
 
+#ifdef USE_SD_SPI
   sd_spi::SdSpi *sd_{nullptr};
+#endif
   display::Display *display_{nullptr};
   http_request::HttpRequestComponent *http_{nullptr};
   int width_{0};
@@ -357,11 +391,26 @@ class SdClip : public Component {
   /// is cached but not shown.
   std::string want_key_;
 
+#ifdef USE_SD_CLIP_HW_JPEG
+  // The ESP32-P4's JPEG peripheral. It decodes a whole frame in one call, so
+  // unlike JPEGDEC it needs somewhere to put it: `hw_out_` is a full-frame
+  // RGB565 buffer and `hw_in_` a copy of the compressed frame, both from
+  // jpeg_alloc_decoder_mem() because the engine has alignment requirements
+  // the cache lines and DMA impose.
+  jpeg_decoder_handle_t hw_jpeg_{nullptr};
+  uint8_t *hw_in_{nullptr};
+  size_t hw_in_cap_{0};
+  uint8_t *hw_out_{nullptr};
+  size_t hw_out_cap_{0};
+#else
   JPEGDEC *jpeg_{nullptr};
+#endif
   /// Where the decoded image's top-left lands on the panel. Negative when the
   /// item is larger than the panel: it is centre-cropped in jpeg_draw_().
   int draw_ox_{0};
   int draw_oy_{0};
+  bool big_endian_{true};
+  bool bgr_order_{true};
 
   float fps_{15.0f};
   bool playing_{true};

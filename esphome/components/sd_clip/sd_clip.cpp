@@ -15,7 +15,9 @@
 #include <new>
 #include <vector>
 
+#ifndef USE_SD_CLIP_HW_JPEG
 #include <JPEGDEC.h>
+#endif
 
 #include "esphome/core/log.h"
 
@@ -24,19 +26,70 @@ namespace sd_clip {
 
 static const char *const TAG = "sd_clip";
 
+/// mkdir, but only where there is a filesystem to make it in. Without a card
+/// driver the VFS layer is not built at all, and linking ::mkdir there raises
+/// "mkdir is not implemented and will always fail".
+void SdClip::make_dir_(const std::string &path) {
+#ifdef USE_SD_SPI
+  ::mkdir(path.c_str(), 0777);
+#endif
+}
+
+bool SdClip::sd_mounted() const {
+#ifdef USE_SD_SPI
+  return this->sd_ != nullptr && this->sd_->is_mounted();
+#else
+  return false;
+#endif
+}
+
+size_t SdClip::file_size(const std::string &path) {
+#ifdef USE_SD_SPI
+  if (this->sd_ != nullptr)
+    return this->sd_->file_size(path);
+#endif
+  return 0;
+}
+
+std::string SdClip::mount_point() const {
+#ifdef USE_SD_SPI
+  if (this->sd_ != nullptr)
+    return this->sd_->mount_point();
+#endif
+  return "";
+}
+
+std::vector<std::string> SdClip::list_directory(const std::string &path, size_t max_entries) {
+#ifdef USE_SD_SPI
+  if (this->sd_ != nullptr)
+    return this->sd_->list_directory(path, max_entries);
+#endif
+  return {};
+}
+
+bool SdClip::card_space(uint64_t &total, uint64_t &free) {
+#ifdef USE_SD_SPI
+  if (this->sd_ != nullptr)
+    return this->sd_->space(total, free);
+#endif
+  return false;
+}
+
 void SdClip::setup() {
-  if (this->sd_ == nullptr || !this->sd_->is_mounted()) {
-    ESP_LOGW(TAG, "No SD card mounted; clip playback is unavailable.");
+  if (!this->sd_mounted()) {
+    // Not a problem in itself: without a card, content lives in PSRAM only
+    // and is fetched again after a reboot.
+    ESP_LOGI(TAG, "No SD card; content will be held in memory only.");
     return;
   }
   // Create the clip directory up front so a later cache() only has to worry
   // about files. mkdir on an existing directory fails harmlessly with EEXIST.
-  const std::string dir = this->sd_->mount_point() + this->directory_;
-  ::mkdir(dir.c_str(), 0777);
+  const std::string dir = this->mount_point() + this->directory_;
+  this->make_dir_(dir);
 
   // Count what a previous run already left on the card, so playback can start
   // immediately after a reboot with no network at all.
-  while (this->sd_->file_size(this->frame_path_(this->cached_)) == this->frame_bytes()) {
+  while (this->file_size(this->frame_path_(this->cached_)) == this->frame_bytes()) {
     this->cached_++;
   }
   if (this->cached_ > 0) {
@@ -59,7 +112,7 @@ std::string SdClip::frame_path_(int index) const {
 }
 
 std::string SdClip::full_path_(int index) const {
-  return this->sd_->mount_point() + this->frame_path_(index);
+  return this->mount_point() + this->frame_path_(index);
 }
 
 bool SdClip::ensure_buffer_() {
@@ -104,8 +157,8 @@ bool SdClip::ensure_buffer_() {
 }
 
 bool SdClip::has_frame(int index) {
-  return this->sd_ != nullptr && this->sd_->is_mounted() &&
-         this->sd_->file_size(this->frame_path_(index)) == this->frame_bytes();
+  return this->sd_mounted() &&
+         this->file_size(this->frame_path_(index)) == this->frame_bytes();
 }
 
 int SdClip::rescan() {
@@ -117,10 +170,10 @@ int SdClip::rescan() {
 }
 
 bool SdClip::ensure_clip(const std::string &token) {
-  if (this->sd_ == nullptr || !this->sd_->is_mounted())
+  if (!this->sd_mounted())
     return false;
 
-  const std::string id_path = this->sd_->mount_point() + this->directory_ + "/id.txt";
+  const std::string id_path = this->mount_point() + this->directory_ + "/id.txt";
   std::string current;
   FILE *f = fopen(id_path.c_str(), "rb");
   if (f != nullptr) {
@@ -154,7 +207,7 @@ bool SdClip::ensure_clip(const std::string &token) {
 bool SdClip::write_frame(int index, const uint8_t *data, size_t len) {
   // Say which precondition failed. This used to return silently, which made a
   // simple "no card mounted" look like a write bug.
-  if (this->sd_ == nullptr || !this->sd_->is_mounted()) {
+  if (!this->sd_mounted()) {
     ESP_LOGW(TAG, "Frame %d not written: no SD card mounted", index);
     return false;
   }
@@ -202,7 +255,7 @@ bool SdClip::write_frame(int index, const uint8_t *data, size_t len) {
 }
 
 bool SdClip::cache_one(const std::string &base_url, int index) {
-  if (this->sd_ == nullptr || !this->sd_->is_mounted()) {
+  if (!this->sd_mounted()) {
     ESP_LOGE(TAG, "Cannot cache: no SD card mounted.");
     return false;
   }
@@ -305,7 +358,7 @@ bool SdClip::show(int index) {
 }
 
 bool SdClip::blit_file_(const std::string &full, const char *what) {
-  if (this->display_ == nullptr || this->sd_ == nullptr || !this->sd_->is_mounted())
+  if (this->display_ == nullptr || !this->sd_mounted())
     return false;
   if (!this->ensure_buffer_())
     return false;
@@ -379,22 +432,22 @@ static const char *const FETCH_TEMP = "new.part";
 static const uint64_t CARD_RESERVE = 16ULL * 1024 * 1024;
 
 std::string SdClip::still_path_(const char *name) const {
-  return this->sd_->mount_point() + "/still/" + name;
+  return this->mount_point() + "/still/" + name;
 }
 
 bool SdClip::has_still() {
-  return this->sd_ != nullptr && this->sd_->is_mounted() &&
-         this->sd_->file_size("/still/image.565") == this->frame_bytes();
+  return this->sd_mounted() &&
+         this->file_size("/still/image.565") == this->frame_bytes();
 }
 
 bool SdClip::start_still(const std::string &url) {
-  if (this->sd_ == nullptr || !this->sd_->is_mounted()) {
+  if (!this->sd_mounted()) {
     this->still_event_ = STILL_FAILED;
     return false;
   }
   // Only offer our ETag if the file it describes is really there and whole;
   // otherwise a 304 would leave us with nothing to show.
-  return this->start_fetch_(FETCH_STILL, "", url, this->sd_->mount_point() + "/still", "image.565",
+  return this->start_fetch_(FETCH_STILL, "", url, this->mount_point() + "/still", "image.565",
                             "etag.txt", this->has_still(), false);
 }
 
@@ -408,7 +461,7 @@ bool SdClip::start_fetch_(FetchKind kind, const std::string &key, const std::str
     return false;
   }
   if (!to_memory)
-    ::mkdir(dir.c_str(), 0777);
+    this->make_dir_(dir);
 
   std::vector<http_request::Header> headers;
   if (offer_etag && !etag_file.empty()) {
@@ -672,8 +725,8 @@ SdClip::Item *SdClip::find_item_(const std::string &key) {
 bool SdClip::has_item(const std::string &key) {
   if (this->find_item_(key) != nullptr)
     return true;
-  return this->sd_ != nullptr && this->sd_->is_mounted() &&
-         this->sd_->file_size(this->cache_path_(key)) > 0;
+  return this->sd_mounted() &&
+         this->file_size(this->cache_path_(key)) > 0;
 }
 
 bool SdClip::request_item(const std::string &key, const std::string &url) {
@@ -695,8 +748,8 @@ bool SdClip::request_item(const std::string &key, const std::string &url) {
   if (this->load_.fd >= 0 || (this->fetch_.http != nullptr && this->fetch_.key == key))
     return true;  // already on its way
 
-  const bool card = this->sd_ != nullptr && this->sd_->is_mounted();
-  if (card && this->sd_->file_size(this->cache_path_(key)) > 0) {
+  const bool card = this->sd_mounted();
+  if (card && this->file_size(this->cache_path_(key)) > 0) {
     ESP_LOGI(TAG, "Item %s: on the card, no download", key.c_str());
     if (this->start_load_(key, this->cache_path_(key)))
       return true;
@@ -707,15 +760,15 @@ bool SdClip::request_item(const std::string &key, const std::string &url) {
 
   bool to_card = card;
   uint64_t total, free;
-  if (to_card && this->sd_->space(total, free) && free < CARD_RESERVE + this->max_bytes_) {
+  if (to_card && this->card_space(total, free) && free < CARD_RESERVE + this->max_bytes_) {
     ESP_LOGW(TAG, "Card nearly full (%u MB free); holding %s in memory only",
              static_cast<unsigned>(free >> 20), key.c_str());
     to_card = false;
   }
   if (to_card) {
-    ::mkdir((this->sd_->mount_point() + "/mjpeg").c_str(), 0777);
+    this->make_dir_(this->mount_point() + "/mjpeg");
     const std::string path = this->cache_path_(key);
-    return this->start_fetch_(FETCH_ITEM, key, url, this->sd_->mount_point() + "/mjpeg/cache",
+    return this->start_fetch_(FETCH_ITEM, key, url, this->mount_point() + "/mjpeg/cache",
                               path.substr(path.rfind('/') + 1), "", false, false);
   }
   return this->start_fetch_(FETCH_ITEM, key, url, "", "", "", false, true);
@@ -739,7 +792,7 @@ bool SdClip::request_file(const std::string &name) {
   }
   if (this->fetch_.http != nullptr && this->fetch_.kind == FETCH_ITEM)
     this->abort_fetch_();
-  if (this->sd_ == nullptr || !this->sd_->is_mounted())
+  if (!this->sd_mounted())
     return false;
   if (!this->start_load_(key, "/mjpeg/" + name)) {
     this->item_event_ = ITEM_FAILED;
@@ -750,9 +803,9 @@ bool SdClip::request_file(const std::string &name) {
 
 std::vector<std::string> SdClip::list_mjpegs() {
   std::vector<std::string> out;
-  if (this->sd_ == nullptr || !this->sd_->is_mounted())
+  if (!this->sd_mounted())
     return out;
-  for (auto &name : this->sd_->list_directory("/mjpeg", 64)) {
+  for (auto &name : this->list_directory("/mjpeg", 64)) {
     std::string lower = name;
     std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
     auto ends_with = [&](const char *ext) {
@@ -820,7 +873,7 @@ bool SdClip::start_load_(const std::string &key, const std::string &path) {
     return false;
   this->abort_load_();
 
-  const size_t size = this->sd_->file_size(path);
+  const size_t size = this->file_size(path);
   if (size == 0) {
     ESP_LOGW(TAG, "%s: missing or empty", path.c_str());
     return false;
@@ -838,7 +891,7 @@ bool SdClip::start_load_(const std::string &key, const std::string &path) {
              static_cast<unsigned>(cap / 1024));
     return false;
   }
-  const std::string full = this->sd_->mount_point() + path;
+  const std::string full = this->mount_point() + path;
   const int fd = ::open(full.c_str(), O_RDONLY);
   if (fd < 0) {
     ESP_LOGW(TAG, "Cannot open %s", full.c_str());
@@ -929,14 +982,14 @@ std::string SdClip::cache_report(size_t max_card) {
     out += str_sprintf(",%u,%u]", static_cast<unsigned>(it->len), static_cast<unsigned>(it->off.size()));
   }
   out += "],\"card\":";
-  if (this->sd_ == nullptr || !this->sd_->is_mounted()) {
+  if (!this->sd_mounted()) {
     out += "null}";
     return out;
   }
   out += '[';
   first = true;
   size_t listed = 0;
-  for (auto &name : this->sd_->list_directory("/mjpeg/cache", 128)) {
+  for (auto &name : this->list_directory("/mjpeg/cache", 128)) {
     if (name.size() <= 4 || name.compare(name.size() - 4, 4, ".mjp") != 0)
       continue;
     if (listed++ >= max_card)
@@ -946,7 +999,7 @@ std::string SdClip::cache_report(size_t max_card) {
     first = false;
     out += '[';
     json_string(out, name.substr(0, name.size() - 4));
-    out += str_sprintf(",%u]", static_cast<unsigned>(this->sd_->file_size("/mjpeg/cache/" + name)));
+    out += str_sprintf(",%u]", static_cast<unsigned>(this->file_size("/mjpeg/cache/" + name)));
   }
   out += "]}";
   return out;
@@ -1179,8 +1232,139 @@ void SdClip::pump_playback_() {
 }
 
 bool SdClip::show_frame_(size_t index) {
-  if (this->display_ == nullptr)
+  const Item *item = this->shown_;
+  if (this->display_ == nullptr || item == nullptr)
     return false;
+  const uint8_t *data = item->buf + item->off[index];
+  const size_t len = item->size[index];
+
+  const uint32_t t0 = micros();
+#ifdef USE_SD_CLIP_HW_JPEG
+  const bool ok = this->hw_decode_(data, len);
+#else
+  const bool ok = this->sw_decode_(data, len);
+#endif
+  this->last_decode_us_ = micros() - t0;
+  if (!ok) {
+    if (this->decode_errors_++ < 3)
+      ESP_LOGW(TAG, "Frame %u: decode failed", static_cast<unsigned>(index));
+    return false;
+  }
+  this->frames_shown_++;
+  return true;
+}
+
+void SdClip::blit_image_(const uint8_t *pixels, int img_w, int img_h, int stride) {
+  // Centre, and clip here rather than in the display driver, which does not
+  // clip -- so an image larger than the panel (a 320x180 video on a 240x240
+  // screen) is centre-cropped instead of scribbling past the edge.
+  const int ox = (this->width_ - img_w) / 2;
+  const int oy = (this->height_ - img_h) / 2;
+  const int skip_left = ox < 0 ? -ox : 0;
+  const int skip_top = oy < 0 ? -oy : 0;
+  const int x0 = ox + skip_left;
+  const int y0 = oy + skip_top;
+  const int w = std::min(img_w - skip_left, this->width_ - x0);
+  const int h = std::min(img_h - skip_top, this->height_ - y0);
+  if (w <= 0 || h <= 0)
+    return;
+  this->display_->draw_pixels_at(x0, y0, w, h, pixels, display::COLOR_ORDER_RGB,
+                                 display::COLOR_BITNESS_565, this->big_endian_, skip_left, skip_top,
+                                 stride - skip_left - w);
+}
+
+#ifdef USE_SD_CLIP_HW_JPEG
+
+// The engine rounds the decoded image out to whole 16-pixel blocks.
+static inline uint32_t align16(uint32_t v) { return (v + 15) & ~15u; }
+
+bool SdClip::ensure_hw_jpeg_() {
+  if (this->hw_jpeg_ != nullptr)
+    return true;
+  // Generous against a stall, but not forever: a frame that never completes
+  // must not wedge playback.
+  jpeg_decode_engine_cfg_t cfg{};
+  cfg.timeout_ms = 200;
+  const esp_err_t err = jpeg_new_decoder_engine(&cfg, &this->hw_jpeg_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "JPEG peripheral unavailable: %s", esp_err_to_name(err));
+    this->hw_jpeg_ = nullptr;
+    return false;
+  }
+  ESP_LOGI(TAG, "Using the ESP32-P4 hardware JPEG decoder");
+  return true;
+}
+
+bool SdClip::hw_decode_(const uint8_t *data, size_t len) {
+  if (!this->ensure_hw_jpeg_())
+    return false;
+
+  jpeg_decode_picture_info_t info{};
+  esp_err_t err = jpeg_decoder_get_info(data, len, &info);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Not a JPEG the peripheral can read: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  // The compressed frame lives in the PSRAM item buffer, which is not
+  // allocated to the engine's alignment; copy it into memory that is. Tens of
+  // KB, against the hundreds of milliseconds this whole path replaces.
+  if (len > this->hw_in_cap_) {
+    if (this->hw_in_ != nullptr)
+      heap_caps_free(this->hw_in_);
+    jpeg_decode_memory_alloc_cfg_t mem_cfg{};
+    mem_cfg.buffer_direction = JPEG_DEC_ALLOC_INPUT_BUFFER;
+    size_t got = 0;
+    this->hw_in_ = static_cast<uint8_t *>(jpeg_alloc_decoder_mem(len, &mem_cfg, &got));
+    if (this->hw_in_ == nullptr) {
+      ESP_LOGE(TAG, "No memory for a %u byte JPEG input buffer", static_cast<unsigned>(len));
+      this->hw_in_cap_ = 0;
+      return false;
+    }
+    this->hw_in_cap_ = got;
+  }
+  memcpy(this->hw_in_, data, len);
+
+  const uint32_t stride = align16(info.width);
+  const size_t need = static_cast<size_t>(stride) * align16(info.height) * 2;
+  if (need > this->hw_out_cap_) {
+    if (this->hw_out_ != nullptr)
+      heap_caps_free(this->hw_out_);
+    jpeg_decode_memory_alloc_cfg_t mem_cfg{};
+    mem_cfg.buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER;
+    size_t got = 0;
+    this->hw_out_ = static_cast<uint8_t *>(jpeg_alloc_decoder_mem(need, &mem_cfg, &got));
+    if (this->hw_out_ == nullptr) {
+      ESP_LOGE(TAG, "No memory for a %u KB frame buffer", static_cast<unsigned>(need / 1024));
+      this->hw_out_cap_ = 0;
+      return false;
+    }
+    this->hw_out_cap_ = got;
+    ESP_LOGD(TAG, "Hardware decode buffer: %u KB for %ux%u", static_cast<unsigned>(got / 1024),
+             static_cast<unsigned>(info.width), static_cast<unsigned>(info.height));
+  }
+
+  jpeg_decode_cfg_t decode_cfg{};
+  decode_cfg.output_format = JPEG_DECODE_OUT_FORMAT_RGB565;
+  decode_cfg.rgb_order =
+      this->bgr_order_ ? JPEG_DEC_RGB_ELEMENT_ORDER_BGR : JPEG_DEC_RGB_ELEMENT_ORDER_RGB;
+  decode_cfg.conv_std = JPEG_YUV_RGB_CONV_STD_BT601;
+  uint32_t out_size = 0;
+  err = jpeg_decoder_process(this->hw_jpeg_, &decode_cfg, this->hw_in_, len, this->hw_out_,
+                             this->hw_out_cap_, &out_size);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Hardware decode failed: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  this->blit_image_(this->hw_out_, static_cast<int>(info.width), static_cast<int>(info.height),
+                    static_cast<int>(stride));
+  return true;
+}
+
+#else  // software decoder
+
+bool SdClip::sw_decode_(const uint8_t *data, size_t len) {
   if (this->jpeg_ == nullptr) {
     // Internal RAM: the decoder's state holds its Huffman tables and MCU
     // scratch, and every one of them is touched per block.
@@ -1196,42 +1380,27 @@ bool SdClip::show_frame_(size_t index) {
     ESP_LOGD(TAG, "JPEG decoder: %u bytes", static_cast<unsigned>(sizeof(JPEGDEC)));
   }
 
-  const uint32_t t0 = micros();
-  const Item *item = this->shown_;
-  if (item == nullptr)
-    return false;
-  if (!this->jpeg_->openRAM(item->buf + item->off[index], static_cast<int>(item->size[index]),
-                            &SdClip::jpeg_draw_)) {
-    if (this->decode_errors_++ < 3)
-      ESP_LOGW(TAG, "Frame %u: not a JPEG (error %d)", static_cast<unsigned>(index),
-               this->jpeg_->getLastError());
+  if (!this->jpeg_->openRAM(const_cast<uint8_t *>(data), static_cast<int>(len), &SdClip::jpeg_draw_)) {
+    ESP_LOGW(TAG, "Not a JPEG (error %d)", this->jpeg_->getLastError());
     return false;
   }
   // After openRAM, which clears the decoder state.
   this->jpeg_->setUserPointer(this);
-  this->jpeg_->setPixelType(RGB565_BIG_ENDIAN);
+  this->jpeg_->setPixelType(this->big_endian_ ? RGB565_BIG_ENDIAN : RGB565_LITTLE_ENDIAN);
   this->draw_ox_ = (this->width_ - this->jpeg_->getWidth()) / 2;
   this->draw_oy_ = (this->height_ - this->jpeg_->getHeight()) / 2;
+  // Progressive JPEGs fail here: JPEGDEC decodes baseline only.
   const bool ok = this->jpeg_->decode(0, 0, 0) != 0;
   const int err = this->jpeg_->getLastError();
   this->jpeg_->close();
-  this->last_decode_us_ = micros() - t0;
-  if (!ok) {
-    // Progressive JPEGs land here: JPEGDEC decodes baseline only.
-    if (this->decode_errors_++ < 3)
-      ESP_LOGW(TAG, "Frame %u: decode failed (error %d)", static_cast<unsigned>(index), err);
-    return false;
-  }
-  this->frames_shown_++;
-  return true;
+  if (!ok)
+    ESP_LOGW(TAG, "Decode failed (error %d)", err);
+  return ok;
 }
 
 int SdClip::jpeg_draw_(jpeg_draw_tag *draw) {
   auto *self = static_cast<SdClip *>(draw->pUser);
-  // Block position on the panel. Clipped here rather than in the display
-  // driver, which does not clip, so a clip larger than the panel -- a 320x180
-  // video on a 240x240 screen -- is centre-cropped instead of scribbling past
-  // the edge.
+  // One MCU block: position it on the panel, clipping as blit_image_ does.
   const int dx = draw->x + self->draw_ox_;
   const int dy = draw->y + self->draw_oy_;
   const int skip_left = dx < 0 ? -dx : 0;
@@ -1244,10 +1413,13 @@ int SdClip::jpeg_draw_(jpeg_draw_tag *draw) {
     return 1;  // entirely off the panel; keep decoding
   // Stride is iWidth; iWidthUsed excludes padding past the image's right edge.
   self->display_->draw_pixels_at(x0, y0, w, h, reinterpret_cast<const uint8_t *>(draw->pPixels),
-                                 display::COLOR_ORDER_RGB, display::COLOR_BITNESS_565, true,
-                                 skip_left, skip_top, draw->iWidth - skip_left - w);
+                                 display::COLOR_ORDER_RGB, display::COLOR_BITNESS_565,
+                                 self->big_endian_, skip_left, skip_top,
+                                 draw->iWidth - skip_left - w);
   return 1;
 }
+
+#endif  // USE_SD_CLIP_HW_JPEG
 
 }  // namespace sd_clip
 }  // namespace esphome

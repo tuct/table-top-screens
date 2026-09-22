@@ -87,6 +87,10 @@ CONFIG_SCHEMA = cv.Schema(
 
 
 async def to_code(config):
+    # Lets sd_clip compile with or without a card driver: a board whose card
+    # is not on SPI (or has no slot) simply leaves this component out.
+    cg.add_define("USE_SD_SPI")
+
     # FATFS is excluded from ESPHome builds by default to keep them small.
     include_builtin_idf_component("fatfs")
 

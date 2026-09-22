@@ -1,0 +1,308 @@
+# Waveshare ESP32-P4-WIFI6-Touch-LCD-4.3
+#   480x800 ST7701 panel over 2-lane MIPI-DSI, GT911 touch, 32MB PSRAM,
+#   ESP32-C6-MINI as the radio, microSD on SDMMC.
+#
+# FIRST BOARD OF A NEW KIND: the ESP32-P4 has no radio of its own. WiFi and
+# Bluetooth come from a second chip -- here an ESP32-C6 -- reached over SDIO
+# and driven by ESP-IDF's esp_hosted, which ESPHome wraps as `esp32_hosted`
+# below. Everything above that (the `wifi:` block in common/base.yaml, mDNS,
+# web_server, http_request) is unchanged: the radio is remote, the API is not.
+#
+# What that buys: a 400 MHz dual-core RISC-V with 32 MB of PSRAM, so the
+# content cache in common/mjpeg-clip.yaml can hold minutes of video rather
+# than tens of seconds.
+#
+# See boards/waveshare-s3-touch-lcd-4.3.yaml for the substitution contract
+# every board package has to satisfy.
+substitutions:
+  display_width: "480"
+  display_height: "800"
+  display_round: "0"
+  default_fit: cover        # 3:5 portrait panel; letterboxing wastes most of it
+  dot_x: "10"               # rectangular panel, so a corner is fine
+  dot_y: "10"
+
+  # NOTE: the cache sizes for this board are set in the DEVICE file
+  # (tabletop-03.yaml), not here. Substitutions from a package listed later
+  # win, and common/mjpeg-clip.yaml comes after this one and defines its own
+  # defaults -- so values put here are silently ignored. Only the device
+  # file's own substitutions beat every package.
+
+esp32:
+  variant: esp32p4
+  # Production rev3 silicon, stated explicitly. Left to itself ESPHome emits
+  # CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y with REV_MIN_0 -- an image laid out
+  # for pre-rev3 engineering samples. On this board (esptool reports "ESP32-P4
+  # (revision v3.2)") that bootloops before the second-stage bootloader can
+  # print anything, resetting on the LP watchdog every ~3.3 s.
+  board: esp32-p4_r3
+  # The chip carries 32MB, but ESPHome only builds OTA partitions for that
+  # with 'enable_idf_experimental_features'. 16MB is declared instead: the
+  # partitions then fit well inside the real flash (declaring MORE than the
+  # chip has is what bootloops it -- see the note on the Waveshare S3 board),
+  # and nothing here needs the upper half.
+  flash_size: 16MB
+  # 360, not the 400MHz default: ESPHome warns that 400 is experimental and
+  # may not boot (esphome/esphome#13425). Raise it once the board is proven.
+  cpu_frequency: 360MHz
+  framework:
+    type: esp-idf   # the only framework for the P4
+    sdkconfig_options:
+      # The options that actually decide the memory layout, belt and braces
+      # with `board:` above.
+      CONFIG_ESP32P4_SELECTS_REV_LESS_V3: "n"
+      CONFIG_ESP32P4_REV_MIN_300: "y"
+      # Console on UART0 -> the "USB to UART" socket, which is the one that
+      # enumerates (a WCH CH343; ioreg shows a single "USB Single Serial").
+      # ESPHome defaults the P4 console to USB_SERIAL_JTAG, i.e. the other
+      # socket, so logs go somewhere nothing is listening and a healthy board
+      # looks dead.
+      CONFIG_ESP_CONSOLE_UART_DEFAULT: "y"
+      CONFIG_ESP_CONSOLE_UART_NUM_0: "y"
+      CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG: "n"
+      # Waveshare's rev3_x profile pairs REV_MIN_300 with 250MHz PSRAM, and
+      # their examples add these cache settings for the DSI framebuffer.
+      # ESPHome's psram component caps the P4 at 200MHz, so force the speed.
+      # PSRAM stays at ESPHome's 200MHz maximum. Waveshare's rev3_x profile
+      # uses 250MHz, and forcing that here booted fine -- but the board reset
+      # instantly, with no panic text, the moment an HTTP body streamed into
+      # PSRAM while the DSI panel was scanning out of it. 200MHz is the
+      # conservative setting and costs nothing we can measure.
+      CONFIG_SPIRAM_XIP_FROM_PSRAM: "y"
+      CONFIG_CACHE_L2_CACHE_256KB: "y"
+      CONFIG_CACHE_L2_CACHE_LINE_128B: "y"
+
+logger:
+  # Matches the console above.
+  hardware_uart: UART0
+
+# ESPHome's mipi_dsi, with one line changed so the DSI PHY clock source is
+# left for ESP-IDF to pick per silicon revision. Upstream hardcodes the legacy
+# (pre-rev3) source, and the rev3 HAL abort()s on it inside display setup --
+# a silent panic, no message, black panel. See components/mipi_dsi/mipi_dsi.cpp:38.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [mipi_dsi]
+
+# The DSI panel's framebuffer is little-endian RGB565 (the BSP's
+# BSP_LCD_BIGENDIAN is 0), and mipi_dsi's draw_pixels_at() ignores the
+# big_endian flag and copies raw -- so the decoder has to produce the right
+# order itself. The other boards' panels want big-endian; this one does not,
+# and getting it wrong shows as an image with visibly wrong colours.
+sd_clip:
+  id: clip
+  byte_order: little_endian
+
+# HEX (16-bit) PSRAM, stacked in the P4 package. Not octal: see
+# psram/__init__.py, where P4 accepts only `hex`. Waveshare's own examples
+# clock it at 250 MHz; ESPHome allows up to 200 MHz, which is plenty here --
+# the panel is fed by the DMA-driven DSI controller, not the CPU.
+psram:
+  mode: hex
+  speed: 200MHz
+
+# The radio: an ESP32-C6-MINI running esp-hosted firmware, over 4-bit SDIO.
+#
+# These pins are the ESP-Hosted defaults for a P4 host (CLK 18, CMD 19,
+# D0-D3 14-17) and Waveshare's own examples ship no overrides, which is what
+# says this board follows them. CONFIRMED on hardware: the screen associates
+# and gets an address ("[C][wifi] IP Address: ..."), so both the SDIO pins and
+# the GPIO54 reset are right for this unit. ESP-Hosted logs one
+# "H_API: ESP-Hosted link not yet up" while the C6 boots; that is expected.
+#
+# The C6 must already be running matching esp-hosted coprocessor firmware.
+# Waveshare ships it flashed; after an ESP-IDF version jump it may need
+# reflashing (esp32_hosted.update, or Waveshare's own image).
+esp32_hosted:
+  type: sdio
+  variant: ESP32C6
+  reset_pin: GPIO54
+  active_high: true
+  clk_pin: GPIO18
+  cmd_pin: GPIO19
+  d0_pin: GPIO14
+  d1_pin: GPIO15
+  d2_pin: GPIO16
+  d3_pin: GPIO17
+  # Slower than the 40MHz default, and buffers in internal RAM rather than
+  # PSRAM. Both are about keeping the link to the C6 alive under load:
+  # esp_hosted sets CONFIG_ESP_HOSTED_TRANSPORT_RESTART_ON_FAILURE, so a
+  # transport failure reboots the whole board SILENTLY -- no panic, no
+  # message, which reads as a random reset the moment content starts
+  # downloading. PSRAM is also being scanned out continuously by the DSI
+  # panel, so SDIO DMA into it is the worst place for it to be.
+  sdio_frequency: 20MHz
+  use_psram: false
+
+# The MIPI D-PHY is powered from the P4's own LDO, channel 3 at 2.5V. Taken
+# from the BSP (BSP_MIPI_DSI_PHY_PWR_LDO_CHAN 3, ..._VOLTAGE_MV 2500); without
+# it the DSI controller initialises and the panel stays dark.
+esp_ldo:
+  - channel: 3
+    voltage: 2.5V
+
+# Touch and the audio codecs (ES8311, ES7210 -- unused here) share this bus.
+i2c:
+  sda: GPIO7
+  scl: GPIO8
+  scan: true
+  id: i2c_bus
+
+display:
+  - platform: mipi_dsi
+    model: CUSTOM
+    id: disp
+    dimensions:
+      width: 480
+      height: 800
+    # Panel parameters from Waveshare's own BSP (bsp/esp32_p4_wifi6_touch_lcd_4_3
+    # in waveshareteam/Waveshare-ESP32-components): 2 lanes at 500 Mbps, 30 MHz
+    # pixel clock, and these porches. ESPHome ships an ST7701 480x800 model
+    # (JC4880P443) whose timings are close but NOT identical -- vsync differs --
+    # so the numbers are spelled out here rather than borrowed.
+    lanes: 2
+    lane_bit_rate: 500Mbps
+    pclk_frequency: 30MHz
+    hsync_back_porch: 42
+    hsync_pulse_width: 12
+    hsync_front_porch: 42
+    vsync_back_porch: 2
+    vsync_pulse_width: 8
+    vsync_front_porch: 60
+    color_order: RGB
+    reset_pin: GPIO27
+    update_interval: never
+    auto_clear_enabled: false
+    # ST7701 init from the same BSP. The first three commands are the
+    # esp_lcd_st7701 preamble (command2 BK0 select, MADCTL, COLMOD 16-bit);
+    # the rest is Waveshare's vendor table.
+    init_sequence:
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x00]
+      - [0x36, 0x00]
+      - [0x3A, 0x55]
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x13]
+      - [0xEF, 0x08]
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x10]
+      - [0xC0, 0x63, 0x00]
+      - [0xC1, 0x0D, 0x02]
+      - [0xC2, 0x17, 0x08]
+      - [0xCC, 0x10]
+      - [0xB0, 0x40, 0xC9, 0x94, 0x0E, 0x10, 0x05, 0x0B, 0x09, 0x08, 0x26, 0x04, 0x52, 0x10, 0x69, 0x6B, 0x69]
+      - [0xB1, 0x40, 0xD2, 0x98, 0x0C, 0x92, 0x07, 0x09, 0x08, 0x07, 0x25, 0x02, 0x0E, 0x0C, 0x6E, 0x78, 0x55]
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x11]
+      - [0xB0, 0x5D]
+      - [0xB1, 0x4E]
+      - [0xB2, 0x87]
+      - [0xB3, 0x80]
+      - [0xB5, 0x4E]
+      - [0xB7, 0x85]
+      - [0xB8, 0x21]
+      - [0xB9, 0x10, 0x1F]
+      - [0xBB, 0x03]
+      - [0xBC, 0x00]
+      - [0xC1, 0x78]
+      - [0xC2, 0x78]
+      - [0xD0, 0x88]
+      - [0xE0, 0x00, 0x3A, 0x02]
+      - [0xE1, 0x04, 0xA0, 0x00, 0xA0, 0x05, 0xA0, 0x00, 0xA0, 0x00, 0x40, 0x40]
+      - [0xE2, 0x30, 0x00, 0x40, 0x40, 0x32, 0xA0, 0x00, 0xA0, 0x00, 0xA0, 0x00, 0xA0, 0x00]
+      - [0xE3, 0x00, 0x00, 0x33, 0x33]
+      - [0xE4, 0x44, 0x44]
+      - [0xE5, 0x09, 0x2E, 0xA0, 0xA0, 0x0B, 0x30, 0xA0, 0xA0, 0x05, 0x2A, 0xA0, 0xA0, 0x07, 0x2C, 0xA0, 0xA0]
+      - [0xE6, 0x00, 0x00, 0x33, 0x33]
+      - [0xE7, 0x44, 0x44]
+      - [0xE8, 0x08, 0x2D, 0xA0, 0xA0, 0x0A, 0x2F, 0xA0, 0xA0, 0x04, 0x29, 0xA0, 0xA0, 0x06, 0x2B, 0xA0, 0xA0]
+      - [0xEB, 0x00, 0x00, 0x4E, 0x4E, 0x00, 0x00, 0x00]
+      - [0xEC, 0x08, 0x01]
+      - [0xED, 0xB0, 0x2B, 0x98, 0xA4, 0x56, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xF7, 0x65, 0x4A, 0x89, 0xB2, 0x0B]
+      - [0xEF, 0x08, 0x08, 0x08, 0x45, 0x3F, 0x54]
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x00]
+    # Same contract as the other boards: a boot checklist until content lands,
+    # every line derived from live state. See the note in
+    # boards/waveshare-s3-touch-lcd-4.3.yaml.
+    lambda: |-
+      // Content drawn by sd_clip (from PSRAM or the card) is already on the
+      // panel and has no copy here to redraw from.
+      if (id(content_on_sd))
+        return;
+      if (id(content_loaded) && id(content_image)->is_loaded()) {
+        id(disp)->draw_pixels_at(0, 0, id(content_image)->get_width(),
+                                 id(content_image)->get_height(),
+                                 id(content_image)->get_data_start(),
+                                 display::COLOR_ORDER_RGB,
+                                 display::COLOR_BITNESS_565, true, 0, 0, 0);
+        return;
+      }
+      it.fill(Color(0, 0, 0));
+      int y = it.get_height() / 2 - 120;
+      it.printf(40, y, id(status_font), Color(0x80, 0x80, 0x80),
+                display::TextAlign::TOP_LEFT, "${device_name}");
+      y += 50;
+      const char *wifi_s    = id(wifi_ok) ? "ok" : "...";
+      const char *server_s  = !id(wifi_ok)       ? ""
+                            : id(server_pushed)  ? "ok"
+                            : id(server_ok)      ? "saved"
+                                                 : "...";
+      const char *content_s = !id(server_ok) ? "" : "...";
+      auto step = [&](const char *label, const char *state) {
+        Color colour = !state[0]                   ? Color(0x50, 0x50, 0x50)
+                     : state[0] == 'o'             ? Color(0x50, 0xC0, 0x70)
+                     : state[0] == 's'             ? Color(0xC0, 0xB0, 0x50)
+                                                   : Color(0xE8, 0xE8, 0xE8);
+        it.printf(40, y, id(status_font), colour, display::TextAlign::TOP_LEFT,
+                  "%s ... %s", label, state);
+        y += 42;
+      };
+      // "WiFi" here means the C6 over SDIO: if this line never turns green,
+      // suspect the esp32_hosted link before the access point.
+      step("Connecting to WiFi", wifi_s);
+      step("Searching for server", server_s);
+      step("Getting content", content_s);
+      if (!id(status_text).empty()) {
+        it.printf(40, y + 12, id(status_font), Color(0xE0, 0x70, 0x70),
+                  display::TextAlign::TOP_LEFT, "%s", id(status_text).c_str());
+      }
+
+touchscreen:
+  - platform: gt911
+    id: touch
+    display: disp
+    # No interrupt or reset pin: the BSP leaves both unconnected
+    # (BSP_LCD_TOUCH_RST / _INT are GPIO_NUM_NC) and polls the controller.
+    i2c_id: i2c_bus
+
+font:
+  - file: "gfonts://Roboto"
+    id: status_font
+    size: 28
+
+# Backlight on GPIO26, ACTIVE LOW: the BSP drives it through LEDC with
+# output_invert set, at 5 kHz / 10-bit. `inverted: true` on the pin is the
+# same thing, so 100% brightness drives the pin low.
+output:
+  - platform: ledc
+    id: backlight_pwm
+    pin:
+      number: GPIO26
+      inverted: true
+    frequency: 5000Hz
+
+light:
+  - platform: monochromatic
+    name: Backlight
+    id: backlight
+    output: backlight_pwm
+    restore_mode: ALWAYS_ON
+    default_transition_length: 500ms
+
+# NOT configured here: the microSD slot (GPIO39-44). It is wired for 4-bit
+# SDMMC, and components/sd_spi drives cards over SPI only -- the P4's card
+# pins are not on a SPI bus at all. So this board holds content in PSRAM
+# alone, which is why the cache substitutions above are large. Giving it the
+# card needs an SDMMC component; common/mjpeg-clip.yaml already works either
+# way and will pick a card up when one exists.
+#
+# Also unused: ES8311 speaker codec + ES7210 mic array (I2S on GPIO9-13),
+# the MIPI-CSI camera header, and the 40-pin GPIO header.
