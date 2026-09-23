@@ -1,0 +1,27 @@
+# Second screen: Seeed Round Display for XIAO on a XIAO ESP32S3.
+#
+# Note what is NOT here: no panel size, no pin, no server address, no fit
+# mode. The board package declares the panel and the framing it wants, and the
+# server learns both over mDNS. This file is only an identity.
+
+substitutions:
+  device_name: tabletop-02
+  friendly_name: Tabletop 02 (round)
+
+  # See tabletop-01.yaml for why this is long and why 0s would be wrong.
+  poll_interval: 30min
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+packages:
+  board: !include boards/seeed-xiao-round-display.yaml
+  base: !include common/base.yaml
+  content: !include common/content-pull.yaml
+  # microSD in the display's slot, on the LCD's SPI bus with its own CS.
+  sd: !include common/sd-card.yaml
+  # MJPEG clips: kept on the card, loaded into PSRAM, decoded straight to the
+  # panel -- about a minute of video in 4 MB. Replaces video-test.yaml and the
+  # 40-frame video-cache.yaml. Must come after `content`.
+  clip: !include common/mjpeg-clip.yaml

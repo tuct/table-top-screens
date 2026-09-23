@@ -35,6 +35,11 @@ sd_clip:
   id: clip
   width: ${display_width}
   height: ${display_height}
+  # This screen has no clip path -- stills only, blitted raw off the card --
+  # so sd_clip never decodes a JPEG here. JPEGDEC is already linked for
+  # online_image's fallback, so saying so shares it and saves the 74 KB that
+  # `auto` would spend on a second decoder nothing calls.
+  jpeg_decoder: software
 
 interval:
   - interval: 200ms
