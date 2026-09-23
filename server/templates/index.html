@@ -102,8 +102,10 @@
         <div class="nameline">
           {% if s.current %}
             <span class="nm" title="{{ s.current.filename }}">{{ s.current.title }}</span>
-            {% if s.current.anim %}<span class="anim">&#9654; {{ s.current.anim }}</span>{% endif %}
-            {% if s.current.still_here %}<span class="still">still</span>{% endif %}
+            {% if s.current.anim %}<span class="anim{{ ' muted' if s.current.still_here }}"
+               >&#9654; {{ s.current.anim }}</span>{% endif %}
+            {% if s.current.still_here %}<span class="still"
+               title="{{ s.name }} shows stills only; this is the first frame">1st frame only</span>{% endif %}
           {% else %}
             <span class="sub">Pick one below</span>
           {% endif %}

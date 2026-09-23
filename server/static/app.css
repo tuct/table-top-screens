@@ -260,10 +260,19 @@ ul#unused li { padding-left: 20px; }
   flex: none; padding: 1px 6px; border-radius: 4px;
   background: var(--chip); color: var(--chip-ink); font-size: 11px;
 }
+/* A screen that cannot play what it is holding says so where the promise of
+   motion is made: next to the name, and under the picture itself. */
 .still {
-  flex: none; font-size: 11px; color: #a60; border: 1px solid #a60;
-  border-radius: 4px; padding: 0 6px; white-space: nowrap;
+  flex: none; font-size: 11px; font-weight: 500; color: #8a4b08;
+  background: #fbefdd; border: 1px solid #e6c9a0;
+  border-radius: 4px; padding: 1px 6px; white-space: nowrap;
 }
+.anim.muted { background: var(--hair); color: var(--muted); }
+.warnline {
+  margin: 12px 0 0; padding: 8px 10px; border-radius: 8px;
+  background: #fbefdd; border: 1px solid #e6c9a0; color: #8a4b08;
+}
+.warnline b { color: #6d3c06; }
 .cached { color: var(--accent-ink); }
 .drop {
   display: flex; align-items: center; justify-content: center; gap: 10px;

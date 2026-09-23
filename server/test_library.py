@@ -924,6 +924,27 @@ def main() -> int:
     idx = c.get("/?all=1").get_data(as_text=True)
     check("and drops the badge for a still", "6 frames" not in idx)
 
+    print("\na screen that cannot animate says so where the promise is made")
+    stills_only = srv.discovery.Screen(name="anim", host="127.0.0.1", port=9,
+                                       anim=())
+    srv.registry._screens["anim._x"] = stills_only
+    try:
+        c.post(f"/d/anim/items/{g['id']}/select")
+        page = flat(c.get("/d/anim/").get_data(as_text=True))
+        check("the row says it plainly", ">1st frame only</span>" in page)
+        check("and the motion chip stops promising motion",
+              'class="anim muted"' in page)
+        check("said again under the picture itself",
+              "shows stills only" in page and "the rest of it is not played" in page)
+        shelf = flat(c.get("/?all=1").get_data(as_text=True))
+        check("the shelf says it too", ">1st frame only</span>" in shelf)
+        c.post(f"/d/anim/items/{st['id']}/select")
+        check("a still gets none of that",
+              "the rest of it is not played" not in flat(
+                  c.get("/d/anim/").get_data(as_text=True)))
+    finally:
+        srv.registry._screens.pop("anim._x", None)
+
     print("\nan animated upload is playable as video")
     c.post(f"/d/anim/items/{g['id']}/select")
     info = c.get("/d/anim/video").get_json()

@@ -58,6 +58,13 @@
         <div class="mono sub" title="file on the server">{{ meta.filename }}</div>
         <div class="mono sub">{{ meta.format }} · {{ meta.width }}×{{ meta.height }} · {{ meta.size }} · {{ meta.when }}</div>
       </div>
+      {% set cur = used | selectattr('current') | first | default(none) %}
+      {% if cur and cur.still_here %}
+        <p class="note warnline">
+          <b>{{ device }} shows stills only.</b> This is the first frame of
+          {{ cur.filename }} — the rest of it is not played.
+        </p>
+      {% endif %}
       <p class="note" id="pstatus">What is on the screen now.</p>
     {% else %}
       <p class="note">Nothing on this screen yet — upload something.</p>
@@ -180,7 +187,7 @@
                 <div class="nameline">
                   <span class="nm" title="{{ it.filename }}">{{ it.title }}</span>
                   {% if it.badge %}<span class="vname">{{ it.badge }}</span>{% endif %}
-                  {% if it.still_here %}<span class="still" title="This screen cannot play {{ it.source_format }}; it shows the first frame">still</span>{% endif %}
+                  {% if it.still_here %}<span class="still" title="{{ device }} cannot play {{ it.source_format }}; it shows the first frame">1st frame only</span>{% endif %}
                 </div>
                 {% if it.desc %}<div class="sub desc">{{ it.desc }}</div>{% endif %}
                 <div class="mono sub">
@@ -191,7 +198,8 @@
                   {{ it.facts }}{% if it.cached %} · <span class="cached" title="Held by the screen: {{ it.cached }}">cached</span>{% endif %}
                 </div>
               </div>
-              {% if it.anim %}<span class="anim">&#9654; {{ it.anim }}</span>{% endif %}
+              {% if it.anim %}<span class="anim{{ ' muted' if it.still_here }}"
+                 >&#9654; {{ it.anim }}</span>{% endif %}
               {% if it.current %}
                 <span class="live"><span class="dot"></span>on screen</span>
               {% else %}
