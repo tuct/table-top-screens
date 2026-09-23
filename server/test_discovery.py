@@ -208,7 +208,8 @@ def main() -> int:
         r = client.get("/")
         results.append(
             check("overview shows free of total",
-                  b"stills on card" in r.data and b"27.4 of 29.7 GB free" in r.data)
+                  b"card in, stills and clips" in r.data
+                  and b"27.4 of 29.7 GB free" in r.data)
         )
         StubScreen.sd = {"SD Mounted": False, "SD In Use": False,
                          "SD Total": None, "SD Free": None}
@@ -218,7 +219,12 @@ def main() -> int:
                   bool(state) and not state["mounted"] and state["total_mb"] is None,
                   str(state))
         )
-        results.append(check("overview says no card", b"none mounted" in client.get("/").data))
+        results.append(check("overview says the slot is empty",
+                             b"no card in the slot" in client.get("/").data))
+        r = client.get(f"/d/{DEVICE}/")
+        results.append(
+            check("the screen's own page says the card is there too",
+                  b"SD: " in r.data, ""))
         results.append(
             check("a screen without sd=1 is not polled",
                   srv.registry.refresh_sd(discovery.Screen(name="x", host="127.0.0.1")) is None)
@@ -299,7 +305,8 @@ def main() -> int:
                   str(received["frames"][-2:]))
         )
         r = client.get(f"/d/{DEVICE}/")
-        results.append(check("device page badges it as a still", b"still here" in r.data))
+        results.append(check("device page badges it as a still",
+                             b'class="still"' in r.data))
 
         # A caching screen decides from the URL alone whether it already holds
         # what it is switched to, so every switch must deliver the URL, and the

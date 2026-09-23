@@ -48,6 +48,7 @@ import hashlib
 import io
 import json
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -292,7 +293,7 @@ def variants_of(root: Path, src_id: str, shape: str | None = None) -> list[dict]
 
 
 def _new_variant(root: Path, src_id: str, shape: str, config: dict, name: str,
-                 auto: bool) -> dict:
+                 auto: bool, desc: str = "") -> dict:
     if pool_get(root, src_id) is None:
         raise LibraryError("no such item")
     entry = {
@@ -303,6 +304,9 @@ def _new_variant(root: Path, src_id: str, shape: str, config: dict, name: str,
         "src": src_id,
         "shape": _shape_ok(shape),
         "name": str(name or "")[:60],
+        # What this framing is for, in the owner's words -- "the face, for the
+        # hallway screen". Filenames out of a camera say nothing.
+        "desc": str(desc or "")[:200],
         "auto": bool(auto),
         "config": {k: v for k, v in (config or {}).items() if k in CONFIG_KEYS},
         "created_at": time.time(),
@@ -332,7 +336,7 @@ def variant_duplicate(root: Path, variant_id: str, name: str = "") -> dict:
         raise LibraryError("no such variant")
     copies = len(variants_of(root, src["src"], src["shape"]))
     return _new_variant(root, src["src"], src["shape"], dict(src["config"]),
-                        name or f"copy {copies}", False)
+                        name or f"copy {copies}", False, src.get("desc", ""))
 
 
 def variant_set_config(root: Path, variant_id: str, config: dict) -> dict:
@@ -358,12 +362,16 @@ def variant_set_config_exact(root: Path, variant_id: str, config: dict) -> dict:
     return entry
 
 
-def variant_set_name(root: Path, variant_id: str, name: str) -> dict:
+def variant_set_labels(root: Path, variant_id: str, name=None, desc=None) -> dict:
+    """Set a variant's name and/or description. None leaves one alone."""
     all_of_them = variants(root)
     entry = next((v for v in all_of_them if v["id"] == variant_id), None)
     if entry is None:
         raise LibraryError("no such variant")
-    entry["name"] = str(name or "")[:60]
+    if name is not None:
+        entry["name"] = str(name)[:60]
+    if desc is not None:
+        entry["desc"] = str(desc)[:200]
     _save_variants(root, all_of_them)
     return entry
 
@@ -390,6 +398,73 @@ def prune_variants(root: Path) -> int:
     return len(stale)
 
 
+def _seen_path(root: Path) -> Path:
+    return root / "_screens.json"
+
+
+def seen(root: Path) -> dict:
+    """Every screen we have ever met, by name.
+
+    Discovery is the only way a screen is found, and it lives in memory -- so
+    without this a screen that is asleep when the server starts has no card at
+    all, and one that was never given content disappears on every restart.
+    What is kept is what a card needs while the screen is quiet (its size and
+    shape) plus where to look for it (host and port).
+    """
+    got = _read_json(_seen_path(root), {})
+    return got if isinstance(got, dict) else {}
+
+
+def note_seen(root: Path, device: str, info: dict) -> dict:
+    """Remember a screen we can see right now."""
+    if not DEVICE_RE.match(device):
+        raise LibraryError("invalid device name")
+    known = seen(root)
+    entry = {**known.get(device, {}),
+             **{k: v for k, v in info.items() if v is not None}}
+    entry["at"] = time.time()
+    known[device] = entry
+    _write_json(_seen_path(root), known)
+    return entry
+
+
+def forget_seen(root: Path, device: str) -> None:
+    known = seen(root)
+    if known.pop(device, None) is not None:
+        _write_json(_seen_path(root), known)
+
+
+def device_remove(root: Path, device: str) -> bool:
+    """Forget a screen: its playlist, its defaults and its last report.
+
+    The pictures are NOT touched -- they live in the pool, which is shared,
+    and a screen being retired is no reason to lose them. Scenes lose the
+    entry for this screen and keep the rest, for the same reason: a scene is
+    a convenience, not a record that has to stay whole.
+    """
+    folder = device_dir(root, device)
+    remembered = device in seen(root)
+    if not folder.exists() and not remembered:
+        return False
+    if folder.exists():
+        shutil.rmtree(folder)
+    # Forgotten for good: without this the screen comes straight back as an
+    # offline card, which is not what "remove" means.
+    forget_seen(root, device)
+
+    stored = scenes(root)
+    trimmed = False
+    for scene in stored:
+        if device in (scene.get("entries") or {}):
+            del scene["entries"][device]
+            trimmed = True
+    if trimmed:
+        _write_json(_scenes_path(root), stored)
+
+    prune_unused_variants(root)
+    return True
+
+
 def devices(root: Path) -> list[str]:
     """Every screen we hold state for."""
     if not root.exists():
@@ -410,35 +485,220 @@ def scenes(root: Path) -> list[dict]:
     return got if isinstance(got, list) else []
 
 
-def scene_save(root: Path, name: str) -> dict:
-    """Capture the current item and render prefs of every known screen."""
+def _capture(root: Path, device: str) -> dict:
+    """What a screen is showing right now, as a scene entry."""
+    state = used(root, device)
+    entry = variant(root, state["current"]) if state["current"] else None
+    return {
+        "item": state["current"],
+        "prefs": prefs(root, device),
+        # The variant's framing as it is now: variants are edited in place, so
+        # without this a restored scene would put the right picture back
+        # wearing whatever framing it has since been given.
+        "config": dict(entry["config"]) if entry else {},
+    }
+
+
+def _scene_entries(root: Path, only: set[str] | None, live: set[str] | None,
+                   old: dict, keep_offline: bool) -> dict:
+    """The entries a save or update should end up with.
+
+    A screen is captured only while it is on the network -- there is no point
+    putting a screen into a scene you cannot drive. One that is already in the
+    scene and has since gone quiet keeps the entry it was saved with, rather
+    than being dropped for being asleep.
+
+    `keep_offline` is the difference between the two callers: saving keeps
+    every offline entry, because the form that saves cannot offer offline
+    screens at all; editing keeps only the offline entries still ticked, so
+    one can be taken out on purpose.
+    """
+    entries = {}
+    for device in devices(root):
+        chosen = only is None or device in only
+        if live is not None and device not in live:
+            if device in old and (keep_offline or chosen):
+                entries[device] = old[device]
+            continue
+        if not chosen:
+            continue
+        entries[device] = _capture(root, device)
+    return entries
+
+
+def _check_name(name: str) -> str:
     name = (name or "").strip()
     if not name:
         raise LibraryError("a scene needs a name")
     if len(name) > 60:
         raise LibraryError("name too long")
-    entries = {}
-    for d in devices(root):
-        state = used(root, d)
-        entry = variant(root, state["current"]) if state["current"] else None
-        entries[d] = {
-            "item": state["current"],
-            "prefs": prefs(root, d),
-            # The variant's framing as it is now: variants are edited in
-            # place, so without this a restored scene would put the right
-            # picture back wearing whatever framing it has since been given.
-            "config": dict(entry["config"]) if entry else {},
-        }
+    return name
+
+
+def scene_save(root: Path, name: str, only: set[str] | None = None,
+               live: set[str] | None = None) -> dict:
+    """Capture what the chosen screens are showing, under a name.
+
+    `only` is which screens to take (None: every one we hold state for), and
+    `live` which are on the network (None: treat them all as reachable, for
+    callers that are not the page).
+    """
+    name = _check_name(name)
+    # Replacing a scene of the same name is what you almost always mean.
+    previous = next((s for s in scenes(root) if s.get("name") == name), None)
+    old = (previous or {}).get("entries") or {}
     scene = {
         "id": hashlib.sha256(f"{name}{time.time()}".encode()).hexdigest()[:12],
         "name": name,
+        # A description outlives a re-save: it says what the scene is for,
+        # which does not change because the pictures did.
+        "desc": str((previous or {}).get("desc", "")),
         "saved_at": time.time(),
-        "entries": entries,
+        # Saving puts you in the scene you just saved: it is, by definition,
+        # what the screens are showing.
+        "applied_at": time.time(),
+        "entries": _scene_entries(root, only, live, old, keep_offline=True),
     }
-    # Replacing a scene of the same name is what you almost always mean.
     keep = [s for s in scenes(root) if s.get("name") != name]
     _write_json(_scenes_path(root), keep + [scene])
     return scene
+
+
+def scene_save_as(root: Path, source_id: str, name: str,
+                  only: set[str] | None = None,
+                  live: set[str] | None = None) -> dict:
+    """Save what is up now as a NEW scene, leaving the one it came from alone.
+
+    Never replaces by name -- that is the whole point of "save as" -- so a
+    name already taken becomes "... copy". The new scene is the one you are
+    then working in, because it is what is on the screens.
+    """
+    source = scene_get(root, source_id)
+    if source is None:
+        raise LibraryError("no such scene")
+    name = _check_name(name)
+    if any(s.get("name") == name for s in scenes(root)):
+        name = _free_name(root, name)
+    scene = {
+        "id": hashlib.sha256(f"{name}{time.time()}".encode()).hexdigest()[:12],
+        "name": name,
+        "desc": str(source.get("desc", "")),
+        "saved_at": time.time(),
+        "applied_at": time.time(),
+        "entries": _scene_entries(root, only, live,
+                                  source.get("entries") or {}, keep_offline=True),
+    }
+    _write_json(_scenes_path(root), scenes(root) + [scene])
+    return scene
+
+
+def scene_set_labels(root: Path, scene_id: str, name: str | None = None,
+                     desc: str | None = None) -> dict:
+    """Rename or describe a scene. Touches nothing it recorded."""
+    stored = scenes(root)
+    scene = next((s for s in stored if s.get("id") == scene_id), None)
+    if scene is None:
+        raise LibraryError("no such scene")
+    if name is not None:
+        new = _check_name(name)
+        if any(s.get("name") == new and s is not scene for s in stored):
+            raise LibraryError("another scene already has that name")
+        scene["name"] = new
+    if desc is not None:
+        scene["desc"] = str(desc).strip()[:200]
+    _write_json(_scenes_path(root), stored)
+    return scene
+
+
+def scene_update(root: Path, scene_id: str, only: set[str] | None = None,
+                 live: set[str] | None = None, name: str | None = None) -> dict:
+    """Edit a scene in place: same id, same place in the list.
+
+    Saving is one act, not two: the name, the membership AND what the live
+    screens show are all taken as they are now. Keeping the old pictures
+    while changing the name would be a second, quieter meaning of "save".
+    """
+    stored = scenes(root)
+    scene = next((s for s in stored if s.get("id") == scene_id), None)
+    if scene is None:
+        raise LibraryError("no such scene")
+    old = scene.get("entries") or {}
+    if name is not None:
+        scene["name"] = _check_name(name)
+    scene["saved_at"] = time.time()
+    scene["entries"] = _scene_entries(root, only, live, old, keep_offline=False)
+    _write_json(_scenes_path(root), stored)
+    return scene
+
+
+def scene_duplicate(root: Path, scene_id: str, name: str = "") -> dict:
+    """Copy a scene, entries and all, under a new name."""
+    stored = scenes(root)
+    scene = next((s for s in stored if s.get("id") == scene_id), None)
+    if scene is None:
+        raise LibraryError("no such scene")
+    name = (name or "").strip() or _free_name(root, str(scene.get("name", "scene")))
+    copy = {
+        "id": hashlib.sha256(f"{name}{time.time()}".encode()).hexdigest()[:12],
+        "name": _check_name(name),
+        "desc": str(scene.get("desc", "")),
+        "saved_at": time.time(),
+        "entries": json.loads(json.dumps(scene.get("entries") or {})),
+    }
+    keep = [s for s in stored if s.get("name") != copy["name"]]
+    _write_json(_scenes_path(root), keep + [copy])
+    return copy
+
+
+def _free_name(root: Path, base: str) -> str:
+    """"Evening" -> "Evening copy" -> "Evening copy 2"."""
+    taken = {s.get("name") for s in scenes(root)}
+    candidate = f"{base} copy"[:60]
+    n = 2
+    while candidate in taken:
+        candidate = f"{base} copy {n}"[:60]
+        n += 1
+    return candidate
+
+
+def _framing_key(config: dict) -> dict:
+    """The part of a config worth comparing, as plain strings.
+
+    Only the keys that change what is rendered, and only those actually set --
+    so an absent zoom and a zoom of None are the same thing, and a value that
+    came back from a form as "150" matches one stored as 150. Values that do
+    nothing are dropped as well: zoom 100 and no zoom at all render the same
+    picture, so calling them different would star a scene nobody changed.
+    """
+    idle = {"zoom": "100", "rot": "0"}
+    got = {k: str(config[k]) for k in CONFIG_KEYS if config.get(k) is not None}
+    return {k: v for k, v in got.items() if idle.get(k) != v}
+
+
+def scene_on_screen(root: Path, scene_id: str) -> bool:
+    """True when every screen in the scene still shows what it recorded.
+
+    This is what "loaded" means here: not that the scene was the last one
+    applied, but that nothing has been changed since -- and framing counts as
+    much as the picture does, because a scene restores both. An empty scene is
+    never on screen: there is nothing for it to be true of.
+    """
+    scene = scene_get(root, scene_id)
+    entries = (scene or {}).get("entries") or {}
+    if not entries:
+        return False
+    known = set(devices(root))
+    for device, entry in entries.items():
+        if device not in known:
+            return False
+        if used(root, device)["current"] != entry.get("item"):
+            return False
+        # What applying the scene would put in effect, against what is in
+        # effect now: prefs seed the variant, the variant's own config wins.
+        want = {**(entry.get("prefs") or {}), **(entry.get("config") or {})}
+        if _framing_key(want) != _framing_key(config_for(root, device)):
+            return False
+    return True
 
 
 def scene_get(root: Path, scene_id: str) -> dict | None:
@@ -471,7 +731,27 @@ def scene_apply(root: Path, scene_id: str) -> list[str]:
             changed.append(device)
         elif isinstance(entry.get("prefs"), dict):
             changed.append(device)
+    # Noted so the page can say when a scene was last put up, even after the
+    # screens have moved on from it.
+    stored = scenes(root)
+    for s in stored:
+        if s.get("id") == scene_id:
+            s["applied_at"] = time.time()
+    _write_json(_scenes_path(root), stored)
     return changed
+
+
+def scene_release(root: Path) -> None:
+    """Stop working in a scene, without deleting anything.
+
+    Only the "which scene am I in" mark is dropped -- every scene keeps its
+    screens and its pictures. The shelf then shows every screen again, and
+    nothing is starred, because no scene claims to be up.
+    """
+    stored = scenes(root)
+    for scene in stored:
+        scene.pop("applied_at", None)
+    _write_json(_scenes_path(root), stored)
 
 
 def scene_remove(root: Path, scene_id: str) -> None:
@@ -640,6 +920,7 @@ def item_view(source: dict, entry: dict) -> dict:
         "id": entry["id"],
         "src_id": source["id"],
         "variant": entry["name"],
+        "desc": entry.get("desc", ""),
         "shape": entry["shape"],
         "config": entry["config"],
         "auto": entry.get("auto", False),

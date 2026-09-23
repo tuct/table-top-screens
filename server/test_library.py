@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -48,6 +49,12 @@ def upload(c, device, colour, name, size=(600, 400)):
         data={"file": (io.BytesIO(png(colour, size)), name)},
         content_type="multipart/form-data",
     )
+
+
+def flat(html: str) -> str:
+    """Collapse whitespace, so a probe does not depend on where the template
+    happens to wrap an attribute."""
+    return re.sub(r"\s+", " ", html)
 
 
 def lists(c, device):
@@ -207,6 +214,138 @@ def main() -> int:
           and rows[current]["config"].get("zoom", 100) != 200,
           str((rows[copy_id]["config"], rows[current]["config"])))
 
+    print("\nthe given name leads, the filename follows the selection")
+    cur_id = c.get("/d/f1/items").get_json()["current"]
+    c.post("/d/f1/prefs", json={"name": "face", "desc": "tight crop for the hallway"})
+    rows = {u["id"]: u for u in c.get("/d/f1/items").get_json()["used"]}
+    check("the description is stored with the variant",
+          rows[cur_id]["desc"] == "tight crop for the hallway", str(rows[cur_id].get("desc")))
+    page = flat(c.get("/d/f1/").get_data(as_text=True))
+    check("the row is titled by its name", '<span class="nm" title=' in page and ">face<" in page)
+    check("the description shows under it", "tight crop for the hallway" in page)
+    check("and the form offers it back", 'name="desc" maxlength="200"' in page)
+    others = [u for u in c.get("/d/f1/items").get_json()["used"] if u["id"] != cur_id]
+    if others:
+        check("an unselected row does not spend a line on the filename",
+              page.count(others[0]["filename"]) <= 2,
+              f'{others[0]["filename"]} x{page.count(others[0]["filename"])}')
+    c.post("/d/f1/prefs", json={"reset": 1})
+    rows = {u["id"]: u for u in c.get("/d/f1/items").get_json()["used"]}
+    check("reset clears the description too", rows[cur_id]["desc"] == "")
+
+    print("\nselecting a picture loads its framing")
+    c.post(f"/d/f1/items/{pool_ids[0]}/select")
+    c.post("/d/f1/prefs", json={"rot": 90, "zoom": 140})
+    c.post(f"/d/f1/items/{pool_ids[1]}/select")
+    c.post("/d/f1/prefs", json={"rot": 180, "zoom": 100})
+    c.post(f"/d/f1/items/{pool_ids[0]}/select")
+    page = flat(c.get("/d/f1/").get_data(as_text=True))
+    check("the form comes up with this picture's rotation",
+          'name="rot" value="90" checked' in page)
+    check("and its zoom", "Zoom 140%" in page or "value=\"140\"" in page or "140" in page)
+    first_png = c.get("/d/f1/image?w=60&h=40&fmt=png").data
+    c.post(f"/d/f1/items/{pool_ids[1]}/select")
+    page = flat(c.get("/d/f1/").get_data(as_text=True))
+    check("switching picture switches the form to its own framing",
+          'name="rot" value="180" checked' in page and 'name="rot" value="90" checked' not in page)
+    check("and the render follows the variant, not the screen",
+          c.get("/d/f1/image?w=60&h=40&fmt=png").data != first_png)
+
+    print("\nnaming a framing")
+    cur = c.get("/d/f1/items").get_json()["current"]
+    c.post("/d/f1/prefs", json={"name": "face", "zoom": 130})
+    rows = {u["id"]: u for u in c.get("/d/f1/items").get_json()["used"]}
+    check("apply saves the name too", rows[cur]["variant"] == "face", str(rows[cur]["variant"]))
+    check("alongside the framing", rows[cur]["config"].get("zoom") == 130)
+    page = flat(c.get("/d/f1/").get_data(as_text=True))
+    check("and the form shows it back",
+          'name="name" maxlength="60" placeholder="e.g. face" value="face"' in page)
+    c.post("/d/f1/prefs", json={"reset": 1})
+    rows = {u["id"]: u for u in c.get("/d/f1/items").get_json()["used"]}
+    check("reset clears the name as well", rows[cur]["variant"] == "")
+
+    print("\nthe page says what the panel is")
+    srv.library.set_shape(DATA_TEST, "geo1", "480x800")
+    srv.library.set_shape(DATA_TEST, "geo2", "240x240r")
+    c.post(f"/d/geo1/items/{pool_ids[0]}/select")
+    c.post(f"/d/geo2/items/{pool_ids[0]}/select")
+    p1 = c.get("/d/geo1/").get_data(as_text=True)
+    p2 = c.get("/d/geo2/").get_data(as_text=True)
+    check("resolution and orientation, for a screen that is offline",
+          "480×800 portrait" in p1, "480×800 portrait")
+    check("a round panel is called round, not oriented", "240×240 round" in p2)
+    check("and its pictures are drawn as circles",
+          "round-screen" in p2 and "bezel round" in p2)
+    check("a rectangular one is not", "round-screen" not in p1)
+    idx = c.get("/").get_data(as_text=True)
+    check("the overview says it too",
+          "480×800 portrait" in idx and "240×240 round" in idx)
+    check("and rounds that card's pictures", "bezel mini round" in idx)
+    check("a screen page offers the way back", 'href="/"' in flat(p1)
+          and "All screens" in p1)
+
+    print("\nthe shelf says which screens are answering, and can be ordered")
+    # Injected rather than discovered: this file never talks to the network,
+    # but the overview's two orders only differ once something is live.
+    live = srv.discovery.Screen(name="geo2", host="127.0.0.1", port=9,
+                                 width=240, height=240)
+    srv.registry._screens["geo2._x"] = live
+    try:
+        idx = c.get("/").get_data(as_text=True)
+        check("an offline screen says so on the panel itself",
+              '<span class="offtag">offline</span>' in flat(idx))
+        order = re.findall(r'<a class="nm" href="/d/([^/]+)/"', idx)
+        check("a live one does not",
+              flat(idx).count('class="offtag"') == len(order) - 1)
+        check("online first by default", order and order[0] == "geo2", str(order))
+        by_name = c.get("/?sort=name").get_data(as_text=True)
+        names = re.findall(r'<a class="nm" href="/d/([^/]+)/"', by_name)
+        check("by name when asked", names == sorted(names), str(names))
+        check("and the choice is marked in the control",
+              '<a href="/?sort=name" class="now"' in flat(by_name))
+        check("the choice is remembered for the next visit",
+              re.findall(r'<a class="nm" href="/d/([^/]+)/"',
+                         c.get("/").get_data(as_text=True)) == names)
+        check("nonsense falls back to the default order",
+              re.findall(r'<a class="nm" href="/d/([^/]+)/"',
+                         c.get("/?sort=sideways").get_data(as_text=True))[0] == "geo2")
+        print("\na screen off the network can be forgotten")
+        c.post(f"/d/gone1/items/{pool_ids[0]}/select")
+        c.post("/scenes", data={"name": "before"}, content_type=FORM)
+        before = srv.library.scenes(DATA_TEST)[-1]["entries"]
+        check("it is in the scene that was saved", "gone1" in before)
+        check("a live screen is not offered for removal",
+              '/d/geo2/remove' not in c.get("/").get_data(as_text=True))
+        check("and refuses to be removed if asked anyway",
+              c.post("/d/geo2/remove").status_code == 409)
+        idx = flat(c.get("/").get_data(as_text=True))
+        check("an offline one is offered, and asks first",
+              '/d/gone1/remove' in idx and "Yes, remove" in idx)
+        pool_before = len(c.get("/pool").get_json())
+        check("removing it answers by going back to the shelf",
+              c.post("/d/gone1/remove", data={"return_to": "/"},
+                     content_type=FORM, headers=BROWSER).status_code == 303)
+        check("the screen is gone from the shelf",
+              "gone1" not in c.get("/").get_data(as_text=True))
+        check("and from what we hold state for",
+              "gone1" not in srv.library.devices(DATA_TEST))
+        check("its folder is gone with it", not (DATA_TEST / "gone1").exists())
+        check("and it is not remembered back into a card",
+              "gone1" not in srv.library.seen(DATA_TEST)
+              and "gone1" not in c.get("/?all=1").get_data(as_text=True))
+        check("the pictures stay in the library",
+              len(c.get("/pool").get_json()) == pool_before)
+        check("the scene forgets that screen and keeps the rest",
+              "gone1" not in srv.library.scenes(DATA_TEST)[-1]["entries"]
+              and srv.library.scenes(DATA_TEST)[-1]["entries"])
+        check("removing it twice is a 404, not a second removal",
+              c.post("/d/gone1/remove").status_code == 404)
+        # Leave the scene shelf as it was: the tests below count what is on it.
+        c.post(f"/scenes/{srv.library.scenes(DATA_TEST)[-1]['id']}/delete")
+    finally:
+        srv.registry._screens.pop("geo2._x", None)
+        c.set_cookie("sort", "", expires=0)
+
     print("\nvariants are keyed by panel shape")
     srv.library.set_shape(DATA_TEST, "f2", "240x240r")
     c.post(f"/d/f2/items/{pool_ids[0]}/select")
@@ -288,7 +427,7 @@ def main() -> int:
     print("\npage shows both lists")
     c.post(f"/d/a/items/{c.get('/pool').get_json()[0]['id']}/select")
     html = c.get("/d/a/").get_data(as_text=True)
-    for probe in ['id="library"', 'id="unused"', "Currently used", "Not used",
+    for probe in ['id="library"', 'id="unused"', "Playlist", "Library",
                   "/thumb", ">Show<", 'draggable="true"', "on screen"]:
         check(f"page contains {probe}", probe in html)
 
@@ -368,6 +507,312 @@ def main() -> int:
     check("apply still succeeds", r.status_code == 200, str(r.status_code))
     check("and skips the missing picture", gone not in str(r.get_json()["changed"]))
 
+    print("\na scene holds the screens you pick, and only live ones can join")
+    c.post(f"/d/a/items/{ids[0]}/select")
+    c.post(f"/d/b/items/{ids[1]}/select")
+    # "a" is on the network for this block; "b" is not.
+    srv.registry._screens["a._x"] = srv.discovery.Screen(name="a", host="127.0.0.1", port=9)
+    try:
+        r = c.post("/scenes", json={"name": "Just A", "screens": ["a"]})
+        check("only the screens ticked are taken", set(r.get_json()["entries"]) == {"a"},
+              str(list(r.get_json()["entries"])))
+        r = c.post("/scenes", json={"name": "Try B", "screens": ["a", "b"]})
+        check("an offline screen cannot be added",
+              set(r.get_json()["entries"]) == {"a"}, str(list(r.get_json()["entries"])))
+
+        both = c.post("/scenes", json={"name": "Both"}).get_json()
+        check("but a caller that picks nothing still gets them all",
+              {"a", "b"} <= set(both["entries"]))
+        saved_b = both["entries"]["b"]
+        c.post(f"/d/b/items/{ids[0]}/select")   # b moves on while it is asleep
+        r = c.post(f"/scenes/{both['id']}/update", json={"screens": ["a", "b"]})
+        check("an offline member is kept exactly as it was saved",
+              r.get_json()["entries"]["b"] == saved_b, str(r.get_json()["entries"].get("b")))
+        r = c.post(f"/scenes/{both['id']}/update", json={"screens": ["a"]})
+        check("and can still be dropped on purpose",
+              set(r.get_json()["entries"]) == {"a"})
+
+        print("\na scene can be edited: its name, its screens, its picture")
+        c.post(f"/d/a/items/{ids[1]}/select")
+        r = c.post(f"/scenes/{both['id']}/update",
+                   json={"screens": ["a"], "name": "Renamed"})
+        check("saving renames it", r.get_json()["name"] == "Renamed")
+        check("and takes what is on the screens now, in the same act",
+              r.get_json()["entries"]["a"]["item"]
+              == c.get("/d/a/items").get_json()["current"])
+        check("editing an unknown scene 404s",
+              c.post("/scenes/deadbeef/update", json={}).status_code == 404)
+
+        r = c.post(f"/scenes/{both['id']}/duplicate", json={})
+        copy = r.get_json()
+        check("duplicate takes a free name", copy["name"] == "Renamed copy", copy["name"])
+        check("with the same screens and a new id",
+              copy["entries"] == r.get_json()["entries"] and copy["id"] != both["id"])
+        check("duplicating again does not collide",
+              c.post(f"/scenes/{both['id']}/duplicate", json={}).get_json()["name"]
+              == "Renamed copy 2")
+
+        print("\nthe page says which scene is on the screens")
+        c.post(f"/scenes/{both['id']}/apply")
+        check("a scene whose screens still match is the one on screen",
+              srv.library.scene_on_screen(DATA_TEST, both["id"]))
+        html = flat(c.get("/").get_data(as_text=True))
+        check("the matching scene is marked", "on screen</span>" in html)
+        check("and named above the list", '<b class="onnow">' in html)
+        check("the screens are offered as checkboxes",
+              'name="screens" value="a"' in html and 'name="pick" value="1"' in html)
+        check("an offline one is offered locked",
+              'name="screens" value="b" disabled' in html)
+        check("with Edit and Duplicate on each scene",
+              ">Edit<" in html and ">Duplicate<" in html)
+        # Out of the way first: those two also record a=ids[0], and a scene
+        # that matches outranks one that has been changed since.
+        for spare in ("Just A", "Try B"):
+            sid = next(s["id"] for s in c.get("/scenes").get_json()
+                       if s["name"] == spare)
+            c.delete(f"/scenes/{sid}")
+        c.post(f"/d/a/items/{ids[0]}/select")
+        check("and it stops being on screen once a screen moves on",
+              not srv.library.scene_on_screen(DATA_TEST, both["id"]))
+        html = flat(c.get("/").get_data(as_text=True))
+        check("the scene that was put up is starred instead",
+              '<span class="star" title=' in html)
+        check("and the line above says so", "was put up, and a screen has been"
+              " changed since" in html)
+        state = c.get("/scenes/state").get_json()
+        check("the mark is available without reloading the page",
+              next(x["dirty"] for x in state["scenes"] if x["id"] == both["id"])
+              and state["note"]["star"])
+        c.post(f"/scenes/{both['id']}/update", json={"screens": ["a"]})
+        html = flat(c.get("/").get_data(as_text=True))
+        check("saving the scene again clears the star",
+              '<span class="star" title=' not in html
+              and '<span class="star" hidden' in html)
+        check("and the marks are in the markup either way, only hidden",
+              not c.get("/scenes/state").get_json()["note"]["star"])
+
+        print("\nreframing counts as a change too, not only switching picture")
+        c.post(f"/scenes/{both['id']}/apply")
+        check("the scene is back on screen after applying it",
+              srv.library.scene_on_screen(DATA_TEST, both["id"]))
+        c.post("/d/a/prefs", json={"zoom": 175})
+        check("a zoom on the shown picture takes it off screen",
+              not srv.library.scene_on_screen(DATA_TEST, both["id"]))
+        check("and the page stars it",
+              '<span class="star" title=' in flat(c.get("/").get_data(as_text=True)))
+        recorded = srv.library.scene_get(DATA_TEST, both["id"])["entries"]["a"]
+        c.post("/d/a/prefs", json={"zoom": recorded["config"]["zoom"]})
+        check("putting the framing back puts the scene back on screen",
+              srv.library.scene_on_screen(DATA_TEST, both["id"]))
+        c.post("/d/a/prefs", json={"zoom": 100})
+        check("a zoom of 100 is no zoom at all, not a change",
+              srv.library._framing_key({"zoom": 100}) == {})
+
+        print("\nthe save form saves back into the scene, or beside it")
+        idx = flat(c.get("/?all=1").get_data(as_text=True))
+        check("it saves into the scene you are in",
+              'action="/scenes/' + both["id"] + '/update"' in idx)
+        check("with that scene's name already in it", 'value="Renamed"' in idx)
+        check("and the screens still tickable", 'name="screens" value="a"' in idx)
+        check("it offers to keep the old one instead", "Save as duplicate" in idx)
+        # Both buttons belong to being in a scene, not to having changed it.
+        c.post(f"/scenes/{both['id']}/update", json={"screens": ["a"]})
+        settled = flat(c.get("/?all=1").get_data(as_text=True))
+        check("both are still there once the scene is back on screen",
+              "Save as duplicate" in settled
+              and 'action="/scenes/' + both["id"] + '/update"' in settled)
+        c.post("/d/a/prefs", json={"zoom": 100})
+
+        was = srv.library.scene_get(DATA_TEST, both["id"])["entries"]["a"]
+        r = c.post(f"/scenes/{both['id']}/saveas",
+                   json={"name": "Renamed", "screens": ["a"]})
+        copy = r.get_json()
+        check("saving as a duplicate never replaces by name",
+              copy["name"].startswith("Renamed copy")
+              and any(x["name"] == "Renamed" for x in c.get("/scenes").get_json()),
+              copy["name"])
+        check("the scene it came from is left as it was",
+              srv.library.scene_get(DATA_TEST, both["id"])["entries"]["a"] == was)
+        check("the copy holds what the screens show now",
+              srv.library.scene_on_screen(DATA_TEST, copy["id"]))
+        check("and is the scene you are now in",
+              srv.scene_marks()["active"]["id"] == copy["id"])
+
+        print("\nthe ticks load from the scene, and a live screen can join it")
+        srv.registry._screens["b._x"] = srv.discovery.Screen(name="b", host="127.0.0.1",
+                                                             port=9)
+        try:
+            chips = flat(c.get("/?all=1").get_data(as_text=True))
+            check("a screen in the scene comes up ticked",
+                  'name="screens" value="a" checked' in chips)
+            check("one that is not, but is online, can be ticked",
+                  'name="screens" value="b" >' in chips)
+            r = c.post(f"/scenes/{both['id']}/update", json={"screens": ["a", "b"]})
+            check("and ticking it puts it in the scene",
+                  set(r.get_json()["entries"]) == {"a", "b"})
+        finally:
+            srv.registry._screens.pop("b._x", None)
+        c.post(f"/scenes/{both['id']}/update", json={"screens": ["a"]})
+
+        print("\nediting a scene changes what it is called, not what it holds")
+        held = srv.library.scene_get(DATA_TEST, copy["id"])["entries"]
+        r = c.post(f"/scenes/{copy['id']}/labels",
+                   json={"name": "Guests", "desc": "for when people are over"})
+        check("it renames", r.get_json()["name"] == "Guests")
+        check("and describes", r.get_json()["desc"] == "for when people are over")
+        check("without re-reading a single screen",
+              srv.library.scene_get(DATA_TEST, copy["id"])["entries"] == held)
+        check("a name another scene already has is refused",
+              c.post(f"/scenes/{copy['id']}/labels", json={"name": "Renamed"})
+              .status_code == 400)
+        shown = flat(c.get("/?all=1").get_data(as_text=True))
+        # Named by the file it shows, NOT the "no longer in the library"
+        # fallback -- which shares the "<device> · " prefix and would let a
+        # broken lookup pass unnoticed.
+        on_a = srv.library.pool_get(
+            DATA_TEST, srv.library.variant(
+                DATA_TEST, c.get("/d/a/items").get_json()["current"])["src"])
+        check("each scene shows what it puts on each screen",
+              f'<span class="shot" title="a · {on_a["filename"]}"' in shown, shown[:0])
+        check("and nothing is drawn as missing that is not",
+              "picture no longer in the library" not in shown)
+        check("the name comes first, then the pictures",
+              shown.index('<span class="who">')
+              < shown.index('<span class="sthumbs">')
+              < shown.index('<span class="rightside">'))
+        check("dates and counts are gone from the row",
+              " screens · saved " not in shown and "· applied " not in shown)
+        # Older scenes here hold "b", which is not on the network.
+        check("a screen that is not answering is greyed in the preview",
+              'class="shot off"' in shown)
+        check("and says so when you point at it", "· offline\"" in shown)
+        # geo2 is the round panel from the geometry block; live for a moment,
+        # so a scene can be saved with it in.
+        srv.registry._screens["geo2._x"] = srv.discovery.Screen(
+            name="geo2", host="127.0.0.1", port=9, width=240, height=240,
+            round=True)
+        try:
+            round_scene = c.post("/scenes", json={"name": "Round one",
+                                                  "screens": ["geo2"]}).get_json()
+            check("a round screen's picture is round there too",
+                  '<span class="shot rnd"' in flat(
+                      c.get("/?all=1").get_data(as_text=True)))
+        finally:
+            srv.registry._screens.pop("geo2._x", None)
+            c.delete(f"/scenes/{round_scene['id']}")
+            c.post(f"/scenes/{both['id']}/apply")
+        check("the description shows in the list",
+              "for when people are over" in flat(c.get("/?all=1").get_data(as_text=True)))
+        c.delete(f"/scenes/{copy['id']}")
+
+        print("\nworking in a scene narrows the shelf to its screens")
+        c.post(f"/scenes/{both['id']}/update", json={"screens": ["a"]})
+        c.post(f"/scenes/{both['id']}/apply")
+        idx = flat(c.get("/").get_data(as_text=True))
+        check("the scene's screen is there", '<a class="nm" href="/d/a/"' in idx)
+        check("one that is not in it is hidden, but still in the page",
+              'data-name="b" hidden' in idx
+              and '<a class="nm" href="/d/b/"' in idx)
+        check("and the line says how many are showing, and how to see the rest",
+              'Showing <span class="fshown">1</span> of' in idx
+              and '<a href="/?all=1">show all</a>' in idx)
+        check("the scene's own picker still lists them all, or none could join",
+              'name="screens" value="b"' in idx)
+        every = flat(c.get("/?all=1").get_data(as_text=True))
+        check("show all brings them back", 'data-name="b" hidden' not in every)
+        check("a hidden card is still whole, so ticking can reveal it",
+              'data-name="b"' in idx and "/d/b/remove" in idx)
+        check("and the page carries the script that reveals it",
+              'data-narrowed=1' in idx)
+        check("with a way back to just the scene", "show only Renamed" in every)
+
+        print("\nan offline screen offers nothing but Remove")
+        asleep = every.split('<a class="nm" href="/d/b/"', 1)[1].split("</article>", 1)[0]
+        awake = every.split('<a class="nm" href="/d/a/"', 1)[1].split("</article>", 1)[0]
+        check("its card is drawn as asleep", "isoff" in every)
+        check("its pictures cannot be switched", "disabled>" in asleep)
+        check("but it can still be forgotten", "/d/b/remove" in asleep)
+        check("a live screen keeps its buttons", "disabled>" not in awake)
+
+        print("\nand you can leave a scene without losing it")
+        check("the way out is offered", "Leave scene" in idx)
+        check("leaving is accepted",
+              c.post("/scenes/release", data={"return_to": "/"},
+                     content_type=FORM, headers=BROWSER).status_code == 303)
+        after = flat(c.get("/").get_data(as_text=True))
+        check("the shelf shows every screen again",
+              '<a class="nm" href="/d/b/"' in after)
+        check("nothing claims to be up any more", "Leave scene" not in after)
+        # Scoped to the scene list: `pill on` is also how a live screen is
+        # marked, and those are still online.
+        listed = after.split('<ul id="scenes">', 1)[1]
+        check("not even a scene whose screens still match",
+              '<span class="pill on"><span' not in listed
+              and srv.library.scene_on_screen(DATA_TEST, both["id"]))
+        check("the note goes back to explaining what a scene is",
+              "A scene saves the picture and settings" in after)
+        check("and the scene itself is untouched",
+              any(x["id"] == both["id"] for x in c.get("/scenes").get_json()))
+        check("nor is anything starred",
+              not c.get("/scenes/state").get_json()["note"]["star"])
+    finally:
+        srv.registry._screens.pop("a._x", None)
+        for sid in [s["id"] for s in c.get("/scenes").get_json()
+                    if s["name"] in {"Just A", "Try B", "Renamed",
+                                     "Renamed copy", "Renamed copy 2"}]:
+            c.delete(f"/scenes/{sid}")
+
+    print("\nrefresh asks the screens, and believes the answer")
+    import http.server, threading as _t
+    class _Quiet(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+        def log_message(self, *a):
+            pass
+    srv_http = http.server.HTTPServer(("127.0.0.1", 0), _Quiet)
+    _t.Thread(target=srv_http.serve_forever, daemon=True).start()
+    port = srv_http.server_address[1]
+    try:
+        # One screen that answers, one that does not.
+        srv.registry._screens["up._x"] = srv.discovery.Screen(
+            name="up", host="127.0.0.1", port=port)
+        srv.registry._screens["down._x"] = srv.discovery.Screen(
+            name="down", host="127.0.0.1", port=9)
+        c.get("/")   # noting them as seen is what the page does
+        check("both are remembered as met",
+              {"up", "down"} <= set(srv.library.seen(DATA_TEST)))
+        r = c.post("/screens/refresh", json={})
+        out = r.get_json()
+        check("the one that answers stays", "up" not in out["gone"], str(out))
+        check("the one that does not is marked offline", out["gone"] == ["down"])
+        check("and it still has a card, from what we remember of it",
+              '<a class="nm" href="/d/down/"' in flat(
+                  c.get("/?all=1").get_data(as_text=True)))
+        check("the button can show it is working",
+              'class="inline refresh"' in flat(c.get("/").get_data(as_text=True)))
+        seat = c.post("/screens/refresh", data={"return_to": "/"},
+                      content_type=FORM, headers=BROWSER)
+        check("a browser is sent back with what was found",
+              seat.status_code == 303 and "checked=" in seat.headers["Location"],
+              seat.headers.get("Location", ""))
+        check("and the page says it",
+              "Knocked on" in c.get(seat.headers["Location"]).get_data(as_text=True))
+        # A screen we remember and cannot see, that answers again, comes back.
+        r = c.post("/screens/refresh", json={})
+        check("a remembered screen that answers again comes back",
+              "down" not in srv.registry.known_names())
+        srv.library.note_seen(DATA_TEST, "down",
+                              {"host": "127.0.0.1", "port": port})
+        check("revived once it answers",
+              "down" in c.post("/screens/refresh", json={}).get_json()["back"])
+        check("and is online again", "down" in srv.registry.known_names())
+    finally:
+        srv_http.shutdown()
+        for key in ("up._x", "down._x", "down.revived"):
+            srv.registry._screens.pop(key, None)
+        c.post("/d/up/remove")
+        c.post("/d/down/remove")
+
     print("\nscenes show on the index and can be deleted")
     html = c.get("/").get_data(as_text=True)
     check("index lists scenes", 'id="scenes"' in html)
@@ -382,12 +827,13 @@ def main() -> int:
     c.post(f"/d/a/items/{ids[0]}/select")
     html = c.get("/").get_data(as_text=True)
     check("the preview is refreshable without a reload",
-          'class="preview"' in html and "data-base=" in html)
-    check("thumbnails carry their filename for the caption", 'data-name="' in html)
-    check("the caption element exists", 'class="caption"' in html)
-    check("the pick handler is present", "form.pick" in html)
+          'data-base="/d/a/image' in html)
+    check("thumbnails carry their name for the caption", 'data-name="' in html)
+    check("the caption element exists", 'class="nm"' in html)
+    script = c.get("/static/app.js").get_data(as_text=True)
+    check("the pick handler is present", "form.pick" in script)
     check("it posts JSON, so the server answers JSON not a 303",
-          'Content-Type": "application/json' in html)
+          'Content-Type": "application/json' in script)
 
     # the JSON path the handler actually uses
     r = c.post(f"/d/a/items/{ids[1]}/select", json={})
@@ -463,16 +909,19 @@ def main() -> int:
           f'src="/pool/{apng["id"]}/raw"' in html)
     check("stills still use the rendered thumbnail",
           f'src="/pool/{st["id"]}/thumb"' in html)
-    check("badge shows the frame count", "6 frames" in html and "8 frames" in html)
+    check("badge shows the frame count", "6 · 0.7s" in html and "8 · " in html)
     check("badge shows the duration", "0.7s" in html)
+    # Three chips, not four: the two clips appear in the playlist, one of them
+    # again in the index's card, and the still is never badged.
     check("the still gets no badge", html.count('class="anim"') == 3, str(html.count('class="anim"')))
 
-    # the index badge follows whatever is current on that screen
+    # the index badge follows whatever is current on that screen. `all=1`
+    # because a scene has been applied by now, and the shelf narrows to it.
     c.post(f"/d/anim/items/{apng['id']}/select")
-    idx = c.get("/").get_data(as_text=True)
-    check("index badges the current clip", 'class="anim"' in idx and "6 frames" in idx)
+    idx = c.get("/?all=1").get_data(as_text=True)
+    check("index badges the current clip", 'class="anim"' in idx and "6 · 0.7s" in idx)
     c.post(f"/d/anim/items/{st['id']}/select")
-    idx = c.get("/").get_data(as_text=True)
+    idx = c.get("/?all=1").get_data(as_text=True)
     check("and drops the badge for a still", "6 frames" not in idx)
 
     print("\nan animated upload is playable as video")

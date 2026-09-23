@@ -1,0 +1,283 @@
+{% macro upload_form(cls, label, id='') %}
+  <form method="post" action="/d/{{ device }}/content" enctype="multipart/form-data" class="inline">
+    <label class="{{ cls }}"{% if id %} id="{{ id }}"{% endif %}>{{ label|safe }}
+      <input type="file" name="file" accept="image/*" hidden onchange="this.form.submit()">
+    </label>
+  </form>
+{% endmacro %}
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ device }} — mini screen</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+
+<nav class="crumbs" aria-label="Breadcrumb">
+  <a href="/">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M19 12H5M11 18l-6-6 6-6"/></svg>
+    All screens
+  </a>
+  <span class="sep" aria-hidden="true">/</span>
+  <span class="here" aria-current="page">{{ device }}</span>
+</nav>
+
+<header class="top">
+  <div class="ident">
+    <h1>{{ device }}</h1>
+    {% if online %}
+      <span class="pill on"><span class="dot"></span>online</span>
+    {% else %}
+      <span class="pill off"><span class="dot"></span>offline</span>
+    {% endif %}
+    <span class="mono sub">{{ caps_line }}</span>
+    {% if last_error %}<span class="sub err">{{ last_error }}</span>{% endif %}
+  </div>
+  {{ upload_form('btn dark', icon.up ~ ' Upload') }}
+</header>
+
+<div class="cols{{ ' round-screen' if round }}">
+
+  {# What is on the panel, drawn as the panel. #}
+  <section>
+    <div class="eyebrow">On screen</div>
+    {% if meta %}
+      <div class="bezel{{ ' round' if round }}" style="width:{{ preview.w + 20 }}px;height:{{ preview.h + 20 }}px">
+        <div class="glass" style="background:{{ preview.letterbox }}">
+          <img id="preview" alt=""
+               data-base="/d/{{ device }}/image?w={{ preview.w }}&h={{ preview.h }}&fmt=png"
+               src="/d/{{ device }}/image?w={{ preview.w }}&h={{ preview.h }}&fmt=png&t={{ preview.stamp }}">
+        </div>
+      </div>
+      <div class="who" style="margin-top:14px">
+        <span class="nm" title="{{ meta.filename }}">{{ settings.name if settings and settings.name else meta.filename }}</span>
+        {% if settings and settings.desc %}<div class="sub desc">{{ settings.desc }}</div>{% endif %}
+        <div class="mono sub" title="file on the server">{{ meta.filename }}</div>
+        <div class="mono sub">{{ meta.format }} · {{ meta.width }}×{{ meta.height }} · {{ meta.size }} · {{ meta.when }}</div>
+      </div>
+      <p class="note" id="pstatus">What is on the screen now.</p>
+    {% else %}
+      <p class="note">Nothing on this screen yet — upload something.</p>
+    {% endif %}
+  </section>
+
+  {# Framing, for the picture on the screen and nothing else. #}
+  <section class="card pad">
+    <header><h2>Settings</h2><span class="note">this picture only</span></header>
+    {% if settings %}
+      <form method="post" action="/d/{{ device }}/prefs" id="framing">
+        <div class="field">
+          <label for="nm">Name</label>
+          <input id="nm" type="text" name="name" maxlength="60" placeholder="e.g. face"
+                 value="{{ settings.name }}">
+          <input id="ds" class="desc-input" type="text" name="desc" maxlength="200"
+                 placeholder="description — what this framing is for"
+                 value="{{ settings.desc }}">
+        </div>
+
+        <div class="field">
+          <span class="lbl">Fit</span>
+          <div class="seg" role="group" aria-label="Fit"
+               style="grid-template-columns:repeat({{ settings.fits|length }},minmax(0,1fr))">
+            {% for value, label in settings.fits %}
+              <input type="radio" id="fit-{{ value }}" name="fit" value="{{ value }}"
+                     {{ 'checked' if value == settings.fit }}>
+              <label for="fit-{{ value }}">{{ label }}</label>
+            {% endfor %}
+          </div>
+        </div>
+
+        <div class="field">
+          <span class="lbl">Rotate</span>
+          <div class="seg" role="group" aria-label="Rotate"
+               style="grid-template-columns:repeat({{ settings.rots|length }},minmax(0,1fr))">
+            {% for value, label in settings.rots %}
+              <input type="radio" id="rot-{{ value }}" name="rot" value="{{ value }}"
+                     {{ 'checked' if value == settings.rot }}>
+              <label for="rot-{{ value }}">{{ label }}</label>
+            {% endfor %}
+          </div>
+        </div>
+
+        <div class="pair">
+          <div class="field">
+            <span class="lbl">Zoom</span>
+            {# The steppers submit this form, so a zoom step carries the rest
+               of the settings with it instead of racing them. #}
+            <div class="stepper">
+              <button type="submit" name="zoom_by" value="-10" aria-label="Zoom out"
+                      {{ 'disabled' if settings.zoom <= settings.zoom_min }}>&minus;</button>
+              <span class="mono">{{ settings.zoom }}%</span>
+              <button type="submit" name="zoom_by" value="10" aria-label="Zoom in"
+                      {{ 'disabled' if settings.zoom >= settings.zoom_max }}>+</button>
+            </div>
+          </div>
+          <div class="field narrow">
+            <label for="q">Quality</label>
+            <select name="q" id="q">
+              {% for value, label in settings.qualities %}
+                <option value="{{ value }}" {{ 'selected' if value|string == settings.q|string }}>{{ label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+
+        <div class="field">
+          <span class="lbl">Letterbox</span>
+          <div class="swatches" role="group" aria-label="Letterbox colour">
+            {% for value, label, colour, ident in settings.bgs %}
+              <input type="radio" id="{{ ident }}" name="bg" value="{{ value }}"
+                     {{ 'checked' if value == settings.bg }}>
+              {% if colour %}
+                <label class="swatch" for="{{ ident }}" title="{{ label }}"
+                       style="background:{{ colour }}"><span class="sr">{{ label }}</span></label>
+              {% else %}
+                <label class="pill" for="{{ ident }}">{{ label }}</label>
+              {% endif %}
+            {% endfor %}
+            {# Any colour the swatches do not carry; it wins over them. #}
+            <input class="hex mono" type="text" name="bg_hex" maxlength="24"
+                   placeholder="#hex" value="{{ settings.bg_custom }}">
+          </div>
+        </div>
+
+        <hr>
+        <div class="row-actions">
+          <button type="submit" class="primary">Apply</button>
+          <button type="submit" class="secondary" name="reset" value="1">Reset</button>
+        </div>
+      </form>
+      <div class="row-actions" style="margin-top:8px">
+        <form method="post" action="/d/{{ device }}/variants/{{ settings.variant }}/duplicate" class="inline">
+          <button type="submit" class="secondary"
+                  title="A second framing of this picture, starting from this one">Duplicate</button>
+        </form>
+      </div>
+      <p class="note">Framing belongs to the picture on this screen, so reframing
+      one leaves the others alone. The same values become this screen's
+      defaults and seed the next picture you put on it.</p>
+    {% else %}
+      <p class="note">Put a picture on the screen to frame it.</p>
+    {% endif %}
+  </section>
+
+  <section class="stack">
+    <div class="card">
+      <header>
+        <h2>Playlist <span class="count">{{ used|length }}</span></h2>
+        <span class="note">drag to reorder</span>
+      </header>
+      {% if used %}
+        <ol id="library" data-order-url="/d/{{ device }}/order">
+          {% for it in used %}
+            <li data-id="{{ it.id }}" draggable="true"{% if it.current %} class="live-row"{% endif %}>
+              {{ icon.grip }}
+              <img class="thumb" src="{{ it.thumb }}" alt="" loading="lazy">
+              <div class="who">
+                <div class="nameline">
+                  <span class="nm" title="{{ it.filename }}">{{ it.title }}</span>
+                  {% if it.badge %}<span class="vname">{{ it.badge }}</span>{% endif %}
+                  {% if it.still_here %}<span class="still" title="This screen cannot play {{ it.source_format }}; it shows the first frame">still</span>{% endif %}
+                </div>
+                {% if it.desc %}<div class="sub desc">{{ it.desc }}</div>{% endif %}
+                <div class="mono sub">
+                  {# No filename here, not even on the selected row: it would
+                     reflow the list every time you switch. The picture on the
+                     screen names its file in the preview beside this list,
+                     and every row carries it as a tooltip. #}
+                  {{ it.facts }}{% if it.cached %} · <span class="cached" title="Held by the screen: {{ it.cached }}">cached</span>{% endif %}
+                </div>
+              </div>
+              {% if it.anim %}<span class="anim">&#9654; {{ it.anim }}</span>{% endif %}
+              {% if it.current %}
+                <span class="live"><span class="dot"></span>on screen</span>
+              {% else %}
+                <form method="post" action="/d/{{ device }}/items/{{ it.id }}/select" class="inline">
+                  <button type="submit" class="quiet">Show</button>
+                </form>
+              {% endif %}
+              <form method="post" action="/d/{{ device }}/items/{{ it.id }}/remove" class="inline">
+                <button type="submit" class="icon" title="Take off this screen">{{ icon.minus }}</button>
+              </form>
+            </li>
+          {% endfor %}
+        </ol>
+        <p class="note" id="ordernote" style="padding:0 20px 14px">Drag to reorder — saved as you drop.</p>
+      {% else %}
+        <p class="note" style="padding:0 20px 16px">Nothing on this screen yet — add one from the library.</p>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <header>
+        <h2>Library <span class="count">{{ unused|length }}</span></h2>
+        <span class="note">shared by every screen</span>
+      </header>
+      {% if unused %}
+        <ul id="unused">
+          {% for it in unused %}
+            <li data-id="{{ it.id }}">
+              <img class="thumb wide" src="{{ it.thumb }}" alt="" loading="lazy">
+              <div class="who">
+                <div class="nameline"><span class="nm" title="{{ it.filename }}">{{ it.title }}</span></div>
+                {% if it.desc %}<div class="sub desc">{{ it.desc }}</div>{% endif %}
+                <div class="mono sub">
+                  {{ it.facts }}{% if it.cached %} · <span class="cached" title="Held by the screen: {{ it.cached }}">cached</span>{% endif %}
+                </div>
+              </div>
+              {% if it.anim %}<span class="anim">&#9654; {{ it.anim }}</span>{% endif %}
+              <div class="acts">
+                <form method="post" action="/d/{{ device }}/items/{{ it.id }}/add" class="inline">
+                  <button type="submit" class="icon" title="Add to the playlist">{{ icon.plus }}</button>
+                </form>
+                <form method="post" action="/d/{{ device }}/items/{{ it.id }}/select" class="inline">
+                  <button type="submit" class="quiet">Show</button>
+                </form>
+                <form method="post" action="/pool/{{ it.id }}/delete" class="inline">
+                  <button type="submit" class="icon danger"
+                          title="Delete from the library, for every screen">{{ icon.trash }}</button>
+                </form>
+              </div>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="note" style="padding:0 20px">Everything in the library is already on this screen.</p>
+      {% endif %}
+      {{ upload_form('drop', icon.up ~ '<span>Drop an image or <b>browse</b> — shows immediately</span>'|safe, 'drop') }}
+    </div>
+
+    {% if cache or sd %}
+      <section class="card pad">
+        <h2>On the screen now</h2>
+        {% if cache %}
+        <p class="sub" style="margin:.5rem 0 0">
+          Memory {{ cache.used }} of {{ cache.budget }}
+          <meter min="0" max="100" value="{{ cache.pct }}" title="{{ cache.pct }}% used"></meter>
+          {% if cache.psram_total %} · PSRAM {{ cache.psram_free }} free of {{ cache.psram_total }}{% endif %}
+          {% if cache.heap_free %} · heap {{ cache.heap_free }} free{% endif %}
+          · reported {{ cache.ago }}
+        </p>
+        {% endif %}
+        {% if sd %}<p class="mono sub sdline">{{ sd }}</p>{% endif %}
+        {% if cache.entries %}
+          <ul class="cache">
+            {% for row in cache.entries %}
+              <li>{% if row.shown %}<b>{{ row.name }}</b> — on screen{% else %}{{ row.name }}{% endif %}
+                <span class="sub">{{ row.where }}{% if row.extra %} ({{ row.extra }}){% endif %}</span></li>
+            {% endfor %}
+          </ul>
+        {% elif cache %}
+          <p class="note">Nothing cached.</p>
+        {% endif %}
+      </section>
+    {% endif %}
+  </section>
+</div>
+
+<p class="note"><a href="/">All screens</a></p>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+

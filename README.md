@@ -29,7 +29,9 @@ esphome/
 server/
   app.py                                content server (Flask + Pillow)
   discovery.py                          mDNS browse + push to screens
-  library.py                            per-device image library
+  library.py                            pool, variants, scenes, screens seen
+  templates/index.html  device.html     the two pages (Jinja)
+  static/app.css  app.js                design tokens; live preview + drag
   test_library.py  test_content.py  test_discovery.py
   README.md                             API, formats, the discovery contract
 ```
@@ -69,8 +71,15 @@ file.
 | Screen | Packages | Advertises |
 |---|---|---|
 | tabletop-01 (Waveshare 4.3) | `sd-card` + `sd-still` | `anim=none sd=1 img=jpeg,rgb565` |
-| tabletop-02 (round XIAO) | `sd-card` + `mjpeg-clip` | `round=1 anim=gif,apng,webp sd=0 clip=mjpeg` |
+| tabletop-02 (round XIAO) | `sd-card` + `mjpeg-clip` | `round=1 anim=gif,apng,webp sd=1 clip=mjpeg` |
 | tabletop-03 (Waveshare P4) | `mjpeg-clip` | `anim=gif,apng,webp sd=0 clip=mjpeg` |
+
+**`sd` means "this screen has a card", not "it keeps stills on one."** It used
+to be set by `sd-still.yaml`, so tabletop-02 — which has a card and fills it
+with clips — advertised `sd=0`, and the server never asked it about the card:
+no size, no free space, nothing on the page. It is now set by `sd-card.yaml`,
+which is the package that knows. Whether stills are actually being kept there
+is a different question, and the `SD In Use` sensor already answered it.
 
 **The Waveshare 4.3 is stills only.** Its GIF path cached clips by
 JPEG-decoding every frame into a 768 KB buffer, which is exactly the memory
@@ -166,8 +175,27 @@ nothing for content the screen already holds.
 **Why decoding every frame is fine.** ESPHome's image decoder has JPEGDEC
 produce RGB8888, then pushes every pixel through a virtual `draw_pixel()` with
 float scaling. That per-pixel output, not the JPEG decode, is where the
-~1.8 s per frame goes. `sd_clip` asks JPEGDEC for RGB565 and blits whole
-blocks, as video-Player does.
+~1.8 s per frame goes. `sd_clip` asks for RGB565 and blits whole blocks, as
+video-Player does.
+
+**Which decoder, and what it costs** (`jpeg_decoder`, default `auto`):
+
+| | 240×240 frame | fps held | flash |
+|---|---|---|---|
+| `software` — JPEGDEC | 72 ms | 13.6 of 15 | 1,143,811 B |
+| `esp_new` — [esp_new_jpeg](https://developer.espressif.com/blog/2025/09/esp-new-jpeg-introduction/) | **58 ms** | **15.2** | +74 KB |
+| `hardware` — the P4's JPEG peripheral | 12–16 ms at 480×800 | 15 | — |
+
+Measured back to back on tabletop-02, same 151-frame clip. The 20% is not the
+point: at 15 fps the budget is 66.7 ms a frame, so JPEGDEC **missed** and the
+screen quietly ran at 13.6 fps, while esp_new_jpeg holds 15.2 with ~9 ms to
+spare. `auto` is therefore `hardware` on the P4 and `esp_new` everywhere else.
+
+esp_new_jpeg runs in **block mode**, handing back 8–16 rows at a time, each
+blitted straight to the panel. That keeps it to one band of memory — the same
+trade JPEGDEC makes. Whole-frame mode would have wanted 115 KB per frame on
+this board. It also emits RGB565 in the panel's own byte order, so nothing is
+swapped on the way out.
 
 **How long a clip can be.** Real 240×240-equivalent video averages about
 2.8 KB per frame at ffmpeg `-q:v 7`, or roughly double at q80. 4 MB is about
@@ -218,6 +246,57 @@ this path removes is PSRAM use **for content**: no decode buffer, no clip cache.
 `buffer_size_rx` is 8192. The ~16 s figure in `sd-clip.yaml` matches the old
 512-byte read size (~48 KB/s), so it may well predate that fix — check the
 `Still: N KB stored in M ms` log line.
+
+## The pages (`server/templates/`)
+
+Two pages, both plain Jinja and plain forms: **the shelf** (every screen) and
+**one screen** (its picture, its framing, its library). Everything works with
+JavaScript off; the script only removes round trips.
+
+### Screens
+
+- **The panel is described as hardware**: `480×800 portrait`, `800×480
+  landscape`, `240×240 round`. A round panel is called round rather than given
+  an orientation, because it has none worth the word. A **round screen's
+  pictures are drawn round everywhere** — a crop that looks right in a square
+  thumbnail is wrong on a circular panel.
+- **Offline screens read as asleep**: the card greys, its pictures lose their
+  colour, `offline` sits over the panel, and every action but **Remove** is
+  disabled. Hovering brings the colour back.
+- **Screens are remembered** in `data/_screens.json` as they are seen — address,
+  size, roundness. Before that, a screen asleep at startup had no card at all,
+  and one that had never been given content vanished on every restart.
+- **Remove** forgets a screen for good: playlist, defaults, last report, and
+  the memory of having seen it. Its **pictures stay** — the pool is shared.
+- **Refresh** knocks on every screen's door (2 s timeout, 8 at a time) and
+  believes the answer. mDNS only reports a screen leaving when it says
+  goodbye, which one that lost power never does, so its record can sit in the
+  cache for an hour. Screens that answer from a remembered address come back.
+- **Sorting** — online first, name, or last seen — kept in a cookie.
+- **The SD card, where there is one**: `SD: card in, clips only · 29.4 of
+  29.5 GB free`, on both pages.
+
+### Scenes
+
+A scene is what a set of screens is showing, saved under a name.
+
+- **You pick the screens.** Chips under the save form; an offline screen
+  cannot join — there is no sense saving a scene you cannot put up — but one
+  already in a scene **keeps the entry it was saved with** rather than being
+  dropped for being asleep. Ticking a screen reveals its card at once, before
+  the scene is saved, because you tick it in order to set what it shows.
+- **`on screen` and `*`.** A scene is marked on screen when the screens still
+  match what it recorded — picture *and* framing, since applying it restores
+  both. Change either and the mark becomes a `*`, the way an edited document
+  is starred. Both marks belong only to the scene you are in, so **Leave
+  scene** really leaves: nothing is deleted, nothing claims to be up.
+- **Save** writes back into the scene you are in; **Save as duplicate** leaves
+  it alone and writes a new one, never replacing by name. **Edit** changes only
+  the name and description.
+- **The shelf narrows** to the scene you are in, with the others hidden rather
+  than dropped, and a line saying how many and how to see them.
+- Each row shows **what it puts up**, one small picture per screen, greyed for
+  screens that are not answering.
 
 ## Phase 1 — S3 + still images (working on hardware)
 

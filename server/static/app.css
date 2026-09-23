@@ -1,0 +1,436 @@
+/* Tokens and components for the screen pages.
+ *
+ * These names mirror the design artboards (Claude Design canvas), so markup
+ * pasted from one lands looking right: paper background, white cards with a
+ * warm hairline, green accent, IBM Plex for text and numbers. Keep the token
+ * values in step with the canvas rather than tweaking colours inline. */
+:root {
+  --paper: #f3f2ee;
+  --ink: #1b1b19;
+  --muted: #5e5d58;
+  --line: #e2e0da;
+  --hair: #eceae4;
+  --card: #ffffff;
+  --accent: #0f6e5c;
+  --accent-bg: #e1efe9;
+  --accent-ink: #0b5a4a;
+  --seg: #f0efea;
+  --danger: #a3362b;
+  --chip: #efe9f7;
+  --chip-ink: #5b3e8a;
+}
+
+* { box-sizing: border-box; }
+/* Components below set `display`, which would otherwise outrank the browser's
+   own rule for [hidden] -- and hidden is how the page flips a mark live. */
+[hidden] { display: none !important; }
+
+body {
+  margin: 0 auto;
+  padding: 24px 32px 40px;
+  max-width: 1360px;
+  background: var(--paper);
+  color: var(--ink);
+  font: 14px/1.45 'IBM Plex Sans', system-ui, sans-serif;
+}
+h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
+h2 { margin: 0; font-size: 15px; font-weight: 600; }
+a { color: var(--accent); }
+a:hover { color: #0a4f42; }
+button { font: inherit; cursor: pointer; }
+.mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+.sub { color: var(--muted); font-size: 12px; }
+.note { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.count { font-weight: 400; color: var(--muted); }
+.eyebrow {
+  font-size: 12px; font-weight: 600; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--muted); margin-bottom: 10px;
+}
+
+/* header */
+header.top {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; margin-bottom: 20px; flex-wrap: wrap;
+}
+.ident { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.topright { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+/* the way back up, above the title so it is the first thing in reading order */
+.crumbs {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--muted); margin-bottom: 10px;
+}
+.crumbs a {
+  display: inline-flex; align-items: center; gap: 6px;
+  text-decoration: none; font-weight: 500;
+}
+.crumbs a:hover { text-decoration: underline; }
+.crumbs .sep { color: var(--line); }
+.crumbs .here { color: var(--ink); font-weight: 500; }
+/* sort: links that look like the segmented controls elsewhere */
+.sorts { display: flex; padding: 3px; gap: 3px; background: var(--seg); border-radius: 8px; }
+.sorts a {
+  padding: 5px 10px; border-radius: 6px; font-size: 13px;
+  color: #3d3c38; text-decoration: none;
+}
+.sorts a:hover { color: var(--ink); }
+.sorts a.now {
+  background: #fff; color: var(--ink); font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .12);
+}
+.pill {
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px;
+  border-radius: 999px; font-size: 12px; font-weight: 500;
+}
+.pill.on { background: var(--accent-bg); color: var(--accent-ink); }
+.pill.off { background: var(--hair); color: var(--muted); }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.pill.on .dot { background: var(--accent); }
+
+/* columns: picture, settings for it, what else there is */
+.cols {
+  display: grid; gap: 20px; align-items: start;
+  grid-template-columns: 300px 332px minmax(0, 1fr);
+}
+@media (max-width: 1180px) { .cols { grid-template-columns: 320px minmax(0, 1fr); } }
+@media (max-width: 820px) {
+  body { padding: 16px; }
+  .cols { grid-template-columns: minmax(0, 1fr); }
+}
+.stack { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+.card {
+  background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  overflow: hidden;
+}
+/* Padded cards hold nothing that needs clipping to the corner radius, and
+   they do hold the confirm/edit panels, which open past the card's edge. */
+.card.pad { padding: 20px; overflow: visible; }
+.card > header {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 12px; padding: 16px 20px 10px;
+}
+.card.pad > header { padding: 0 0 4px; }
+.card > header .note { margin: 0; }
+
+/* the panel, as a panel */
+.bezel {
+  padding: 10px; border-radius: 18px; background: var(--ink);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .08), 0 8px 24px rgba(0, 0, 0, .10);
+}
+.glass {
+  position: relative;
+  width: 100%; height: 100%; border-radius: 9px; overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+}
+.offtag {
+  position: absolute; padding: 3px 10px; border-radius: 999px;
+  background: rgba(27, 27, 25, .74); color: #fff;
+  font-size: 11px; font-weight: 500; letter-spacing: .04em;
+}
+.round .glass, .round .glass img { border-radius: 50%; }
+/* A round panel shows only the inscribed circle, so every picture belonging
+   to that screen is drawn as one -- thumbnails included, or a crop looks
+   right in the list and wrong on the wall. */
+.round-screen .thumb, .round-screen .pick button, .round-screen .pick img {
+  border-radius: 50%;
+}
+.round-screen .thumb.wide { border-radius: 50%; width: 40px; }
+.glass img { display: block; max-width: 100%; max-height: 100%; }
+.who { flex: 1; min-width: 0; }
+.nm {
+  display: block; font-size: 14px; font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.nameline { display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* The name takes the room; chips give it up rather than squeezing it out. */
+.nameline .nm { flex: 1 1 auto; min-width: 0; }
+.nameline .vname, .nameline .still, .nameline .anim { flex: none; max-width: 40%; overflow: hidden; }
+.desc { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.desc-input { font-size: 12px !important; height: 32px !important; color: var(--muted); }
+
+/* settings */
+.field { display: flex; flex-direction: column; gap: 8px; margin-bottom: 18px; }
+.field.narrow { width: 124px; flex: none; }
+.pair { display: flex; gap: 16px; }
+.pair .field { flex: 1; }
+.lbl, .field label { font-size: 12px; font-weight: 500; color: var(--muted); }
+input[type=text], select {
+  height: 38px; border: 1px solid var(--line); border-radius: 8px; padding: 0 10px;
+  background: #fff; font: inherit; font-size: 13px; color: var(--ink);
+}
+/* Radios, not buttons: the control works with JavaScript off, and the live
+   preview still hears a change event. */
+.seg { display: grid; padding: 3px; gap: 3px; background: var(--seg); border-radius: 8px; }
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg label {
+  height: 32px; display: flex; align-items: center; justify-content: center;
+  border-radius: 6px; font-size: 13px; color: #3d3c38; cursor: pointer;
+}
+.seg input:checked + label {
+  background: #fff; color: var(--ink); font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .12);
+}
+.seg input:focus-visible + label { outline: 2px solid var(--accent); outline-offset: 1px; }
+.stepper {
+  display: flex; align-items: center; height: 38px; background: #fff;
+  border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+}
+.stepper span { flex: 1; text-align: center; font-size: 13px; font-weight: 500; }
+.stepper button {
+  width: 38px; height: 38px; border: 0; background: transparent;
+  color: var(--ink); font-size: 18px;
+}
+.stepper button:disabled { color: #c9c7c0; cursor: default; }
+.swatches { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.swatches input { position: absolute; opacity: 0; pointer-events: none; }
+.swatch {
+  display: block; width: 30px; height: 30px; border-radius: 50%;
+  border: 1px solid var(--line); cursor: pointer;
+}
+.swatches .pill { height: 30px; border: 1px solid var(--line); background: #fff; color: #3d3c38; cursor: pointer; }
+.swatches input:checked + .swatch { box-shadow: 0 0 0 2px #fff, 0 0 0 4px var(--ink); }
+.swatches input:checked + .pill { border-color: var(--ink); color: var(--ink); font-weight: 600; }
+.hex { width: 86px; height: 30px !important; border-style: dashed !important; }
+hr { border: 0; border-top: 1px solid var(--hair); margin: 4px 0 16px; }
+.row-actions { display: flex; gap: 8px; }
+
+/* buttons */
+.primary {
+  flex: 1; height: 40px; border: 0; border-radius: 8px;
+  background: var(--accent); color: #fff; font-size: 14px; font-weight: 500;
+}
+.secondary {
+  height: 40px; padding: 0 14px; border: 1px solid var(--line); border-radius: 8px;
+  background: #fff; color: var(--ink); font-size: 14px;
+}
+.quiet {
+  height: 32px; padding: 0 12px; border: 1px solid var(--line); border-radius: 6px;
+  background: #fff; color: var(--ink); font-size: 13px;
+}
+.icon {
+  width: 32px; height: 32px; padding: 0; display: flex; align-items: center;
+  justify-content: center; border: 1px solid var(--line); border-radius: 6px;
+  background: #fff; color: var(--ink);
+}
+.icon.danger { border: 0; background: transparent; color: var(--danger); }
+.btn.dark {
+  display: inline-flex; align-items: center; gap: 8px; height: 40px; padding: 0 16px;
+  border-radius: 8px; background: var(--ink); color: #fff;
+  font-size: 14px; font-weight: 500; cursor: pointer;
+}
+.inline { display: inline; }
+form.refresh button { display: inline-flex; align-items: center; gap: 7px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinning svg { animation: spin .8s linear infinite; transform-origin: 50% 50%; }
+.spinning { color: var(--muted); cursor: progress; }
+/* Something still has to say "working"; a pulse does it without turning. */
+@media (prefers-reduced-motion: reduce) {
+  .spinning svg { animation: none; }
+  .spinning { opacity: .55; }
+}
+
+/* rows */
+ol#library, ul#unused { list-style: none; margin: 0; padding: 0; }
+ol#library li, ul#unused li {
+  display: flex; align-items: center; gap: 12px; background: #fff;
+  padding: 10px 16px 10px 10px; border-top: 1px solid var(--hair);
+}
+ol#library li { cursor: grab; }
+ol#library li.live-row { background: #f5faf8; }
+ol#library li.dragging { opacity: .4; }
+ul#unused li { padding-left: 20px; }
+.thumb {
+  width: 40px; height: 40px; flex: none; border-radius: 6px;
+  border: 1px solid var(--hair); object-fit: contain; background: #fff;
+}
+.thumb.wide { width: 56px; height: 40px; object-fit: cover; }
+.grip { flex: none; }
+.acts { display: flex; gap: 4px; flex: none; }
+.live {
+  display: inline-flex; align-items: center; gap: 6px; flex: none;
+  font-size: 12px; font-weight: 500; color: var(--accent-ink);
+}
+.live .dot { background: var(--accent); }
+.anim {
+  flex: none; display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px;
+  border-radius: 999px; background: var(--accent-bg); color: var(--accent-ink);
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+}
+.vname {
+  flex: none; padding: 1px 6px; border-radius: 4px;
+  background: var(--chip); color: var(--chip-ink); font-size: 11px;
+}
+.still {
+  flex: none; font-size: 11px; color: #a60; border: 1px solid #a60;
+  border-radius: 4px; padding: 0 6px; white-space: nowrap;
+}
+.cached { color: var(--accent-ink); }
+.drop {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  margin: 12px 16px 16px; height: 52px; border: 1.5px dashed #c9c7c0;
+  border-radius: 10px; color: var(--muted); font-size: 13px; cursor: pointer;
+}
+.drop.over { border-color: var(--accent); color: var(--accent-ink); background: #f5faf8; }
+
+/* what the screen says it is holding */
+ul.cache { margin: .5rem 0 0; padding-left: 1.1rem; font-size: 12px; color: var(--muted); }
+ul.cache b { color: var(--ink); }
+meter { width: 5rem; height: .7rem; vertical-align: middle; }
+.sdon { color: var(--accent-ink); }
+.sdwarn { color: #a60; }
+.err { color: var(--danger); }
+
+/* ---- overview ---------------------------------------------------------- */
+/* Every card the same height, whatever it has to say: a shelf of screens
+   should read as a shelf, and the "Open screen" links should line up. The
+   slack falls before that link, which already takes it with margin-top:auto. */
+.grid {
+  display: grid; gap: 20px; align-items: stretch; grid-auto-rows: 1fr;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+}
+.card.screen { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.cardhead { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.cardhead .nm { font-size: 16px; font-weight: 600; color: var(--ink); text-decoration: none; }
+.cardhead .nm:hover { color: var(--accent); }
+/* The panel sits in a tray, so portrait and landscape screens line up. */
+.stage {
+  height: 196px; border-radius: 8px; background: var(--seg);
+  display: flex; align-items: center; justify-content: center;
+}
+.bezel.mini { padding: 5px; border-radius: 10px; box-shadow: none; }
+.bezel.mini .glass { border-radius: 5px; }
+/* A screen that is not answering reads as asleep: the whole card goes quiet,
+   and its pictures lose their colour, because what they show is the last
+   thing we sent rather than anything the screen is doing now. */
+.card.screen.isoff { background: #faf9f7; border-color: var(--hair); }
+.card.screen.isoff .cardhead .nm { color: var(--muted); }
+.card.screen.isoff .stage { background: #f1f0ec; }
+.card.screen.isoff .bezel { background: #8d8b85; }
+.card.screen.isoff .glass img { filter: grayscale(1); opacity: .55; }
+.card.screen.isoff .strip img { filter: grayscale(1); opacity: .5; }
+.card.screen.isoff .nameline, .card.screen.isoff .stats { opacity: .7; }
+/* Open screen still works -- looking is not an action -- but the picture
+   cannot be switched, so it does not offer to. */
+.card.screen.isoff .go { color: var(--muted); }
+/* a button that reads as a link, for actions that only change the view */
+.linky {
+  border: 0; background: none; padding: 0; color: var(--accent);
+  font-size: 12px; text-decoration: underline;
+}
+.linky:hover { color: #0a4f42; }
+.filterline { margin: 0 0 14px; }
+.filterline b { color: var(--ink); }
+.card.screen.isoff:hover .glass img,
+.card.screen.isoff:focus-within .glass img { filter: none; opacity: 1; }
+.bezel.dim { opacity: .6; }
+.bezel.mini .glass img { width: 100%; height: 100%; object-fit: contain; }
+.strip { display: flex; gap: 5px; overflow-x: auto; padding: 2px; }
+.pick { line-height: 0; }
+.pick button {
+  width: 44px; height: 34px; padding: 0; border: 0; border-radius: 6px;
+  overflow: hidden; background: #fff; box-shadow: 0 0 0 1px var(--line);
+}
+.pick.now button { box-shadow: 0 0 0 2px var(--accent); }
+.pick.busy button { opacity: .4; }
+.pick button[disabled] { cursor: not-allowed; }
+.pick img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.stats { display: flex; flex-direction: column; gap: 5px; padding-top: 10px; border-top: 1px solid var(--hair); }
+.statline { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+.bar { height: 4px; border-radius: 2px; background: var(--hair); overflow: hidden; }
+.bar .fill { height: 100%; background: var(--accent); }
+.bar .fill.hot { background: #b45309; }
+.cardfoot {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; margin-top: auto;
+}
+.go {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 13px; font-weight: 500; text-decoration: none;
+}
+/* Asking before removing, without a dialog: the question opens over the card
+   rather than inside it, so the row of cards does not jump a height. */
+.confirm { position: relative; }
+.confirm > summary {
+  list-style: none; cursor: pointer; font-size: 12px; color: var(--muted);
+  padding: 3px 8px; border-radius: 6px;
+}
+.confirm > summary::-webkit-details-marker { display: none; }
+.confirm > summary:hover { color: var(--danger); background: var(--hair); }
+.confirm[open] > summary { color: var(--danger); background: var(--hair); }
+.ask {
+  position: absolute; right: 0; bottom: 28px; z-index: 5; width: 232px;
+  padding: 12px; background: #fff; border: 1px solid var(--line);
+  border-radius: 10px; box-shadow: 0 8px 24px rgba(0, 0, 0, .14);
+  /* Long lists of screens scroll inside the panel rather than running off
+     the top of the window. */
+  max-height: min(60vh, 440px); overflow: auto;
+}
+.ask p { margin: 0 0 10px; font-size: 12px; color: var(--muted); }
+.ask b { color: var(--ink); }
+.warn { color: var(--danger); border-color: #e7c9c4; }
+.warn:hover { background: #fdf4f2; }
+.scenes { margin-top: 24px; }
+.scenehead {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 24px; flex-wrap: wrap;
+}
+.onnow { color: var(--accent-ink); }
+/* the edited-document mark: this scene is up, but no longer what you see */
+.star { color: #b45309; font-weight: 700; margin-left: 1px; cursor: help; }
+.sceneform { display: flex; flex-direction: column; gap: 10px; flex: none; }
+.scenerow { display: flex; gap: 8px; }
+.sceneform input[type=text] { width: 220px; height: 40px; }
+/* which screens belong: one chip each, ticked */
+.picks { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+  border: 1px solid var(--line); border-radius: 999px; background: #fff;
+  font-size: 12px; cursor: pointer;
+}
+.chip input { margin: 0; accent-color: var(--accent); }
+.chip:has(input:checked) { border-color: var(--accent); background: var(--accent-bg); }
+.chip.off { color: var(--muted); }
+/* A screen that is not answering cannot join a scene; one already in it can
+   still be taken out, so only the first case is locked. */
+.chip.locked { background: var(--hair); cursor: not-allowed; opacity: .75; }
+ul#scenes { list-style: none; margin: 14px 0 0; padding: 0; }
+ul#scenes li {
+  display: flex; align-items: center; gap: 10px; padding: 8px 0;
+  border-top: 1px solid var(--hair);
+}
+ul#scenes li b { flex: none; }
+/* Name, then what it is for, then what it looks like -- all together on the
+   left, so a row reads as one thing. The name gives way before the pictures
+   do, since a long description must not push them out of sight. */
+ul#scenes li .who {
+  flex: 0 1 auto; min-width: 0; max-width: 40%;
+  display: flex; flex-direction: column; gap: 1px;
+}
+ul#scenes li .who b, ul#scenes li .who .desc {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* the mark and the actions, held at the right end of the row */
+.rightside { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+ul#scenes li .who .desc { font-size: 12px; }
+/* what the scene puts up: one picture per screen, at a glance */
+.sthumbs { display: flex; align-items: center; gap: 4px; flex: none; }
+/* Greyed like the card of the screen it belongs to, and for the same
+   reason: that picture is the last thing sent, not what is on the wall. */
+.shot.off img { filter: grayscale(1); opacity: .45; }
+.shot.off { box-shadow: 0 0 0 1px var(--hair); }
+.shot {
+  display: block; width: 34px; height: 22px; border-radius: 4px;
+  overflow: hidden; background: var(--seg); box-shadow: 0 0 0 1px var(--line);
+}
+.shot img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.shot.rnd { width: 22px; border-radius: 50%; }
+.shot .gone {
+  display: flex; align-items: center; justify-content: center;
+  width: 100%; height: 100%; font-size: 11px; color: var(--muted);
+}
+.acts { display: flex; align-items: center; gap: 8px; }
+.ask.wide { width: 300px; display: flex; flex-direction: column; gap: 10px; }
+.ask.wide input[type=text] { width: 100%; height: 36px; }
+.askacts { display: flex; gap: 8px; }
+.askacts button { flex: 1; }
+footer.note { margin-top: 24px; }

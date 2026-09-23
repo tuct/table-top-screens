@@ -31,7 +31,9 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
-from flask import Flask, Response, abort, jsonify, request
+from flask import (Flask, Response, abort, jsonify, make_response,
+                   render_template, request)
+from markupsafe import Markup
 from PIL import Image, ImageColor, ImageOps, ImageStat
 
 import discovery
@@ -712,7 +714,9 @@ def get_image(device: str):
     # overrides. The device page uses it to preview a selection before it is
     # applied -- without it, stored prefs would mask whatever you picked.
     use_prefs = request.args.get("prefs", "1") not in ("0", "false", "no")
-    prefs = read_prefs(device) if use_prefs else {}
+    # The current variant's framing, over the screen's defaults -- the same
+    # thing /clip.mjpeg renders with, so the preview matches the panel.
+    prefs = lib(library.config_for, device) if use_prefs else {}
 
     def arg(name: str, default):
         """Preference wins over query string; see read_prefs()."""
@@ -1239,6 +1243,9 @@ def post_prefs(device: str):
 
     if (bg := form.get("bg")) is not None:
         prefs["bg"] = str(bg)
+    # The swatches cover four colours; anything else is typed, and wins.
+    if (hex_bg := str(form.get("bg_hex", "")).strip()):
+        prefs["bg"] = hex_bg
 
     # zoom_by is what the +/- buttons send: a relative step, so the browser
     # never has to know the current value.
@@ -1262,6 +1269,16 @@ def post_prefs(device: str):
     write_prefs(device, prefs)
     entry = lib(library.current_variant, device)
     if entry is not None:
+        # Applied with the framing, not only when duplicating: naming a
+        # framing after the fact is the normal case ("this is the face crop").
+        # Reset puts the variant back to plain, so the name goes with it.
+        if form.get("reset"):
+            lib(library.variant_set_labels, entry["id"], "", "")
+        else:
+            name, desc = form.get("name"), form.get("desc")
+            if name is not None or desc is not None:
+                lib(library.variant_set_labels, entry["id"], name, desc)
+    if entry is not None:
         lib(library.variant_set_config, entry["id"],
             prefs if prefs else dict.fromkeys(library.CONFIG_KEYS))
         if not prefs:
@@ -1283,408 +1300,367 @@ def get_meta(device: str):
     return jsonify(meta)
 
 
-LIBRARY_JS = """
-<script>
-(function () {
-  var list = document.getElementById("library");
-  if (!list) return;
-  var dragging = null;
-
-  list.addEventListener("dragstart", function (e) {
-    dragging = e.target.closest("li");
-    if (dragging) dragging.classList.add("dragging");
-  });
-
-  list.addEventListener("dragend", function () {
-    if (dragging) dragging.classList.remove("dragging");
-    dragging = null;
-    persist();
-  });
-
-  list.addEventListener("dragover", function (e) {
-    e.preventDefault();
-    var over = e.target.closest("li");
-    if (!over || !dragging || over === dragging) return;
-    var rows = Array.prototype.slice.call(list.children);
-    // Insert before or after depending on which half of the row we are over.
-    var box = over.getBoundingClientRect();
-    var after = (e.clientY - box.top) > box.height / 2;
-    list.insertBefore(dragging, after ? over.nextSibling : over);
-  });
-
-  function persist() {
-    var ids = Array.prototype.map.call(list.children, function (li) {
-      return li.dataset.id;
-    });
-    fetch(list.dataset.orderUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ids: ids })
-    }).then(function (r) {
-      var note = document.getElementById("ordernote");
-      if (note) note.textContent = r.ok ? "Order saved." : "Could not save order.";
-    });
-  }
-})();
-</script>
-"""
 
 
-INDEX_JS = """
-<script>
-(function () {
-  var grid = document.querySelector(".grid");
-  if (!grid) return;
-
-  // Switch in place: no navigation, no reload. Posting JSON (rather than a
-  // form body) is what makes the server answer with JSON instead of a 303.
-  grid.addEventListener("submit", function (e) {
-    var form = e.target.closest("form.pick");
-    if (!form) return;
-    e.preventDefault();
-
-    var card = form.closest(".card");
-    var busy = form.classList.contains("busy");
-    if (busy) return;
-    form.classList.add("busy");
-
-    fetch(form.action, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}"
-    })
-      .then(function (r) {
-        if (!r.ok) throw new Error(r.status);
-        return r.json();
-      })
-      .then(function () {
-        form.classList.remove("busy");
-
-        var picks = card.querySelectorAll("form.pick");
-        for (var i = 0; i < picks.length; i++) picks[i].classList.remove("now");
-        form.classList.add("now");
-
-        var caption = card.querySelector(".caption");
-        if (caption && form.dataset.name) caption.textContent = form.dataset.name;
-
-        var img = card.querySelector("img.preview");
-        if (img) {
-          // Cache-bust: the URL is unchanged, only what it renders to.
-          img.src = img.dataset.base + "&t=" + Date.now();
-        } else {
-          // The card had nothing on screen and so has no preview element yet.
-          location.reload();
-        }
-      })
-      .catch(function () {
-        form.classList.remove("busy");
-        form.submit();   // last resort: let the browser do the normal post
-      });
-  });
-})();
-</script>
-"""
 
 
-PREVIEW_JS = """
-<script>
-(function () {
-  var form = document.getElementById("framing");
-  var img = document.getElementById("preview");
-  if (!form || !img) return;
-  var base = img.dataset.base;          // /d/<device>/image?w=..&h=..&fmt=png
-  var status = document.getElementById("pstatus");
 
-  function refresh() {
-    var p = new URLSearchParams(new FormData(form));
-    p.delete("reset");
-    p.set("prefs", "0");                // preview the selection, not the stored prefs
-    p.set("t", Date.now());             // defeat the browser cache
-    img.src = base + "&" + p.toString();
-    if (status) status.textContent = "preview — not yet on the screen";
-  }
 
-  form.addEventListener("change", refresh);
-})();
-</script>
-"""
+# Small inline SVGs, as Markup so the template can place them directly.
+# Icons live here rather than in the template so a row's markup stays legible.
+ICONS = {
+    "grip": Markup(
+        '<svg class="grip" width="16" height="16" viewBox="0 0 24 24" fill="none"'
+        ' stroke="#9a988f" stroke-width="2" stroke-linecap="round" aria-hidden="true">'
+        '<circle cx="9" cy="6" r="1"/><circle cx="15" cy="6" r="1"/>'
+        '<circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/>'
+        '<circle cx="9" cy="18" r="1"/><circle cx="15" cy="18" r="1"/></svg>'
+    ),
+    "plus": Markup(
+        '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"'
+        ' stroke-width="2" stroke-linecap="round" aria-hidden="true">'
+        '<path d="M12 5v14M5 12h14"/></svg>'
+    ),
+    "minus": Markup(
+        '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"'
+        ' stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 12h14"/></svg>'
+    ),
+    "trash": Markup(
+        '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"'
+        ' stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+        '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>'
+    ),
+    "up": Markup(
+        '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"'
+        ' stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+        '<path d="M12 16V4"/><path d="m6 10 6-6 6 6"/><path d="M4 20h16"/></svg>'
+    ),
+}
+
+# Quality: low values exist for clips, where quality sets bytes per frame and
+# a screen caches a fixed number of BYTES -- so dropping it is what buys a
+# longer clip and a faster download.
+QUALITIES = [
+    (35, "35 · longest"), (50, "50"), (65, "65"), (75, "75"),
+    (85, "85"), (95, "95 · default"), (100, "100 · sharpest"),
+]
+FIT_CHOICES = [("contain", "Contain"), ("cover", "Cover"),
+               ("width", "Width"), ("height", "Height")]
+ROT_CHOICES = [(0, "0°"), (90, "90°"), (180, "180°"), (270, "270°")]
+BG_CHOICES = [("auto", "Auto", None), ("black", "Black", "#000000"),
+              ("white", "White", "#ffffff"), ("#808080", "Grey", "#6b6a65")]
+
+# How the shelf is ordered. Live screens first by default: those are the ones
+# you can actually send to, so they are the ones worth reaching first.
+SORTS = [("status", "Online first"), ("name", "Name"), ("seen", "Last seen")]
+SORTS_BY = {
+    "status": lambda c: (0 if c["online"] else 1, c["name"].lower()),
+    "name": lambda c: c["name"].lower(),
+    "seen": lambda c: (-c["seen"], c["name"].lower()),
+}
+DEFAULT_SORT = "status"
+
+
+def geometry(width: int, height: int, is_round: bool) -> str:
+    """How the panel is shaped, in one phrase: "480×800 portrait".
+
+    Orientation is the panel's own, not the framing's: it says which way the
+    hardware stands, which is what decides how a picture has to be cropped. A
+    round panel has no orientation worth the word.
+    """
+    shape = "round" if is_round else (
+        "portrait" if height > width else "landscape" if width > height else "square"
+    )
+    return f"{width}×{height} {shape}"
+
+
+def panel_of(device: str, screen) -> tuple[int, int, bool]:
+    """(width, height, round) for a screen that may be offline.
+
+    From the registry when it is there, else from the shape recorded for it --
+    a screen does not change size or grow corners while it is away, and its
+    pictures should keep being drawn for the panel they are going to.
+    """
+    if screen is not None:
+        return screen.width, screen.height, bool(screen.round)
+    # What it looked like when we last saw it beats a shape guessed from
+    # nothing -- a screen with no content of its own has no recorded shape.
+    was = lib(library.seen).get(device) or {}
+    if was.get("width") and was.get("height"):
+        return int(was["width"]), int(was["height"]), bool(was.get("round"))
+    shape = lib(library.shape_of, device)
+    body, is_round = (shape[:-1], True) if shape.endswith("r") else (shape, False)
+    try:
+        width, height = (int(n) for n in body.split("x"))
+    except ValueError:
+        return 800, 480, False
+    return width, height, is_round
+
+
+def geometry_of(device: str, screen) -> str:
+    """The shape phrase for a screen that may be offline."""
+    return geometry(*panel_of(device, screen))
+
+
+def caps_line(screen) -> str:
+    """The screen in its own words: size, what it animates, what it takes."""
+    if screen is None:
+        return "not seen on the network"
+    bits = [geometry(screen.width, screen.height, screen.round)]
+    if screen.anim:
+        bits.append(" ".join(screen.anim))
+    elif screen.anim is not None:
+        bits.append("stills only")
+    bits.append(" ".join(screen.img))
+    if screen.clip:
+        bits.append(screen.clip)
+    if screen.sd:
+        bits.append("sd")
+    return " · ".join(bits)
+
+
+def sd_line(screen) -> str:
+    """The card, in one line: whether it is in, how full, what it is for.
+
+    Separate from the cache report -- a screen can have a card and never
+    report memory, and can have a card it only keeps clips on.
+    """
+    if screen is None or not screen.sd:
+        return ""
+    state = screen.sd_state or {}
+    if not state:
+        return "SD: not read yet"
+    if not state.get("mounted"):
+        return "SD: no card in the slot"
+    use = "stills and clips" if state.get("in_use") else "clips only"
+    total, free = state.get("total_mb"), state.get("free_mb")
+    line = f"SD: card in, {use}"
+    if total and free is not None:
+        line += f" · {free / 1024:.1f} of {total / 1024:.1f} GB free"
+    return line
+
+
+def cache_view(device: str) -> dict | None:
+    """What the screen last reported holding, as rows for the page."""
+    state = lib(library.screen_state, device)
+    report = (state or {}).get("report")
+    if not report:
+        return None
+    names = {it["id"]: it["filename"] for it in lib(library.pool)}
+    budget, used = report.get("budget") or 0, report.get("used") or 0
+    entries = []
+    for r in cache_entries(state):
+        where = []
+        if "mem" in r:
+            where.append(f"memory {_kb(r['mem'])}")
+        if "card" in r:
+            where.append(f"card {_kb(r['card'])}")
+        extra = []
+        if r.get("frames") and r["frames"] > 1:
+            extra.append(f"{r['frames']} frames")
+        if r["fps"]:
+            extra.append(f"{r['fps']} fps")
+        if r["framed"]:
+            extra.append("custom framing")
+        if r["file"]:
+            extra.append("SD file")
+        entries.append({
+            "name": r["file"] or names.get(r["item_id"], r["item_id"] or r["key"]),
+            "where": " · ".join(where),
+            "extra": ", ".join(extra),
+            "shown": r["shown"],
+        })
+    return {
+        "used": _kb(used), "budget": _kb(budget),
+        "pct": round(100 * used / budget) if budget else 0,
+        "psram_free": _kb(report.get("psram_free")) if report.get("psram_total") else "",
+        "psram_total": _kb(report["psram_total"]) if report.get("psram_total") else "",
+        "heap_free": _kb(report["heap_free"]) if report.get("heap_free") is not None else "",
+        "ago": _ago(state.get("at")),
+        "entries": entries,
+    }
 
 
 @app.get("/d/<device>/")
 def device_page(device: str):
     device_dir(device)  # validates the name
     meta = read_meta(device)
-    prefs = read_prefs(device)
+    # The framing OF THE PICTURE ON THE SCREEN, not the screen's defaults: the
+    # controls edit this variant, so they have to show its values. Selecting
+    # another picture reloads the page and brings up that picture's framing.
+    config = lib(library.config_for, device)
 
-    # Preview at the real panel aspect ratio so what you see matches the
-    # screen. Prefs override query params, so the preview shows the same fit
-    # and rotation the device will get.
     screens = registry.for_device(device)
     screen = screens[0] if screens else None
-    pw, ph = (screen.width, screen.height) if screen else (800, 480)
-    shape = "border-radius:50%;" if screen and screen.round else ""
-    scale = min(1.0, 520 / max(pw, 1))
+    pw, ph, is_round = panel_of(device, screen)
+    # A preview, not the exhibit: big enough to judge a crop, small enough to
+    # sit beside the settings rather than push them off the page.
+    scale = min(1.0, 300 / max(pw, ph, 1))
     vw, vh = max(1, round(pw * scale)), max(1, round(ph * scale))
 
-    if meta:
-        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(meta["uploaded_at"]))
-        current = (
-            f'<p>Source: <b>{meta["filename"]}</b> &mdash; '
-            f'{meta["source_format"]} {meta["source_size"][0]}x{meta["source_size"][1]}, '
-            f'{meta["bytes"] // 1024} kB, updated {ts}</p>'
-            f'<p><img id="preview" '
-            f'data-base="/d/{device}/image?w={vw}&h={vh}&fmt=png" '
-            f'src="/d/{device}/image?w={vw}&h={vh}&fmt=png&t={int(meta["uploaded_at"])}" '
-            f'width="{vw}" height="{vh}" '
-            f'style="max-width:100%;border:1px solid #ccc;background:#eee;{shape}"></p>'
-            f'<p style="color:#666" id="pstatus">Showing what is on the screen '
-            f'now, at the panel aspect ratio {pw}x{ph}.</p>'
-        )
-    else:
-        current = "<p><i>No content yet.</i></p>"
-
-    cache_rows = cache_entries(lib(library.screen_state, device))
     used_state = lib(library.used, device)
-    used = lib(library.used_items, device)
-    unused = lib(library.unused_items, device)
+    used_items = lib(library.used_items, device)
+    unused_items = lib(library.unused_items, device)
 
-    def row(it, n=None, draggable=False):
-        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(it["uploaded_at"]))
-        is_current = it["id"] == used_state["current"]
-        klass = "current" if is_current else ""
-        num = f"{n}. " if n else ""
-        grip = '<span class="grip" title="Drag to reorder">&#9776;</span>' if draggable else ""
-        if draggable:
-            acts = (
-                f'<form method="post" action="/d/{device}/items/{it["id"]}/select">'
-                f'<button type="submit"{" disabled" if is_current else ""}>Show</button></form>'
-                f'<form method="post" action="/d/{device}/items/{it["id"]}/remove">'
-                f'<button type="submit" title="Stop using on this screen">&minus;</button></form>'
-            )
-        else:
-            acts = (
-                f'<form method="post" action="/d/{device}/items/{it["id"]}/add">'
-                f'<button type="submit" title="Use on this screen">+</button></form>'
-                f'<form method="post" action="/d/{device}/items/{it["id"]}/select">'
-                f'<button type="submit">Show</button></form>'
-                f'<form method="post" action="/pool/{it["id"]}/delete">'
-                f'<button type="submit" title="Delete from the pool entirely">&times;</button></form>'
-            )
-        attrs = ' draggable="true"' if draggable else ""
-        if klass:
-            attrs += f' class="{klass}"'
-        # A row is a variant: same picture, possibly framed more than one way.
-        named = f'<span class="vname">{it["variant"]}</span>' if it.get("variant") else ""
-        return (
-            f'<li{attrs} data-id="{it["id"]}">'
-            f'{grip}'
-            f'<img src="{thumb_src(it)}" width="80" height="48" alt="" loading="lazy">'
-            f'<span class="who"><b>{num}{it["filename"]}</b> {named} {motion_badge(it)} '
-            f'{still_badge(screen, it)} {cache_badge(cache_rows, it.get("src_id", it["id"]))}<br>'
-            f'<small>{it["source_size"][0]}x{it["source_size"][1]}, '
-            f'{it["bytes"] // 1024} kB, {when}'
-            f'{" &mdash; <b>on screen</b>" if is_current else ""}</small></span>'
-            f'<span class="acts">{acts}</span></li>'
-        )
+    # "cached" belongs in the row you choose from: whether the screen already
+    # holds a picture is the difference between switching instantly and
+    # waiting for a download.
+    held: dict[str, int] = {}
+    for r in cache_entries(lib(library.screen_state, device)):
+        if r["item_id"]:
+            held[r["item_id"]] = held.get(r["item_id"], 0) + (r.get("mem", 0) or r.get("card", 0))
 
-    if used:
-        used_html = (
-            f'<ol id="library" data-order-url="/d/{device}/order">'
-            + "".join(row(it, n, True) for n, it in enumerate(used, 1))
-            + "</ol>"
-            '<p style="color:#666" id="ordernote">Drag to reorder &mdash; saved '
-            "as you drop, and the order a slideshow will follow.</p>"
-        )
-    else:
-        used_html = (
-            "<p><i>This screen is not using anything yet. Upload below, or "
-            "add from the pool.</i></p>"
-        )
+    def row(it: dict) -> dict:
+        source_id = it.get("src_id", it["id"])
+        motion = motion_of(it)
+        # The given name leads, because "face" says more than
+        # PXL_20260909_133347043.MP.jpg. The filename is still the truth about
+        # which file this is, so it shows on the one you have selected.
+        return {
+            "id": it["id"],
+            "title": it.get("variant") or it["filename"],
+            "desc": it.get("desc", ""),
+            "filename": it["filename"],
+            # NOT "copy": Jinja resolves a dict's attributes before its keys,
+            # so `it.copy` would render dict.copy, the built-in method.
+            "badge": "copy" if not it.get("auto", True) and not it.get("variant") else "",
+            "variant": it.get("variant", ""),
+            "thumb": thumb_src(it),
+            "facts": f'{it["source_size"][0]}×{it["source_size"][1]} · {_kb(it["bytes"])}',
+            "cached": _kb(held[source_id]) if held.get(source_id) else "",
+            "current": it["id"] == used_state["current"],
+            "still_here": plays_as_still(screen, it) if screen else False,
+            "source_format": it.get("source_format", ""),
+            "anim": (f'{motion["frames"]} · {(motion.get("duration_ms") or 0) / 1000:.1f}s'
+                     if motion.get("animated") else ""),
+        }
 
-    unused_html = (
-        '<ul id="unused">' + "".join(row(it) for it in unused) + "</ul>"
-        if unused
-        else "<p><i>Nothing else in the pool.</i></p>"
-    )
-
-    def sel(name: str, value, options) -> str:
-        current_value = prefs.get(name, value)
-        opts = "".join(
-            f'<option value="{v}"{" selected" if str(v) == str(current_value) else ""}>{label}</option>'
-            for v, label in options
-        )
-        return f'<select name="{name}">{opts}</select>'
-
-    fit_sel = sel("fit", "contain", [
-        ("contain", "contain — fit all, letterbox"),
-        ("cover", "cover — fill, crop overflow"),
-        ("width", "width (x) — match width"),
-        ("height", "height (y) — match height"),
-        ("stretch", "stretch — distort to fill"),
-    ])
-    rot_sel = sel("rot", 0, [(0, "0°"), (90, "90° CW"), (180, "180°"), (270, "270° CW")])
-    # Lower values are there for clips: quality sets bytes per frame, and a
-    # screen caches a fixed number of BYTES, so dropping it is what buys a
-    # longer clip (and a faster download).
-    q_sel = sel("q", DEFAULT_QUALITY, [
-        (35, "35 — longest clips"),
-        (50, "50"),
-        (65, "65"),
-        (75, "75"),
-        (85, "85"),
-        (95, "95 (default)"),
-        (100, "100"),
-    ])
-    bg_sel = sel("bg", "black", [
-        ("auto", "auto — match the picture edge"),
-        ("black", "black"),
-        ("white", "white"),
-        ("#808080", "grey"),
-    ])
-    zoom_now = int(prefs.get("zoom", 100))
-    # Separate little forms rather than part of the framing form: these are
-    # relative steps applied server-side, so the page never has to know or
-    # round-trip the current value.
-    zoom_html = (
-        f'<form method="post" action="/d/{device}/prefs">'
-        f'<button type="submit" name="zoom_by" value="-10" title="Zoom out"'
-        f'{" disabled" if zoom_now <= ZOOM_MIN else ""}>&minus;</button></form> '
-        f"<b>{zoom_now}%</b> "
-        f'<form method="post" action="/d/{device}/prefs">'
-        f'<button type="submit" name="zoom_by" value="10" title="Zoom in"'
-        f'{" disabled" if zoom_now >= ZOOM_MAX else ""}>+</button></form> '
-        f'<form method="post" action="/d/{device}/prefs">'
-        f'<button type="submit" name="zoom" value="100"'
-        f'{" disabled" if zoom_now == 100 else ""}>Reset zoom</button></form>'
-    )
-
-    override = (
-        f'<p style="color:#666">Overriding: <code>{prefs}</code></p>' if prefs else
-        '<p style="color:#666">No overrides — using what the device asked for.</p>'
-    )
-
-    # Which picture the framing controls act on, and the button that gives it
-    # a second framing to switch between.
     entry = lib(library.current_variant, device)
-    if entry is None:
-        framing_of = "nothing on screen"
-        duplicate_html = ""
-    else:
-        named = f' <span class="vname">{entry["name"]}</span>' if entry["name"] else ""
-        framing_of = f'<b>{meta.get("filename", "current picture")}</b>{named}'
-        duplicate_html = (
-            f'<form method="post" action="/d/{device}/variants/{entry["id"]}/duplicate" '
-            'style="display:inline">'
-            '<input name="name" placeholder="name, e.g. face" maxlength="60" '
-            'style="font-size:1rem;padding:.3rem">'
-            '<button type="submit" title="A second framing of this same picture">'
-            'Duplicate</button></form>'
-        )
+    settings = None
+    if entry is not None:
+        bg_now = str(config.get("bg", "black"))
+        known_bg = {value for value, _, _ in BG_CHOICES}
+        settings = {
+            "variant": entry["id"],
+            "name": entry["name"],
+            "desc": entry.get("desc", ""),
+            "fit": FIT_ALIASES.get(str(config.get("fit", "contain")), str(config.get("fit", "contain"))),
+            "fits": FIT_CHOICES,
+            "rot": int(config.get("rot", 0)),
+            "rots": ROT_CHOICES,
+            "zoom": int(config.get("zoom", 100)),
+            "zoom_min": ZOOM_MIN,
+            "zoom_max": ZOOM_MAX,
+            "q": config.get("q", DEFAULT_QUALITY),
+            "qualities": QUALITIES,
+            "bg": bg_now,
+            "bgs": [(value, label, colour, "bg-" + re.sub(r"[^a-z0-9]", "", value))
+                    for value, label, colour in BG_CHOICES],
+            "bg_custom": "" if bg_now in known_bg else bg_now,
+        }
 
-    return f"""<!doctype html>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{device} — mini screen</title>
-<style>
-  body {{ font: 16px system-ui, sans-serif; margin: 0 auto; padding: 1.5rem; max-width: 40rem; }}
-  input[type=file] {{ display: block; margin: 1rem 0; }}
-  button {{ font-size: 1rem; padding: .6rem 1.2rem; }}
-  label {{ display: inline-block; margin: 0 1rem .6rem 0; }}
-  select {{ font-size: 1rem; padding: .3rem; }}
-  fieldset {{ border: 1px solid #ddd; margin: 1.5rem 0; padding: 1rem; }}
-  ol#library {{ list-style: none; margin: 0; padding: 0; }}
-  ul#unused {{ list-style: none; margin: 0; padding: 0; }}
-  ul#unused li {{ display: flex; align-items: center; gap: .6rem; padding: .4rem;
-                  border: 1px solid #eee; border-radius: 4px; margin-bottom: .4rem;
-                  background: #fafafa; }}
-  ul#unused img {{ border: 1px solid #ddd; flex: none; }}
-  ol#library li {{ display: flex; align-items: center; gap: .6rem; padding: .4rem;
-                   border: 1px solid #eee; border-radius: 4px; margin-bottom: .4rem;
-                   background: #fff; cursor: grab; }}
-  ol#library li.current {{ border-color: #1a7f37; background: #f2fbf4; }}
-  ol#library li.dragging {{ opacity: .4; }}
-  ol#library img {{ border: 1px solid #ddd; flex: none; }}
-  .grip {{ color: #999; flex: none; }}
-  .who {{ flex: 1; min-width: 0; overflow: hidden; }}
-  .acts {{ display: flex; gap: .3rem; flex: none; }}
-  .acts button {{ font-size: .85rem; padding: .3rem .6rem; }}
-  .anim {{ font-size: .75rem; color: #0a5; border: 1px solid #0a5;
-           border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
-  .still {{ font-size: .75rem; color: #a60; border: 1px solid #a60;
-            border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
-  .caps {{ color: #666; }}
-  .cached {{ font-size: .75rem; color: #2458b3; border: 1px solid #2458b3;
-             border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
-  .vname {{ font-size: .8rem; color: #6a3ab2; background: #f3eefc;
-            border-radius: 3px; padding: 0 .3rem; }}
-  ul.cache {{ margin: .3rem 0; padding-left: 1.2rem; font-size: .9rem; }}
-  .sdon {{ color: #1a7f37; }}
-  .sdwarn {{ color: #a60; }}
-  meter {{ width: 4rem; height: .7rem; vertical-align: middle; }}
-</style>
-<h1>{device}</h1>
-<p>{caps_html(screen) if screen else '<small class="caps">offline &mdash; capabilities unknown</small>'}</p>
-<div>{memory_html(device, detailed=True)}</div>
-{current}
+    # The bezel's glass takes the letterbox colour, so the preview shows what
+    # the panel will show around the picture.
+    letterbox = {"auto": "#ffffff", "black": "#000000", "white": "#ffffff"}.get(
+        str(config.get("bg", "black")),
+        str(config.get("bg")) if str(config.get("bg", "")).startswith("#") else "#6b6a65",
+    )
 
-<fieldset>
-  <legend>Send an image</legend>
-  <form method="post" action="/d/{device}/content" enctype="multipart/form-data">
-    <input type="file" name="file" accept="image/*" required>
-    <button type="submit">Upload</button>
-  </form>
-  <p style="color:#666">Pushed to the screen immediately. On a phone the file
-  picker offers the camera.</p>
-</fieldset>
+    return render_template(
+        "device.html",
+        device=device,
+        online=screen is not None,
+        last_error=screen.last_error if screen else "",
+        caps_line=(caps_line(screen) if screen
+                   else " · ".join(x for x in [geometry_of(device, None),
+                                               "not seen on the network"] if x)),
+        round=is_round,
+        icon=ICONS,
+        meta={
+            "filename": meta["filename"],
+            "format": meta["source_format"],
+            "width": meta["source_size"][0],
+            "height": meta["source_size"][1],
+            "size": _kb(meta["bytes"]),
+            "when": time.strftime("%d %b %H:%M", time.localtime(meta["uploaded_at"])),
+        } if meta else None,
+        preview={"w": vw, "h": vh, "letterbox": letterbox,
+                 "stamp": int(meta["uploaded_at"]) if meta else 0},
+        settings=settings,
+        used=[row(it) for it in used_items],
+        unused=[row(it) for it in unused_items],
+        cache=cache_view(device),
+        sd=sd_line(screen),
+    )
 
-<fieldset>
-  <legend>Currently used ({len(used)})</legend>
-  {used_html}
-</fieldset>
 
-<fieldset>
-  <legend>Not used &mdash; in the pool ({len(unused)})</legend>
-  {unused_html}
-  <p style="color:#666">The pool is shared by every screen, and each image is
-  stored once. <b>+</b> starts using it here, <b>Show</b> uses it and puts it
-  on now, <b>&times;</b> deletes it from the pool for every screen.</p>
-</fieldset>
+IDLE_NOTE = ("A scene saves the picture and settings of the screens you pick, "
+             "and puts them all back at once.")
+EMPTY_NOTE = ("None yet. A scene saves the picture and settings of the screens "
+              "you pick, and restores them all at once.")
 
-<fieldset>
-  <legend>Framing &mdash; {framing_of}</legend>
-  <form method="post" action="/d/{device}/prefs" id="framing">
-    <label>Fit {fit_sel}</label>
-    <label>Rotate {rot_sel}</label>
-    <label>Quality {q_sel}</label>
-    <label>Letterbox {bg_sel}</label>
-    <div style="margin-top:.8rem">
-      <button type="submit">Apply to screen</button>
-      <button type="submit" name="reset" value="1">Reset</button>
-    </div>
-  </form>
-  {duplicate_html}
-  <p style="margin-top:1rem">Zoom {zoom_html}</p>
-  {override}
-  <p style="color:#666">Framing belongs to the <b>picture on this screen</b>,
-  not to the screen: reframing one does not move the others. The same values
-  become this screen's defaults, so the next picture you put on it starts
-  where you left off. <b>Duplicate</b> keeps the current framing and makes a
-  second version of the same picture, which you can then frame differently
-  and switch between.</p>
-  <p style="color:#666">Zoom crops in above 100% and letterboxes below it, on
-  top of whatever fit mode is selected. Rotate is for a panel mounted turned — it is applied
-  after fitting, so content stays upright and fills the screen. Doing it here
-  keeps the device on its fast draw path. Letterbox only shows with
-  <code>contain</code> (or <code>width</code>/<code>height</code> when the
-  picture underflows); <b>auto</b> fills each bar with the median colour of
-  the picture edge it touches. Any CSS colour name or <code>#rrggbb</code>
-  also works via the <code>bg</code> URL parameter.</p>
-</fieldset>
 
-<p><a href="/">All devices</a></p>
-{PREVIEW_JS}
-{LIBRARY_JS}
-"""
+def scene_marks() -> dict:
+    """Which scene is up, and which has been changed out from under it.
+
+    "On screen" is not "was applied last": it means the screens still show
+    what the scene recorded. The one that was applied and no longer matches
+    gets the star -- the way an edited document does. Only that one: a scene
+    nobody has applied is not changed, it is simply not up.
+    """
+    stored = lib(library.scenes)
+    latest = max((s.get("applied_at") or 0 for s in stored), default=0)
+    by_id = {}
+    for s in stored:
+        # Both marks belong to the scene you are IN. Another scene that
+        # happens to match is not "on screen" -- nothing put it there -- and
+        # after leaving a scene nothing claims to be up at all.
+        here = bool(latest and (s.get("applied_at") or 0) == latest)
+        on = here and lib(library.scene_on_screen, s["id"])
+        by_id[s["id"]] = {
+            "id": s["id"],
+            "name": s["name"],
+            "on_screen": on,
+            "dirty": here and not on,
+        }
+    order = [by_id[s["id"]] for s in reversed(stored)]
+    # The scene you are working in: the last one put up, whether or not the
+    # screens have since moved away from it.
+    active = None
+    if latest:
+        s = next(x for x in stored if (x.get("applied_at") or 0) == latest)
+        active = {"id": s["id"], "name": s["name"],
+                  "members": sorted((s.get("entries") or {}).keys())}
+    return {
+        "by_id": by_id,
+        "scenes": order,
+        "active": active,
+        "on_screen": next((m["name"] for m in order if m["on_screen"]), ""),
+        "changed": next((m["name"] for m in order if m["dirty"]), ""),
+    }
+
+
+def scene_note(marks: dict, any_scenes: bool) -> dict:
+    """The one-line summary above the scene list, in parts the page can swap.
+
+    A scene that matches outranks one that has been changed since: what is
+    actually on the screens is worth more than what was last clicked.
+    """
+    if marks["on_screen"]:
+        return {"who": marks["on_screen"], "star": False,
+                "tail": "is on the screens now."}
+    if marks["changed"]:
+        return {"who": marks["changed"], "star": True,
+                "tail": "was put up, and a screen has been changed since."}
+    return {"who": "", "star": False, "tail": IDLE_NOTE if any_scenes else EMPTY_NOTE}
+
+
+@app.get("/scenes/state")
+def scenes_state():
+    """Just the marks, for a page that switched a picture without reloading."""
+    marks = scene_marks()
+    return jsonify({"scenes": marks["scenes"],
+                    "note": scene_note(marks, bool(marks["scenes"]))})
 
 
 @app.get("/")
@@ -1694,172 +1670,226 @@ def index():
     # A screen is worth a card if it is on the network OR we hold state for
     # it. Live ones first: those are the ones you can actually send to.
     online = {sc.name: sc for sc in registry.all()}
-    known = set(lib(library.devices))
+    # Remembered as we go, so a screen still has a card when it is asleep --
+    # and so a restart does not lose one that was never given content.
+    for sc in online.values():
+        lib(library.note_seen, sc.name, {
+            "key": registry.key_of(sc), "host": sc.host, "port": sc.port,
+            "width": sc.width, "height": sc.height, "round": sc.round,
+            "sd": sc.sd,
+        })
+    remembered = lib(library.seen)
+    known = set(lib(library.devices)) | set(remembered)
+
+    order = request.args.get("sort") or request.cookies.get("sort") or DEFAULT_SORT
+    if order not in {key for key, _ in SORTS}:
+        order = DEFAULT_SORT
 
     cards = []
     for name in sorted(online.keys() | known):
         sc = online.get(name)
-        pw, ph = (sc.width, sc.height) if sc else (800, 480)
-        # Preview at the panel's aspect ratio, and through the same prefs the
-        # screen gets, so the card shows what is actually on it.
-        tw = 260
-        th = max(1, round(tw * ph / max(pw, 1)))
+        pw, ph, is_round = panel_of(name, sc)
         state = lib(library.used, name)
+        # A screen with nothing assigned still gets a strip to pick from.
         items = lib(library.used_items, name) or lib(library.pool)
-        cur = next((i for i in items if i["id"] == state["current"]), None)
+        current = next((i for i in items if i["id"] == state["current"]), None)
 
-        # A round panel shows only the inscribed circle, so preview exactly that.
-        shape = "border-radius:50%;" if sc and sc.round else ""
-        if state["current"]:
-            preview = (
-                f'<img class="preview" data-base="/d/{name}/image?w={tw}&h={th}&fmt=png"'
-                f' src="/d/{name}/image?w={tw}&h={th}&fmt=png"'
-                f' width="{tw}" height="{th}" alt=""'
-                f' style="border:1px solid #ccc;background:#eee;{shape}">'
-            )
-        else:
-            preview = (
-                f'<a href="/d/{name}/" class="empty" style="width:{tw}px;height:{th}px;{shape}">'
-                "nothing on screen</a>"
-            )
-
-        if sc:
-            status = (
-                f'<span class="on">&#9679; online</span> '
-                f"<small>{sc.host}</small><br>{caps_html(sc)}"
-            )
-            if sc.last_error:
-                status += f' <small class="err">({sc.last_error})</small>'
-        else:
-            status = '<span class="off">&#9675; offline</span>'
-        # Last report, even while offline: it is what the screen held then.
-        if mem := memory_html(name):
-            status += f"<br>{mem}"
-
-        # "Dropdown with preview": a details/summary holding a strip of
-        # thumbnails. A <select> cannot show pictures, and picking an image by
-        # filename is exactly the thing you cannot do from memory.
-        if items:
-            choices = "".join(
-                f'<form method="post" action="/d/{name}/items/{it["id"]}/select" '
-                f'class="pick{" now" if it["id"] == state["current"] else ""}" '
-                f'data-name="{it["filename"]}">'
-                '<input type="hidden" name="return_to" value="/">'
-                f'<button type="submit" title="{it["filename"]}">'
-                f'<img src="{thumb_src(it)}" width="72" height="43" alt="" '
-                f'loading="lazy"></button></form>'
-                for it in items
-            )
-            switcher = (
-                f"<details><summary>Switch picture "
-                f"({len(items)})</summary><div class=\"strip\">{choices}</div></details>"
-            )
-        else:
-            switcher = '<p><small>Nothing in the pool yet.</small></p>'
-
-        cards.append(
-            f'<div class="card"><h2><a href="/d/{name}/">{name}</a></h2>'
-            f"<p>{status}</p>{preview}"
-            f'<p><small class="caption">{cur["filename"] if cur else "&mdash;"}</small> '
-            f'{motion_badge(cur) if cur else ""} {still_badge(sc, cur)}</p>'
-            f"{switcher}</div>"
+        # The panel in the tray, at its own proportions: a portrait screen
+        # stands, a landscape one lies down, and both fit the same card.
+        box_w, box_h = 250, 186
+        scale = min(box_w / max(pw, 1), box_h / max(ph, 1))
+        frame_w, frame_h = max(40, round(pw * scale)), max(40, round(ph * scale))
+        config = lib(library.config_for, name)
+        bg = str(config.get("bg", "black"))
+        letterbox = {"auto": "#ffffff", "black": "#000000", "white": "#ffffff"}.get(
+            bg, bg if bg.startswith("#") else "#6b6a65"
         )
 
-    grid = (
-        f'<div class="grid">{"".join(cards)}</div>'
-        if cards
-        else "<p><i>Nothing found yet. Screens appear here automatically once "
-             "they are on the network.</i></p>"
-    )
+        # What the screen last reported holding, as one bar and one line.
+        cache = None
+        view = cache_view(name)
+        if view:
+            detail = []
+            if view["psram_total"]:
+                detail.append(f'PSRAM {view["psram_free"]} of {view["psram_total"]} free')
+            if view["heap_free"]:
+                detail.append(f'heap {view["heap_free"]}')
+            detail.append(view["ago"])
+            cache = {"used": view["used"], "budget": view["budget"],
+                     "pct": view["pct"], "detail": " · ".join(detail)}
 
-    scenes = lib(library.scenes)
-    scene_rows = "".join(
-        f'<li><b>{sc["name"]}</b> '
-        f'<small>{len(sc.get("entries") or {})} screen(s), '
-        f'{time.strftime("%Y-%m-%d %H:%M", time.localtime(sc.get("saved_at", 0)))}</small>'
-        f'<span class="acts">'
-        f'<form method="post" action="/scenes/{sc["id"]}/apply">'
-        f'<button type="submit">Apply</button></form>'
-        f'<form method="post" action="/scenes/{sc["id"]}/delete">'
-        f'<button type="submit" title="Delete scene">&times;</button></form>'
-        f"</span></li>"
-        for sc in reversed(scenes)
-    )
-    scenes_html = (
-        f'<ul id="scenes">{scene_rows}</ul>' if scene_rows
-        else "<p><i>No scenes saved yet.</i></p>"
-    )
+        geo = geometry_of(name, sc)
+        if sc:
+            sub = f"{sc.host} · {geo}"
+            sub_full = caps_line(sc)
+        else:
+            sub = geo or "offline"
+            sub_full = "not seen on the network"
 
-    return f"""<!doctype html>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Mini screens</title>
-<style>
-  body {{ font: 16px system-ui, sans-serif; margin: 0 auto; padding: 1.5rem; max-width: 64rem; }}
-  h1 {{ margin-top: 0; }}
-  h2 {{ font-size: 1.1rem; margin: 0 0 .3rem; }}
-  a {{ color: inherit; }}
-  .grid {{ display: grid; gap: 1rem;
-           grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); }}
-  .card {{ border: 1px solid #ddd; border-radius: 6px; padding: .9rem; }}
-  .card p {{ margin: .3rem 0; }}
-  .on {{ color: #1a7f37; }}
-  .off {{ color: #999; }}
-  .err {{ color: #b00; }}
-  .empty {{ display: flex; align-items: center; justify-content: center;
-            border: 1px dashed #ccc; color: #999; text-decoration: none; }}
-  details summary {{ cursor: pointer; margin-top: .5rem; font-size: .9rem; }}
-  .strip {{ display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .5rem; }}
-  .pick button {{ padding: 0; border: 2px solid transparent; background: none;
-                  cursor: pointer; line-height: 0; }}
-  .pick.now button {{ border-color: #1a7f37; }}
-  .pick.busy button {{ opacity: .4; }}
-  .anim {{ font-size: .75rem; color: #0a5; border: 1px solid #0a5;
-           border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
-  .still {{ font-size: .75rem; color: #a60; border: 1px solid #a60;
-            border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
-  .caps {{ color: #666; }}
-  .cached {{ font-size: .75rem; color: #2458b3; border: 1px solid #2458b3;
-             border-radius: 3px; padding: 0 .25rem; white-space: nowrap; }}
-  .vname {{ font-size: .8rem; color: #6a3ab2; background: #f3eefc;
-            border-radius: 3px; padding: 0 .3rem; }}
-  ul.cache {{ margin: .3rem 0; padding-left: 1.2rem; font-size: .9rem; }}
-  .sdon {{ color: #1a7f37; }}
-  .sdwarn {{ color: #a60; }}
-  meter {{ width: 4rem; height: .7rem; vertical-align: middle; }}
-  form {{ display: inline; }}
-  fieldset {{ border: 1px solid #ddd; margin: 1.5rem 0; padding: 1rem; }}
-  ul#scenes {{ list-style: none; margin: 0; padding: 0; }}
-  ul#scenes li {{ display: flex; align-items: center; gap: .6rem; padding: .4rem;
-                  border: 1px solid #eee; border-radius: 4px; margin-bottom: .4rem; }}
-  ul#scenes li b {{ flex: none; }}
-  ul#scenes li small {{ flex: 1; color: #666; }}
-  .acts {{ display: flex; gap: .3rem; }}
-  button {{ font-size: .9rem; padding: .35rem .7rem; }}
-</style>
-<h1>Mini screens</h1>
-{grid}
+        sd = sd_line(sc)
 
-<fieldset>
-  <legend>Scenes</legend>
-  {scenes_html}
-  <form method="post" action="/scenes" style="margin-top:.8rem">
-    <input name="name" placeholder="Scene name" maxlength="60" required
-           style="font-size:1rem;padding:.35rem">
-    <button type="submit">Save current state</button>
-  </form>
-  <p style="color:#666">A scene records which picture each screen is showing
-  and its framing (fit, rotation, zoom, letterbox, quality). Applying one puts
-  every screen back and pushes them all. Screens whose picture has since left
-  the pool are skipped rather than failing the whole scene.</p>
-</fieldset>
+        def card_item(it):
+            motion = motion_of(it)
+            return {
+                "id": it["id"],
+                "title": it.get("variant") or it["filename"],
+                "filename": it["filename"],
+                "thumb": thumb_src(it),
+                "current": it["id"] == state["current"],
+                "still_here": plays_as_still(sc, it) if sc else False,
+                "anim": (f'{motion["frames"]} · {(motion.get("duration_ms") or 0) / 1000:.1f}s'
+                         if motion.get("animated") else ""),
+            }
 
-<p style="color:#666">Screens are discovered over mDNS and told where to fetch
-from &mdash; no addresses configured anywhere.
-<a href="/devices">/devices</a> shows the raw registry,
-<a href="/pool">/pool</a> every image.</p>
-{INDEX_JS}
-"""
+        cards.append({
+            "name": name,
+            "online": sc is not None,
+            "seen": sc.last_seen if sc else 0.0,
+            "sub": sub,
+            "sub_full": sub_full,
+            "round": is_round,
+            "frame_w": frame_w,
+            "frame_h": frame_h,
+            "letterbox": letterbox,
+            # Rendered through the screen's own framing, so a card shows what
+            # is actually on the panel rather than the original picture.
+            "preview": f"/d/{name}/image?w={frame_w * 2}&h={frame_h * 2}&fmt=png",
+            "stamp": int(time.time()),
+            "current": card_item(current) if current else None,
+            "thumbs": [card_item(it) for it in items],
+            "cache": cache,
+            "sd": sd,
+        })
+
+    cards.sort(key=SORTS_BY[order])
+
+    # Which screens a scene may be built from: live ones can be added, ones
+    # that are not answering can only be kept where a scene already has them.
+    # Ticked by default when live: saving a scene means "these, as they are".
+    choices = [{"name": c["name"], "online": c["online"], "member": c["online"]}
+               for c in cards]
+
+    def scene_shots(entries: dict) -> list[dict]:
+        """A row of small pictures: what this scene puts on each screen.
+
+        The pool thumbnail, not a render of the scene's framing -- it is the
+        picture you are identifying at 34 pixels wide, and a screen that is
+        round shows it round so the row reads like the shelf does.
+        """
+        shots = []
+        for device in sorted(entries):
+            variant_id = entries[device].get("item")
+            entry = lib(library.variant, variant_id) if variant_id else None
+            # "src" is what a stored variant calls it; "src_id" is the name it
+            # takes in list rows. Scenes hold stored ids -- and pool ids
+            # directly, for scenes saved before variants existed.
+            src = (entry or {}).get("src") or variant_id
+            item = (lib(library.pool_get, src)
+                    if src and library.ITEM_RE.match(str(src)) else None)
+            live = device in online
+            shots.append({
+                "device": device,
+                "thumb": thumb_src(item) if item else "",
+                "round": panel_of(device, online.get(device))[2],
+                "online": live,
+                "title": (f'{device} · {item["filename"]}' if item else
+                          f"{device} · picture no longer in the library")
+                         + ("" if live else " · offline"),
+            })
+        return shots
+
+    marks = scene_marks()
+    scenes = []
+    for s in reversed(lib(library.scenes)):
+        members = set((s.get("entries") or {}).keys())
+        mark = marks["by_id"][s["id"]]
+        scenes.append({
+            "id": s["id"],
+            "name": s["name"],
+            "desc": s.get("desc", ""),
+            "shots": scene_shots(s.get("entries") or {}),
+            "on_screen": mark["on_screen"],
+            "dirty": mark["dirty"],
+            # A screen a scene remembers but we no longer hold state for.
+            "lost": sorted(members - {c["name"] for c in choices}),
+        })
+    note = scene_note(marks, bool(scenes))
+
+    # One save form, always at the top, always with the screens to tick. While
+    # you are in a scene it saves back into that scene, and offers to save
+    # beside it instead -- the name starts as the one you are in, so "save as"
+    # takes a word changed rather than a name invented.
+    here = marks["active"]
+    in_scene = set(here["members"]) if here else set()
+    save_form = {
+        "scene_id": here["id"] if here else "",
+        "name": here["name"] if here else "",
+        "picks": [{"name": c["name"], "online": c["online"],
+                   "member": (c["name"] in in_scene) if here else c["online"]}
+                  for c in choices],
+    }
+
+    # Working in a scene means working on its screens: the rest are out of the
+    # way until you ask for them, or add one to the scene. Never hidden to the
+    # point of an empty shelf, and never hidden from the scene's own picker --
+    # that is where a screen is added, so it has to list them all.
+    # Hidden, not dropped: every card is still sent, so ticking a screen into
+    # the scene can show it at once -- you tick it because you want to set
+    # what it shows, and waiting for a round trip to see it is no good.
+    active = marks["active"]
+    narrowed = bool(active and request.args.get("all") != "1"
+                    and any(c["name"] in active["members"] for c in cards))
+    for c in cards:
+        c["in_scene"] = bool(active and c["name"] in active["members"])
+    scene_filter = {
+        "name": active["name"] if active else "",
+        "narrowed": narrowed,
+        "showing_all": bool(active and request.args.get("all") == "1"),
+        "shown": sum(1 for c in cards if c["in_scene"]) if narrowed else len(cards),
+        "total": len(cards),
+    }
+
+    page = make_response(render_template(
+        "index.html",
+        screens=cards,
+        online_count=len(online),
+        upload_to=(sorted(online)[0] if online else (sorted(known)[0] if known else "")),
+        scenes=scenes,
+        save_form=save_form,
+        note=note,
+        scene_filter=scene_filter,
+        # Set only just after a refresh, to say what the knocking found.
+        checked=request.args.get("checked", type=int),
+        gone=request.args.get("gone", type=int) or 0,
+        back=request.args.get("back", type=int) or 0,
+        sort=order,
+        sorts=SORTS,
+        icon=ICONS,
+    ))
+    # Asked for once, kept: the order you read the shelf in is a preference,
+    # not a step in a journey, so it should survive the next visit.
+    if request.args.get("sort"):
+        page.set_cookie("sort", order, max_age=365 * 24 * 3600, samesite="Lax")
+    return page
+
+
+@app.post("/screens/refresh")
+def refresh_screens():
+    """Knock on every screen's door, and believe the answer.
+
+    mDNS only reports a screen leaving when it says goodbye, so one that lost
+    power stays on the shelf until its record expires -- possibly an hour.
+    This checks now: anything that does not answer is marked offline, and any
+    screen we remember that DOES answer comes back.
+    """
+    result = registry.recheck(lib(library.seen))
+    if from_browser_form():
+        back = redirect_target("/")
+        joiner = "&" if "?" in back else "?"
+        return Response(status=303, headers={
+            "Location": f'{back}{joiner}checked={result["checked"]}'
+                        f'&gone={len(result["gone"])}&back={len(result["back"])}'})
+    return jsonify(result)
 
 
 @app.get("/devices")
@@ -1873,11 +1903,92 @@ def list_scenes():
     return jsonify(lib(library.scenes))
 
 
+def scene_selection() -> tuple[set[str] | None, set[str] | None]:
+    """Which screens a scene form picked, and which of them are reachable.
+
+    The page always sends the selection -- with a `pick` marker, so ticking
+    nothing is telling the difference from a caller that never offered the
+    choice. Those callers (the JSON API) keep the old behaviour: every screen,
+    online or not.
+    """
+    data = request.form if request.form else (request.get_json(silent=True) or {})
+    if hasattr(data, "getlist"):
+        picked, marked = data.getlist("screens"), "pick" in data
+    else:
+        raw = data.get("screens")
+        marked = isinstance(raw, list)
+        picked = [str(x) for x in raw] if marked else []
+    if not marked:
+        return None, None
+    return set(picked), {sc.name for sc in registry.all()}
+
+
 @app.post("/scenes")
 def save_scene():
-    """Snapshot what every screen is showing, and how, under a name."""
+    """Snapshot what the chosen screens are showing, and how, under a name."""
     form = request.form if request.form else (request.get_json(silent=True) or {})
-    scene = lib(library.scene_save, str(form.get("name", "")))
+    only, live = scene_selection()
+    scene = lib(library.scene_save, str(form.get("name", "")), only, live)
+    if from_browser_form():
+        return Response(status=303, headers={"Location": "/"})
+    return jsonify(scene), 201
+
+
+@app.post("/scenes/<scene_id>/update")
+def update_scene(scene_id: str):
+    """Edit a scene in place: its name, its screens, and what they show.
+
+    Saving is one act: the scene ends up meaning the screens as they are now.
+    """
+    form = request.form if request.form else (request.get_json(silent=True) or {})
+    only, live = scene_selection()
+    name = form.get("name")
+    scene = lib(library.scene_update, scene_id, only, live,
+                str(name) if name is not None else None)
+    if from_browser_form():
+        return Response(status=303, headers={"Location": "/"})
+    return jsonify(scene)
+
+
+@app.post("/scenes/<scene_id>/saveas")
+def save_scene_as(scene_id: str):
+    """Save what is up now as a new scene, leaving the original alone."""
+    form = request.form if request.form else (request.get_json(silent=True) or {})
+    only, live = scene_selection()
+    scene = lib(library.scene_save_as, scene_id, str(form.get("name", "")),
+                only, live)
+    if from_browser_form():
+        return Response(status=303, headers={"Location": "/"})
+    return jsonify(scene), 201
+
+
+@app.post("/scenes/<scene_id>/labels")
+def label_scene(scene_id: str):
+    """Rename or describe a scene, without touching what it recorded."""
+    form = request.form if request.form else (request.get_json(silent=True) or {})
+    name, desc = form.get("name"), form.get("desc")
+    scene = lib(library.scene_set_labels, scene_id,
+                str(name) if name is not None else None,
+                str(desc) if desc is not None else None)
+    if from_browser_form():
+        return Response(status=303, headers={"Location": "/"})
+    return jsonify(scene)
+
+
+@app.post("/scenes/release")
+def release_scene():
+    """Leave the scene you are in. Deletes nothing -- only the mark."""
+    lib(library.scene_release)
+    if from_browser_form():
+        return Response(status=303, headers={"Location": redirect_target("/")})
+    return "", 204
+
+
+@app.post("/scenes/<scene_id>/duplicate")
+def duplicate_scene(scene_id: str):
+    """A copy to change freely, leaving the original as it was."""
+    form = request.form if request.form else (request.get_json(silent=True) or {})
+    scene = lib(library.scene_duplicate, scene_id, str(form.get("name", "")))
     if from_browser_form():
         return Response(status=303, headers={"Location": "/"})
     return jsonify(scene), 201
@@ -1898,6 +2009,24 @@ def delete_scene(scene_id: str):
     lib(library.scene_remove, scene_id)
     if from_browser_form():
         return Response(status=303, headers={"Location": "/"})
+    return "", 204
+
+
+@app.post("/d/<device>/remove")
+def remove_device(device: str):
+    """Forget a screen that is no longer on the shelf.
+
+    Only one that is off the network: a live screen would be rediscovered
+    within seconds and come back empty, which looks like a bug rather than a
+    removal. Its pictures stay in the pool.
+    """
+    device_dir(device)  # validates the name
+    if registry.for_device(device):
+        abort(409, "that screen is on the network")
+    if not lib(library.device_remove, device):
+        abort(404)
+    if from_browser_form():
+        return Response(status=303, headers={"Location": redirect_target("/")})
     return "", 204
 
 

@@ -23,6 +23,7 @@ import logging
 import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from urllib.parse import quote, urlencode
 
@@ -65,6 +66,9 @@ SD_STATE_PATHS = {
 }
 # Free space changes slowly and the device only re-measures once a minute.
 SD_POLL_INTERVAL = 30.0
+# Short on purpose: a screen on the same LAN either answers at once or is not
+# there, and this runs while someone waits for the page.
+PROBE_TIMEOUT = 2.0
 CONFIGURE_RETRIES = 5
 CONFIGURE_BACKOFF = 3.0
 
@@ -94,7 +98,9 @@ class Screen:
     # the firmware predates the record, so nothing is known and clips are
     # offered as before; an empty tuple means stills only.
     anim: tuple[str, ...] | None = None
-    # Stores stills on an SD card (when one is mounted).
+    # Has an SD card slot, so the card is worth asking about. Whether stills
+    # are actually kept there is a separate thing, reported in `sd_state`:
+    # a screen can have a card and use it only for clips.
     sd: bool = False
     # How clips reach the screen: "mjpeg" (one /clip.mjpeg download, played
     # from memory) or "frames" (per-frame fetches). None: firmware predates it.
@@ -359,6 +365,73 @@ class Registry:
         with self._lock:
             screen.sd_state = state
         return state
+
+    def key_of(self, screen: Screen) -> str:
+        """The mDNS instance name a screen is filed under, for remembering."""
+        with self._lock:
+            for key, known in self._screens.items():
+                if known is screen:
+                    return key
+        return ""
+
+    def answers(self, host: str, port: int) -> bool:
+        """Is anything listening? Any HTTP reply counts -- the question is
+        whether the screen is there, not what it has to say."""
+        try:
+            requests.get(f"http://{host}:{port}/", timeout=PROBE_TIMEOUT)
+            return True
+        except requests.RequestException:
+            return False
+
+    def recheck(self, revive: dict[str, dict] | None = None) -> dict:
+        """Ask every screen whether it is still there, and drop the ones that
+        are not.
+
+        mDNS only tells us a screen went away when it says goodbye, which a
+        screen that lost power never does -- its record then sits in the cache
+        until it expires, which can be an hour. This is the manual answer to
+        that: a round of knocking on doors.
+
+        `revive` is {name: {host, port, ...}} for screens we remember but
+        cannot see; any that answer are put back, since something is there.
+        """
+        with self._lock:
+            live = list(self._screens.items())
+        checked = [(key, s, s.host, s.port) for key, s in live]
+        for name, info in (revive or {}).items():
+            if info.get("host") and name not in {s.name for _, s in live}:
+                checked.append((info.get("key") or f"{name}.revived",
+                                None, str(info["host"]), int(info.get("port") or 80)))
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            alive = list(pool.map(lambda c: self.answers(c[2], c[3]), checked))
+
+        gone, back = [], []
+        for (key, screen, host, port), ok in zip(checked, alive):
+            if screen is not None:
+                if ok:
+                    with self._lock:
+                        screen.last_seen = time.time()
+                else:
+                    log.info("no answer from %s at %s:%d -- marking offline",
+                             screen.name, host, port)
+                    self.drop(key)
+                    gone.append(screen.name)
+            elif ok:
+                name = key.split(".")[0]
+                info = (revive or {}).get(name, {})
+                restored = Screen(
+                    name=info.get("name", name), host=host, port=port,
+                    width=int(info.get("width") or 800),
+                    height=int(info.get("height") or 480),
+                    round=bool(info.get("round")),
+                    sd=bool(info.get("sd")),
+                )
+                if (needs := self.put(key, restored)) is not None:
+                    threading.Thread(target=self.configure, args=(key, needs),
+                                     daemon=True).start()
+                back.append(restored.name)
+        return {"checked": len(checked), "gone": sorted(gone), "back": sorted(back)}
 
     def poll_sd_forever(self, interval: float = SD_POLL_INTERVAL) -> None:
         while True:

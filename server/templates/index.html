@@ -1,0 +1,312 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mini screens</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+
+<header class="top">
+  <div class="ident" style="align-items:baseline">
+    <h1>Mini screens</h1>
+    <span class="sub" style="font-size:14px">{{ online_count }} of {{ screens|length }} online</span>
+  </div>
+  {% if screens %}
+    <div class="topright">
+      {# mDNS only says a screen left when it says goodbye, so this asks. #}
+      <form method="post" action="/screens/refresh" class="inline refresh">
+        <input type="hidden" name="return_to" value="/">
+        <button type="submit" class="secondary" title="Check which screens answer">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>
+          Refresh
+        </button>
+      </form>
+      {# Order is a preference, so it is a plain link and remembered. #}
+      <nav class="sorts" aria-label="Sort screens">
+        {% for key, label in sorts %}
+          <a href="/?sort={{ key }}"{% if key == sort %} class="now" aria-current="true"{% endif %}>{{ label }}</a>
+        {% endfor %}
+      </nav>
+      {# Uploading here goes to the screen you are looking at least often, so it
+         asks which: the first live one, else the first known. #}
+      <form method="post" action="/d/{{ upload_to }}/content" enctype="multipart/form-data" class="inline">
+        <label class="btn dark">{{ icon.up }} Upload to {{ upload_to }}
+          <input type="file" name="file" accept="image/*" hidden onchange="this.form.submit()">
+        </label>
+      </form>
+    </div>
+  {% endif %}
+</header>
+
+{% if checked is not none %}
+  <p class="note filterline">
+    Knocked on {{ checked }} door{{ '' if checked == 1 else 's' }}.
+    {% if gone %}{{ gone }} did not answer and {{ 'is' if gone == 1 else 'are' }} now offline.{% endif %}
+    {% if back %}{{ back }} answered and {{ 'is' if back == 1 else 'are' }} back.{% endif %}
+    {% if not gone and not back %}Everything is as it was.{% endif %}
+  </p>
+{% endif %}
+
+{% if scene_filter.name and (scene_filter.narrowed or scene_filter.showing_all) %}
+  <p class="note filterline">
+    {% if scene_filter.narrowed %}
+      Showing <span class="fshown">{{ scene_filter.shown }}</span> of
+      {{ scene_filter.total }} screens — the ones in <b>{{ scene_filter.name }}</b>.
+      <a href="/?all=1">show all</a>
+    {% else %}
+      Showing all {{ scene_filter.total }} screens, in <b>{{ scene_filter.name }}</b>
+      or not — <a href="/">show only {{ scene_filter.name }}</a>
+    {% endif %}
+  </p>
+{% endif %}
+
+{% if screens %}
+  <div class="grid"{{ ' data-narrowed=1'|safe if scene_filter.narrowed }}>
+    {% for s in screens %}
+      <article class="card pad screen{{ ' round-screen' if s.round }}{{ ' isoff' if not s.online }}"
+               data-name="{{ s.name }}"{{ ' hidden' if scene_filter.narrowed and not s.in_scene }}>
+        <div class="cardhead">
+          <div class="who">
+            <a class="nm" href="/d/{{ s.name }}/">{{ s.name }}</a>
+            <div class="mono sub" title="{{ s.sub_full }}">{{ s.sub }}</div>
+          </div>
+          {% if s.online %}
+            <span class="pill on"><span class="dot"></span>online</span>
+          {% else %}
+            <span class="pill off"><span class="dot"></span>offline</span>
+          {% endif %}
+        </div>
+
+        {# The panel itself: shape and orientation as the hardware has them,
+           dimmed when the screen is not answering. #}
+        <div class="stage">
+          <div class="bezel mini{{ ' round' if s.round }}{{ ' dim' if not s.online }}"
+               style="width:{{ s.frame_w }}px;height:{{ s.frame_h }}px">
+            <div class="glass" style="background:{{ s.letterbox }}">
+              {% if s.current %}
+                <img src="{{ s.preview }}&t={{ s.stamp }}" data-base="{{ s.preview }}"
+                     alt="" loading="lazy">
+              {% else %}
+                <span class="sub">nothing on screen</span>
+              {% endif %}
+              {# Said on the panel itself: what you see here is the last thing
+                 sent, not what the screen is showing -- it is not answering. #}
+              {% if not s.online %}<span class="offtag">offline</span>{% endif %}
+            </div>
+          </div>
+        </div>
+
+        <div class="nameline">
+          {% if s.current %}
+            <span class="nm" title="{{ s.current.filename }}">{{ s.current.title }}</span>
+            {% if s.current.anim %}<span class="anim">&#9654; {{ s.current.anim }}</span>{% endif %}
+            {% if s.current.still_here %}<span class="still">still</span>{% endif %}
+          {% else %}
+            <span class="sub">Pick one below</span>
+          {% endif %}
+        </div>
+
+        {% if s.thumbs %}
+          <div class="field" style="margin:0;gap:6px">
+            <span class="lbl">Playlist · {{ s.thumbs|length }}</span>
+            {# Nothing to switch on a screen that is not listening: the only
+               thing worth doing to it from here is forgetting it. #}
+            <div class="strip" role="group" aria-label="Switch picture">
+              {% for t in s.thumbs %}
+                <form method="post" action="/d/{{ s.name }}/items/{{ t.id }}/select"
+                      class="pick{{ ' now' if t.current }}" data-name="{{ t.title }}">
+                  <input type="hidden" name="return_to" value="/">
+                  <button type="submit" title="{{ t.title if s.online else s.name ~ ' is not on the network' }}"
+                          aria-pressed="{{ 'true' if t.current else 'false' }}"
+                          {{ 'disabled' if not s.online }}>
+                    <img src="{{ t.thumb }}" alt="" loading="lazy">
+                  </button>
+                </form>
+              {% endfor %}
+            </div>
+          </div>
+        {% else %}
+          <p class="note" style="margin:0">Nothing in the library yet.</p>
+        {% endif %}
+
+        {% if s.cache or s.sd %}
+          <div class="stats">
+            {% if s.cache %}
+              <div class="statline"><span>Cache</span><span class="mono">{{ s.cache.used }} / {{ s.cache.budget }}</span></div>
+              <div class="bar"><div class="fill{{ ' hot' if s.cache.pct >= 88 }}" style="width:{{ s.cache.pct }}%"></div></div>
+              <span class="mono sub">{{ s.cache.detail }}</span>
+            {% endif %}
+            {% if s.sd %}<span class="mono sub">{{ s.sd }}</span>{% endif %}
+          </div>
+        {% endif %}
+
+        <div class="cardfoot">
+          <a class="go" href="/d/{{ s.name }}/">Open screen
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          </a>
+          {# Only offered for a screen that is not answering: a live one would
+             be rediscovered in seconds. Asks first, and says what is lost. #}
+          {% if not s.online %}
+            <details class="confirm">
+              <summary>Remove</summary>
+              <div class="ask">
+                <p>Forget <b>{{ s.name }}</b>? Its playlist and settings go; the
+                  pictures stay in the library.</p>
+                <form method="post" action="/d/{{ s.name }}/remove" class="inline">
+                  <input type="hidden" name="return_to" value="/">
+                  <button type="submit" class="quiet warn">Yes, remove</button>
+                </form>
+              </div>
+            </details>
+          {% endif %}
+        </div>
+      </article>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="note">Nothing found yet. Screens appear here by themselves once they
+  are on the network.</p>
+{% endif %}
+
+{# One checkbox per screen. A screen that is not answering cannot be added --
+   there is no point saving a scene you cannot put up -- but one a scene
+   already holds stays tickable, so it can be kept or dropped on purpose. #}
+{% macro screen_picks(picks) %}
+  <input type="hidden" name="pick" value="1">
+  <div class="picks">
+    {% for p in picks %}
+      {% set locked = not p.online and not p.member %}
+      <label class="chip{{ ' off' if not p.online }}{{ ' locked' if locked }}"
+             title="{{ 'not on the network' if not p.online else '' }}">
+        <input type="checkbox" name="screens" value="{{ p.name }}"
+               {{ 'checked' if p.member }}{{ ' disabled' if locked }}>
+        <span>{{ p.name }}</span>
+        {% if not p.online %}<span class="sub">offline</span>{% endif %}
+      </label>
+    {% endfor %}
+  </div>
+{% endmacro %}
+
+<section class="card pad scenes">
+  <div class="scenehead">
+    <div>
+      <h2>Scenes</h2>
+      {# Built from parts the script can swap, so switching a picture updates
+         the line without a reload. #}
+      <p class="sub" id="scenenote" style="margin:.3rem 0 0">
+        <b class="onnow"{{ ' hidden' if not note.who }}><span class="who">{{ note.who }}</span
+          ><span class="star"{{ ' hidden' if not note.star }}>*</span></b>
+        <span class="tail">{{ note.tail }}</span>
+        {# Leaving a scene deletes nothing: it only stops the shelf being
+           narrowed to it, and stops anything claiming to be up. #}
+        {% if scene_filter.name %}
+          <form method="post" action="/scenes/release" class="inline">
+            <input type="hidden" name="return_to" value="/">
+            <button type="submit" class="linky"
+                    title="Stop working in this scene. Nothing is deleted.">Leave scene</button>
+          </form>
+        {% endif %}
+      </p>
+    </div>
+    {# One form, whether you are in a scene or not: a name, the screens to
+       take, and Save. In a scene you have changed, the same form can also
+       save the change as a scene of its own. #}
+    <form method="post" action="{{ '/scenes/' ~ save_form.scene_id ~ '/update'
+                                  if save_form.scene_id else '/scenes' }}"
+          class="sceneform">
+      <div class="scenerow">
+        <label class="sr" for="scene">Scene name</label>
+        <input id="scene" type="text" name="name" placeholder="Scene name"
+               maxlength="60" value="{{ save_form.name }}" required>
+        <button type="submit" class="primary" style="flex:none">
+          {{ 'Save' if save_form.scene_id else 'Save current state' }}</button>
+        {% if save_form.scene_id %}
+          <button type="submit" class="secondary" style="flex:none"
+                  formaction="/scenes/{{ save_form.scene_id }}/saveas"
+                  title="Keep the scene as it was and save this as a new one">Save as duplicate</button>
+        {% endif %}
+      </div>
+      {% if save_form.picks %}{{ screen_picks(save_form.picks) }}{% endif %}
+    </form>
+  </div>
+  {% if scenes %}
+    <ul id="scenes">
+      {% for sc in scenes %}
+        {# The mark and the pill are always in the markup, shown or hidden, so
+           a live update is a flag to flip rather than markup to build. #}
+        <li data-id="{{ sc.id }}">
+          <span class="who">
+            <b>{{ sc.name }}<span class="star"{{ ' hidden' if not sc.dirty }}
+               title="A screen has been changed since this scene was put up">*</span></b>
+            {% if sc.desc %}<span class="sub desc">{{ sc.desc }}</span>{% endif %}
+          </span>
+          {# What the scene puts up, one small picture per screen. A screen
+             that is not answering is greyed here the same way its card is. #}
+          {% if sc.shots %}
+            <span class="sthumbs">
+              {% for shot in sc.shots %}
+                <span class="shot{{ ' rnd' if shot.round }}{{ ' off' if not shot.online }}"
+                      title="{{ shot.title }}">
+                  {% if shot.thumb %}
+                    <img src="{{ shot.thumb }}" alt="" loading="lazy">
+                  {% else %}
+                    <span class="gone" aria-hidden="true">?</span>
+                  {% endif %}
+                </span>
+              {% endfor %}
+            </span>
+          {% endif %}
+          {# Pushed to the right end of the row, mark first, then the
+             things you can do to the scene. #}
+          <span class="rightside">
+          <span class="pill on"{{ ' hidden' if not sc.on_screen }}><span class="dot"></span>on screen</span>
+          <span class="acts">
+            <form method="post" action="/scenes/{{ sc.id }}/apply" class="inline">
+              <button type="submit" class="quiet">Apply</button>
+            </form>
+            {# Edit is only what the scene is called and what it is for. What
+               it holds is changed by saving, at the top. #}
+            <details class="confirm">
+              <summary>Edit</summary>
+              <form method="post" action="/scenes/{{ sc.id }}/labels" class="ask wide">
+                <label class="sr" for="n{{ sc.id }}">Scene name</label>
+                <input id="n{{ sc.id }}" type="text" name="name" value="{{ sc.name }}"
+                       maxlength="60" required>
+                <label class="sr" for="d{{ sc.id }}">Description</label>
+                <input id="d{{ sc.id }}" type="text" name="desc" value="{{ sc.desc }}"
+                       maxlength="200" class="desc-input" placeholder="What this scene is for">
+                {% if sc.lost %}
+                  <p class="sub">Remembers {{ sc.lost|join(', ') }}, which we no
+                    longer hold anything for.</p>
+                {% endif %}
+                <div class="askacts">
+                  <button type="submit" class="quiet">Save name</button>
+                </div>
+              </form>
+            </details>
+            <form method="post" action="/scenes/{{ sc.id }}/duplicate" class="inline">
+              <button type="submit" class="quiet" title="Copy this scene to change freely">Duplicate</button>
+            </form>
+            <form method="post" action="/scenes/{{ sc.id }}/delete" class="inline">
+              <button type="submit" class="icon danger" title="Delete this scene">{{ icon.trash }}</button>
+            </form>
+          </span>
+          </span>
+        </li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</section>
+
+<footer class="note">
+  Screens are found over mDNS and told where to fetch from — nothing is typed
+  on either side. Raw data: <a href="/devices">/devices</a> ·
+  <a href="/pool">/pool</a>
+</footer>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>

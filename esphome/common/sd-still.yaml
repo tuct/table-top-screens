@@ -21,7 +21,6 @@
 # override its defaults.
 
 substitutions:
-  sd_still: "1"
   image_formats: jpeg,rgb565
 
 external_components:

@@ -301,10 +301,13 @@ def main() -> int:
     check("page exposes a preview element the JS can drive", 'id="preview"' in page)
     check("page gives the JS a base URL", 'data-base="/d/tabletop-01/image' in page)
     check("page has the framing form", 'id="framing"' in page)
-    check("page has an apply button", "Apply to screen" in page)
+    check("page has an apply button", ">Apply</button>" in page)
     check("page offers bg=auto", 'value="auto"' in page)
     check("page offers the x/y fit modes", 'value="width"' in page and 'value="height"' in page)
-    check("preview JS asks for prefs=0", 'p.set("prefs", "0")' in page)
+    check("page loads the script that drives the preview",
+          'static/app.js' in page)
+    check("and that script previews the selection rather than what is stored",
+          'p.set("prefs", "0")' in c.get("/static/app.js").get_data(as_text=True))
     c.post("/d/tabletop-01/prefs", json={"reset": 1})
 
     print("\nvideo frames")
@@ -518,11 +521,12 @@ def main() -> int:
     check("hand-copied files are recognised", by_key["file:intro.mjpeg"]["file"] == "intro.mjpeg")
     check("the row on screen sorts first", st["entries"][0]["shown"])
     page = c.get("/d/tabletop-01/").get_data(as_text=True)
-    check("device page shows memory in use", "Memory cache: 1.2 MB of 4.8 MB" in page)
+    check("device page shows memory in use", "Memory 1.2 MB of 4.8 MB" in page)
     check("and the cached items", "intro.mjpeg" in page and "on screen" in page)
     check("library row carries a cached badge", 'class="cached"' in page)
-    check("index card shows memory too",
-          "Memory cache: 1.2 MB of 4.8 MB" in c.get("/").get_data(as_text=True))
+    # The overview says it as a bar and a line, not a sentence.
+    idx = c.get("/").get_data(as_text=True)
+    check("index card shows memory too", "1.2 MB / 4.8 MB" in idx)
 
     print("\npages")
     check("device page", c.get("/d/tabletop-01/").status_code == 200)

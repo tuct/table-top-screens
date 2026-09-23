@@ -32,7 +32,7 @@ Each screen also says what it can do, in the same TXT record:
 | `round` | `0` / `1` | visible area is a circle |
 | `img` | `jpeg,rgb565` | still formats the firmware accepts |
 | `anim` | `gif,apng,webp` or `none` | animation sources it can play |
-| `sd` | `0` / `1` | stores stills on an SD card when one is mounted |
+| `sd` | `0` / `1` | has an SD card slot, so the card is worth asking about |
 | `clip` | `frames` / `mjpeg` | how it takes clips: per-frame fetches, or one `/clip.mjpeg` |
 
 The server acts on these. An animated item whose format is not in `anim` is
@@ -155,7 +155,24 @@ many live screens were told to refresh.
 | `GET` | `/d/<device>/clip.mjpeg` | The whole clip as one TTMJ file (`w`, `h`, `q`, `fps`, `max`) |
 | `POST` | `/d/<device>/state` | A screen reports what it holds (sent by the screen on change) |
 | `GET` | `/d/<device>/state` | That last report, one row per cached item |
+| `POST` | `/d/<device>/remove` | Forget a screen. Offline only (409 otherwise); its pictures stay |
+| `POST` | `/screens/refresh` | Knock on every screen; ones that do not answer go offline, remembered ones that do come back |
+| `GET` | `/scenes` | Every scene (JSON) |
+| `POST` | `/scenes` | Save what the chosen screens show: `name`, `screens[]` + `pick=1` |
+| `POST` | `/scenes/<id>/apply` | Put it back on the screens |
+| `POST` | `/scenes/<id>/update` | Save into this scene: name, screens, and what they show now |
+| `POST` | `/scenes/<id>/saveas` | Save as a new scene, never replacing by name |
+| `POST` | `/scenes/<id>/labels` | Rename / describe, touching nothing it recorded |
+| `POST` | `/scenes/<id>/duplicate` | Copy it under a free name |
+| `POST` | `/scenes/release` | Leave the scene you are in; deletes nothing |
+| `GET` | `/scenes/state` | Which scene is on screen and which is starred, for a page that did not reload |
+| `DELETE` | `/scenes/<id>` | Delete a scene (`POST .../delete` for forms) |
 | `GET` | `/healthz` | Liveness + whether QOI is available |
+
+Scene requests that carry `screens[]` must also carry `pick=1` (a hidden field
+in the page's form). Without it there is no way to tell "no screens ticked"
+from a caller that never offered the choice — and that caller, the JSON API,
+keeps the old behaviour of taking every screen, online or not.
 
 ### Variants: a picture plus how it is framed
 
