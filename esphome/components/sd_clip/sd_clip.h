@@ -15,8 +15,13 @@
 
 #ifdef USE_ESP32
 
-#ifdef USE_SD_CLIP_HW_JPEG
+#if defined(USE_SD_CLIP_HW_JPEG)
 #include "driver/jpeg_decode.h"
+#elif defined(USE_SD_CLIP_ESP_NEW_JPEG)
+// Espressif's software decoder, SIMD-optimised on the S3. Used in BLOCK mode,
+// which hands back 8 or 16 rows at a time -- so, like JPEGDEC, it never needs
+// a whole frame in memory.
+#include "esp_jpeg_dec.h"
 #else
 // JPEGDEC's header defines the class; forward declarations keep it out of
 // every translation unit that includes this one.
@@ -335,9 +340,13 @@ class SdClip : public Component {
   /// `stride` is the source row length in PIXELS, which the hardware decoder
   /// rounds up to a multiple of 16.
   void blit_image_(const uint8_t *pixels, int img_w, int img_h, int stride);
-#ifdef USE_SD_CLIP_HW_JPEG
+#if defined(USE_SD_CLIP_HW_JPEG)
   bool ensure_hw_jpeg_();
   bool hw_decode_(const uint8_t *data, size_t len);
+#elif defined(USE_SD_CLIP_ESP_NEW_JPEG)
+  bool esp_new_decode_(const uint8_t *data, size_t len);
+  /// One band of rows from a block-mode decode, placed on the panel.
+  void blit_band_(const uint8_t *pixels, int img_w, int img_h, int y, int rows);
 #else
   bool sw_decode_(const uint8_t *data, size_t len);
   static int jpeg_draw_(jpeg_draw_tag *draw);
@@ -402,6 +411,12 @@ class SdClip : public Component {
   size_t hw_in_cap_{0};
   uint8_t *hw_out_{nullptr};
   size_t hw_out_cap_{0};
+#elif defined(USE_SD_CLIP_ESP_NEW_JPEG)
+  // Reused across frames: the band buffer the decoder writes into, kept at
+  // the largest size any frame has needed so far. 16-byte aligned, which
+  // `jpeg_calloc_align` guarantees and the S3's SIMD path requires.
+  uint8_t *nj_out_{nullptr};
+  int nj_out_cap_{0};
 #else
   JPEGDEC *jpeg_{nullptr};
 #endif

@@ -23,14 +23,22 @@ frames held in PSRAM and decoded straight to the panel. That works because the
 slow part of ESPHome's decoder is its per-pixel output, not the JPEG decode
 itself. `max_bytes` caps how much of a clip is held in memory.
 
-Two decoders, chosen by `jpeg_decoder` (default `auto`):
+Three decoders, chosen by `jpeg_decoder` (default `auto`):
 
-* `software`  JPEGDEC, block callback straight to draw_pixels_at(). The only
-              option on an ESP32-S3.
+* `software`  JPEGDEC, block callback straight to draw_pixels_at().
 * `hardware`  the ESP32-P4's JPEG peripheral (esp_driver_jpeg), which decodes
               a whole frame to RGB565 in one call. Measured on a 480x800
               panel, software took 99-141 ms a frame -- about 7-10 fps, under
-              the 15 fps the server resamples to.
+              the 15 fps the server resamples to -- against 12-16 ms here.
+* `esp_new`   espressif/esp_new_jpeg, software but SIMD-optimised on the S3,
+              run in block mode so it costs one band of rows rather than a
+              frame. Measured on the 240x240 round screen: 58 ms a frame
+              against JPEGDEC's 72, which is the difference between holding
+              15 fps and falling to 13.6. Software-only, so pointless on the
+              P4, where the peripheral is ten times quicker again.
+
+`auto` is `hardware` on the P4 and `esp_new` everywhere else. `software`
+stays as the fallback if esp_new ever misreads a file.
 """
 
 import esphome.codegen as cg
@@ -107,7 +115,7 @@ CONFIG_SCHEMA = cv.Schema(
         # `auto` means the JPEG peripheral on an ESP32-P4 and JPEGDEC on
         # anything else. Only the P4 has the peripheral.
         cv.Optional(CONF_JPEG_DECODER, default="auto"): cv.one_of(
-            "auto", "hardware", "software", lower=True
+            "auto", "hardware", "software", "esp_new", lower=True
         ),
         # Hardware decoder only: which way round the colour channels come out.
         # BGR by default because that is what Waveshare's own P4 player uses
@@ -138,7 +146,11 @@ async def to_code(config):
     decoder = config[CONF_JPEG_DECODER]
     is_p4 = get_esp32_variant() == VARIANT_ESP32P4
     if decoder == "auto":
-        decoder = "hardware" if is_p4 else "software"
+        # Measured on tabletop-02 (240x240, ESP32-S3), same 151-frame clip:
+        # JPEGDEC 72 ms a frame and 13.6 fps against a 15 fps target;
+        # esp_new_jpeg 58 ms and a steady 15.2. It costs 74 KB of flash and
+        # 6.5 KB of RAM, which is worth hitting the rate.
+        decoder = "hardware" if is_p4 else "esp_new"
     elif decoder == "hardware" and not is_p4:
         raise cv.Invalid(
             "jpeg_decoder: hardware needs the JPEG peripheral, which only the "
@@ -149,6 +161,11 @@ async def to_code(config):
         # esp_driver_jpeg ships with ESP-IDF; nothing to pull in, and JPEGDEC
         # is not linked at all on this path.
         cg.add_define("USE_SD_CLIP_HW_JPEG")
+    elif decoder == "esp_new":
+        # Espressif's own software decoder. Pulled in only when asked for, so
+        # JPEGDEC is not linked as well.
+        cg.add_define("USE_SD_CLIP_ESP_NEW_JPEG")
+        add_idf_component(name="espressif/esp_new_jpeg", ref="1.0.2")
     else:
         # The same JPEGDEC, at the same version, that runtime_image pulls in
         # for online_image's JPEG format, so a device using both links one copy.

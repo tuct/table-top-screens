@@ -32,6 +32,7 @@
 substitutions:
   anim_formats: gif,apng,webp
   clip_transport: mjpeg
+  clip_jpeg_decoder: auto
   clip_max_bytes: "4000000"
   clip_cache_bytes: "5000000"
   clip_quality: "80"
@@ -52,6 +53,10 @@ sd_clip:
   height: ${display_height}
   max_bytes: ${clip_max_bytes}
   cache_bytes: ${clip_cache_bytes}
+  # auto: the P4's JPEG peripheral, JPEGDEC everywhere else. Set
+  # `clip_jpeg_decoder: esp_new` in a device file to try Espressif's
+  # SIMD-optimised software decoder instead, and watch `Clip Decode`.
+  jpeg_decoder: ${clip_jpeg_decoder}
 
 globals:
   - id: mjpeg_frames_prev

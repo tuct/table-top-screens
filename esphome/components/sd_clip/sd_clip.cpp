@@ -15,7 +15,7 @@
 #include <new>
 #include <vector>
 
-#ifndef USE_SD_CLIP_HW_JPEG
+#if !defined(USE_SD_CLIP_HW_JPEG) && !defined(USE_SD_CLIP_ESP_NEW_JPEG)
 #include <JPEGDEC.h>
 #endif
 
@@ -1239,8 +1239,10 @@ bool SdClip::show_frame_(size_t index) {
   const size_t len = item->size[index];
 
   const uint32_t t0 = micros();
-#ifdef USE_SD_CLIP_HW_JPEG
+#if defined(USE_SD_CLIP_HW_JPEG)
   const bool ok = this->hw_decode_(data, len);
+#elif defined(USE_SD_CLIP_ESP_NEW_JPEG)
+  const bool ok = this->esp_new_decode_(data, len);
 #else
   const bool ok = this->sw_decode_(data, len);
 #endif
@@ -1362,6 +1364,108 @@ bool SdClip::hw_decode_(const uint8_t *data, size_t len) {
   return true;
 }
 
+#elif defined(USE_SD_CLIP_ESP_NEW_JPEG)
+
+// esp_new_jpeg, in block mode: the decoder hands back one MCU band (8 or 16
+// rows) per call, each of which goes straight to the panel. That keeps the
+// memory cost to one band -- the same trade JPEGDEC makes -- while getting
+// the SIMD-optimised inner loop on the S3.
+bool SdClip::esp_new_decode_(const uint8_t *data, size_t len) {
+  jpeg_dec_config_t cfg = DEFAULT_JPEG_DEC_CONFIG();
+  // The decoder writes the panel's own byte order, so no swap on the way out.
+  cfg.output_type = this->big_endian_ ? JPEG_PIXEL_FORMAT_RGB565_BE : JPEG_PIXEL_FORMAT_RGB565_LE;
+  cfg.block_enable = true;
+
+  // Opened per frame: the handle carries the state of one decode, and the
+  // library's own examples open and close around each image.
+  jpeg_dec_handle_t dec = nullptr;
+  if (jpeg_dec_open(&cfg, &dec) != JPEG_ERR_OK) {
+    ESP_LOGW(TAG, "esp_new_jpeg: cannot open the decoder");
+    return false;
+  }
+
+  jpeg_dec_io_t io{};
+  io.inbuf = const_cast<uint8_t *>(data);
+  io.inbuf_len = static_cast<int>(len);
+  jpeg_dec_header_info_t info{};
+  jpeg_error_t err = jpeg_dec_parse_header(dec, &io, &info);
+  if (err != JPEG_ERR_OK) {
+    ESP_LOGW(TAG, "esp_new_jpeg: not a JPEG it can read (error %d)", static_cast<int>(err));
+    jpeg_dec_close(dec);
+    return false;
+  }
+  // Block mode decodes whole MCUs only. The server renders at panel size and
+  // every panel here is a multiple of 8, so this should not fire.
+  if ((info.width % 8) != 0 || (info.height % 8) != 0) {
+    ESP_LOGW(TAG, "esp_new_jpeg: %ux%u is not a multiple of 8; block mode cannot decode it",
+             info.width, info.height);
+    jpeg_dec_close(dec);
+    return false;
+  }
+
+  int band_len = 0, bands = 0;
+  if (jpeg_dec_get_outbuf_len(dec, &band_len) != JPEG_ERR_OK ||
+      jpeg_dec_get_process_count(dec, &bands) != JPEG_ERR_OK || band_len <= 0 || bands <= 0) {
+    ESP_LOGW(TAG, "esp_new_jpeg: cannot size the output");
+    jpeg_dec_close(dec);
+    return false;
+  }
+  if (band_len > this->nj_out_cap_) {
+    if (this->nj_out_ != nullptr)
+      jpeg_free_align(this->nj_out_);
+    this->nj_out_ = static_cast<uint8_t *>(jpeg_calloc_align(static_cast<size_t>(band_len), 16));
+    this->nj_out_cap_ = this->nj_out_ == nullptr ? 0 : band_len;
+    if (this->nj_out_ == nullptr) {
+      ESP_LOGE(TAG, "esp_new_jpeg: no memory for a %d byte band", band_len);
+      jpeg_dec_close(dec);
+      return false;
+    }
+    ESP_LOGD(TAG, "esp_new_jpeg: %d byte band buffer, %d bands", band_len, bands);
+  }
+  io.outbuf = this->nj_out_;
+
+  // Rows per band, from the band's size: the decoder does not say directly.
+  const int rows = band_len / (static_cast<int>(info.width) * 2);
+  int y = 0;
+  for (int i = 0; i < bands; i++) {
+    err = jpeg_dec_process(dec, &io);
+    if (err != JPEG_ERR_OK) {
+      ESP_LOGW(TAG, "esp_new_jpeg: decode failed at row %d (error %d)", y, static_cast<int>(err));
+      jpeg_dec_close(dec);
+      return false;
+    }
+    // The last band is short when the height is not a whole number of MCUs.
+    const int got = io.out_size > 0 ? io.out_size / (static_cast<int>(info.width) * 2) : rows;
+    this->blit_band_(this->nj_out_, static_cast<int>(info.width), static_cast<int>(info.height), y,
+                     std::min(got, static_cast<int>(info.height) - y));
+    y += got;
+    if (y >= static_cast<int>(info.height))
+      break;
+  }
+  jpeg_dec_close(dec);
+  return true;
+}
+
+void SdClip::blit_band_(const uint8_t *pixels, int img_w, int img_h, int y, int rows) {
+  if (rows <= 0)
+    return;
+  // Same centring and clipping as blit_image_, but for a slice of the image:
+  // the band's own top edge is `y` rows down from the image's.
+  const int ox = (this->width_ - img_w) / 2;
+  const int oy = (this->height_ - img_h) / 2 + y;
+  const int skip_left = ox < 0 ? -ox : 0;
+  const int skip_top = oy < 0 ? -oy : 0;
+  const int x0 = ox + skip_left;
+  const int y0 = oy + skip_top;
+  const int w = std::min(img_w - skip_left, this->width_ - x0);
+  const int h = std::min(rows - skip_top, this->height_ - y0);
+  if (w <= 0 || h <= 0)
+    return;
+  this->display_->draw_pixels_at(x0, y0, w, h, pixels, display::COLOR_ORDER_RGB,
+                                 display::COLOR_BITNESS_565, this->big_endian_, skip_left, skip_top,
+                                 img_w - skip_left - w);
+}
+
 #else  // software decoder
 
 bool SdClip::sw_decode_(const uint8_t *data, size_t len) {
@@ -1419,7 +1523,7 @@ int SdClip::jpeg_draw_(jpeg_draw_tag *draw) {
   return 1;
 }
 
-#endif  // USE_SD_CLIP_HW_JPEG
+#endif  // decoder choice
 
 }  // namespace sd_clip
 }  // namespace esphome
