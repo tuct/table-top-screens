@@ -32,7 +32,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from flask import (Flask, Response, abort, jsonify, make_response,
-                   render_template, request)
+                   render_template, request, send_file)
 from markupsafe import Markup
 from PIL import Image, ImageColor, ImageOps, ImageStat
 
@@ -64,12 +64,28 @@ PORT = 8099
 # point of diminishing returns rather than 100. Paired with subsampling=0 in
 # render(), which matters far more than quality for sharp colour edges.
 DEFAULT_QUALITY = 95
-MAX_UPLOAD = 32 * 1024 * 1024
+# A ceiling on one upload. Generous because a long clip is a long file: a
+# minute of 480x800 at 15 fps is tens of megabytes before the server has
+# resampled anything, and a screen that streams from its card can play far
+# more than it could ever hold. Flask reads the body into memory, so this is
+# also the most one request can cost the server.
+MAX_UPLOAD = 256 * 1024 * 1024
 RENDER_CACHE_SIZE = 32
 DEVICE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD
+
+
+@app.errorhandler(413)
+def too_large(err):  # noqa: ANN001 - Flask handler signature
+    """Say what the limit is, rather than just refusing."""
+    limit = f"{MAX_UPLOAD // (1024 * 1024)} MB"
+    if from_browser_form():
+        return Response(f"That file is larger than the {limit} limit.", status=413,
+                        content_type="text/plain; charset=utf-8")
+    return jsonify({"error": str(getattr(err, "description", "too large")),
+                    "limit_bytes": MAX_UPLOAD}), 413
 
 # Screens announce themselves over mDNS; this browses for them and pushes each
 # one its content URL. Nothing here needs to be told an address.
@@ -181,8 +197,6 @@ registry.version_provider = _version_for
 _render_cache: OrderedDict[tuple, tuple[bytes, str]] = OrderedDict()
 # (source_hash, params) -> (clip bytes, frame count). Few entries: a clip is
 # megabytes, and only the screens' current clips are ever asked for.
-_clip_cache: OrderedDict[tuple, tuple[bytes, int]] = OrderedDict()
-CLIP_CACHE_SIZE = 4
 
 
 # --------------------------------------------------------------------------
@@ -342,6 +356,9 @@ def cache_entries(state: dict | None) -> list[dict]:
         if isinstance(entry, list) and len(entry) >= 2:
             rows.setdefault(str(entry[0]), {})["mem"] = int(entry[1])
             rows[str(entry[0])]["frames"] = int(entry[2]) if len(entry) > 2 else None
+            # A clip too big to hold is played off the card; what it costs in
+            # memory is only its index.
+            rows[str(entry[0])]["streamed"] = bool(entry[3]) if len(entry) > 3 else False
     for entry in report.get("card") or []:
         if isinstance(entry, list) and len(entry) >= 2:
             rows.setdefault(str(entry[0]), {})["card"] = int(entry[1])
@@ -855,16 +872,50 @@ CLIP_VERSION = 1
 CLIP_HEADER = struct.Struct("<4sHHHHI")
 CLIP_RECORD = struct.Struct("<I")
 CLIP_QUALITY = 80
-CLIP_MAX_BYTES = 64 * 1024 * 1024
+# A clip is built to disk and the screens stream it off their card, so this
+# is about what one screen can sensibly be asked to hold, not about memory.
+CLIP_MAX_BYTES = 1024 * 1024 * 1024
+# What every built clip may occupy together. The oldest unused files go first.
+CLIP_CACHE_BYTES = 4 * 1024 * 1024 * 1024
+
+
+def clip_file(etag: str) -> Path:
+    """Where a built clip lives. Named by its ETag, which already covers the
+    picture and every render parameter."""
+    folder = DATA_DIR / "_clips"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / (etag.strip('"') + ".ttmj")
+
+
+def clip_cache_prune(budget: int = CLIP_CACHE_BYTES) -> int:
+    """Drop the least recently used built clips. Returns bytes freed."""
+    folder = DATA_DIR / "_clips"
+    if not folder.exists():
+        return 0
+    files = sorted((f for f in folder.glob("*.ttmj")), key=lambda f: f.stat().st_atime)
+    total = sum(f.stat().st_size for f in files)
+    freed = 0
+    for f in files:
+        if total - freed <= budget:
+            break
+        size = f.stat().st_size
+        f.unlink(missing_ok=True)
+        freed += size
+    return freed
 
 
 class ClipTooLarge(Exception):
     """Even the first frame does not fit the device's byte budget."""
 
 
-def build_clip(body: bytes | None, w: int, h: int, fps: int, max_bytes: int,
-               framing: tuple, still: bool = False) -> tuple[bytes, int]:
-    """One cycle of the clip at `fps`, as TTMJ, truncated to `max_bytes`.
+def write_clip(out, body: bytes | None, w: int, h: int, fps: int, max_bytes: int,
+               framing: tuple, still: bool = False) -> int:
+    """Write one cycle of the clip to `out` as TTMJ. Returns the frame count.
+
+    Written a frame at a time, never assembled whole: a long clip is bigger
+    than anything the server should hold in memory, and the screens can now
+    play one straight off their card. The header is rewritten at the end,
+    once the count is known.
 
     Frames are encoded once per distinct SOURCE frame: resampling a slow GIF
     to a high rate repeats frames, and repeats reuse the same JPEG bytes.
@@ -873,35 +924,53 @@ def build_clip(body: bytes | None, w: int, h: int, fps: int, max_bytes: int,
     # A clip is many frames in a fixed byte budget, so its frames are encoded
     # 4:2:0. A one-frame item is a still and keeps 4:4:4.
     subsampling = 0 if still else 2
+    out.write(CLIP_HEADER.pack(CLIP_MAGIC, CLIP_VERSION, w, h, fps, 0))
+    used = CLIP_HEADER.size
+    count = 0
+
     if still:
         # A still is a one-frame clip, so a screen can hold stills and clips in
         # the same cache and show both through one decoder.
         jpeg, _ = render(body, w, h, "jpeg", fit, quality, bg, rot, zoom)
-        if CLIP_HEADER.size + CLIP_RECORD.size + len(jpeg) > max_bytes:
+        if used + CLIP_RECORD.size + len(jpeg) > max_bytes:
             raise ClipTooLarge
-        return (CLIP_HEADER.pack(CLIP_MAGIC, CLIP_VERSION, w, h, fps, 1)
-                + CLIP_RECORD.pack(len(jpeg)) + jpeg), 1
-    indices = frames.resample(frames.durations(body), fps)
-    encoded: dict[int, bytes] = {}
-    for n, img in frames.iter_frames(body, indices, w, h):
-        encoded[n], _ = render_image(img, w, h, "jpeg", fit, quality, bg, rot, zoom,
-                                     subsampling)
+        out.write(CLIP_RECORD.pack(len(jpeg)))
+        out.write(jpeg)
+        count = 1
+    else:
+        indices = frames.resample(frames.durations(body), fps)
+        # Keyed by source frame: a repeat writes the same JPEG again without
+        # re-encoding it, which is most of the work on a slow GIF.
+        encoded: dict[int, bytes] = {}
+        for n, img in frames.iter_frames(body, indices, w, h):
+            encoded[n], _ = render_image(img, w, h, "jpeg", fit, quality, bg, rot, zoom,
+                                         subsampling)
+        for n in indices:
+            jpeg = encoded[n]
+            cost = CLIP_RECORD.size + len(jpeg)
+            if used + cost > max_bytes:
+                break
+            out.write(CLIP_RECORD.pack(len(jpeg)))
+            out.write(jpeg)
+            used += cost
+            count += 1
+        if count == 0:
+            raise ClipTooLarge
 
-    parts: list[bytes] = []
-    used = CLIP_HEADER.size
-    for n in indices:
-        jpeg = encoded[n]
-        cost = CLIP_RECORD.size + len(jpeg)
-        if used + cost > max_bytes:
-            break
-        parts.append(CLIP_RECORD.pack(len(jpeg)))
-        parts.append(jpeg)
-        used += cost
-    count = len(parts) // 2
-    if count == 0:
-        raise ClipTooLarge
-    header = CLIP_HEADER.pack(CLIP_MAGIC, CLIP_VERSION, w, h, fps, count)
-    return header + b"".join(parts), count
+    # The count was not known until the last frame fit.
+    out.seek(0)
+    out.write(CLIP_HEADER.pack(CLIP_MAGIC, CLIP_VERSION, w, h, fps, count))
+    out.seek(0, io.SEEK_END)
+    return count
+
+
+def build_clip(body: bytes | None, w: int, h: int, fps: int, max_bytes: int,
+               framing: tuple, still: bool = False) -> tuple[bytes, int]:
+    """The whole clip in memory. For callers small enough to want it -- tests,
+    and the preview paths. Everything serving a screen writes to a file."""
+    buf = io.BytesIO()
+    count = write_clip(buf, body, w, h, fps, max_bytes, framing, still)
+    return buf.getvalue(), count
 
 
 @app.get("/d/<device>/clip.mjpeg")
@@ -948,29 +1017,40 @@ def get_clip(device: str):
     if request.headers.get("If-None-Match") == etag:
         return Response(status=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
 
-    key = (sha, params)
-    hit = _clip_cache.get(key)
-    if hit is None:
+    # Built to a file and served from it, never held whole: a long clip is
+    # larger than the server should keep in memory, and the file doubles as
+    # the cache -- asking for the same clip again is a sendfile, not a build.
+    path = clip_file(etag)
+    if not path.exists():
+        tmp = path.with_suffix(".part")
         try:
-            hit = build_clip(body, w, h, fps, max_bytes, (fit, quality, bg, rot, zoom), still)
+            with tmp.open("wb") as fh:
+                count = write_clip(fh, body, w, h, fps, max_bytes,
+                                   (fit, quality, bg, rot, zoom), still)
         except ClipTooLarge:
+            tmp.unlink(missing_ok=True)
             abort(413, "the first frame alone exceeds max")
-        _clip_cache[key] = hit
-        while len(_clip_cache) > CLIP_CACHE_SIZE:
-            _clip_cache.popitem(last=False)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+        tmp.rename(path)
+        clip_cache_prune()
     else:
-        _clip_cache.move_to_end(key)
-    out, count = hit
-    return Response(
-        out,
-        content_type="application/octet-stream",
-        headers={
-            "ETag": etag,
-            "Cache-Control": "no-cache",
-            "Content-Length": str(len(out)),
-            "X-Frame-Count": str(count),
-        },
-    )
+        with path.open("rb") as fh:
+            count = CLIP_HEADER.unpack(fh.read(CLIP_HEADER.size))[5]
+        os.utime(path, None)  # it is the least recently USED that goes
+
+    return send_file(
+        path,
+        mimetype="application/octet-stream",
+        conditional=True,
+        etag=False,
+        last_modified=None,
+    ), 200, {
+        "ETag": etag,
+        "Cache-Control": "no-cache",
+        "X-Frame-Count": str(count),
+    }
 
 
 @app.get("/d/<device>/frame")
@@ -1458,6 +1538,8 @@ def cache_view(device: str) -> dict | None:
         extra = []
         if r.get("frames") and r["frames"] > 1:
             extra.append(f"{r['frames']} frames")
+        if r.get("streamed"):
+            extra.append("streamed from card")
         if r["fps"]:
             extra.append(f"{r['fps']} fps")
         if r["framed"]:

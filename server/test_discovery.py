@@ -252,6 +252,19 @@ def main() -> int:
                   srv.registry.current_url(screen) is None
                   and not srv.registry.verify_url(screen)))
 
+        print("\na clip too big to hold is reported as streamed, not as absent")
+        big = {"report": {"budget": 16000000, "used": 8000,
+                          "shown": "abc.def-f15-q80",
+                          "mem": [["abc.def-f15-q80", 8000, 1000, 1]],
+                          "card": [["abc.def-f15-q80", 52000000]]},
+               "at": time.time()}
+        srv.library.set_screen_state(srv.DATA_DIR, DEVICE, big)
+        row = srv.cache_entries(big)[0]
+        results.append(check("the report says it is streamed", row.get("streamed") is True))
+        results.append(
+            check("and the page says where it is playing from",
+                  b"streamed from card" in client.get(f"/d/{DEVICE}/").data))
+
         r = client.get(f"/d/{DEVICE}/")
         results.append(
             check("the screen's own page says the card is there too",

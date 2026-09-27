@@ -131,6 +131,18 @@ interval:
             }
           }
 
+          // Before anything else: if a frame of ours is on the panel, say so.
+          // The event below is the same news, but it only arrives on the tick
+          // AFTER the frame lands -- and in that gap the 500ms boot checklist
+          // can paint over it. A clip survives that (the next frame wipes it);
+          // a still does not, and the text simply stays. Hence both: say it
+          // early, and put the picture back if the checklist got there first.
+          if (id(clip)->is_showing() && !id(content_on_sd)) {
+            id(content_on_sd) = true;
+            id(content_loaded) = true;
+            id(clip)->redraw();
+          }
+
           switch (id(clip)->take_item_event()) {
             case SdClip::ITEM_SHOWN:
               failures = 0;

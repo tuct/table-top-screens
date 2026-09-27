@@ -242,6 +242,11 @@ class SdClip : public Component {
   /// empty.
   std::string shown_key() const { return this->shown_ != nullptr ? this->shown_->key : ""; }
   int shown_frames() const { return this->shown_ != nullptr ? (int) this->shown_->off.size() : 0; }
+  /// True once something of ours is actually on the panel. What the boot
+  /// checklist has to know before it paints over it.
+  bool is_showing() const { return this->shown_ != nullptr && this->frames_shown_ > 0; }
+  /// Put the current frame back, after something else drew over it.
+  bool redraw();
   size_t shown_bytes() const { return this->shown_ != nullptr ? this->shown_->len : 0; }
   size_t cache_count() const { return this->cache_.size(); }
   size_t cache_used() const;
@@ -314,11 +319,20 @@ class SdClip : public Component {
   /// An item in PSRAM.
   struct Item {
     std::string key;
+    /// The clip's bytes, when it is held in memory. Null when it is streamed
+    /// off the card instead -- see `path`.
     uint8_t *buf{nullptr};
     size_t len{0};
+    /// Card path, for an item too big to hold: its frames are read as they
+    /// are shown. Only the index lives in memory then, 8 bytes a frame, so
+    /// length is bounded by the card rather than by PSRAM.
+    std::string path;
+    int fd{-1};             ///< open while streamed, closed when evicted
+    uint32_t widest{0};     ///< biggest frame, which is the read buffer size
     std::vector<uint32_t> off;
     std::vector<uint32_t> size;
     uint32_t used{0};  ///< millis() of last show, for LRU eviction
+    bool streamed() const { return this->buf == nullptr; }
     ~Item();
   };
   Item *find_item_(const std::string &key);
@@ -328,6 +342,11 @@ class SdClip : public Component {
   uint8_t *reserve_(size_t len);
   void evict_(Item *item);
   bool start_load_(const std::string &key, const std::string &path);
+  /// Index a clip on the card without reading it in, and play it from there.
+  /// The alternative to start_load_ for a file bigger than `max_bytes`.
+  bool start_stream_(const std::string &key, const std::string &path);
+  /// One frame of a streamed item, read into `stream_buf_`.
+  const uint8_t *read_frame_(const Item *item, size_t index, size_t &len);
   void pump_load_();
   void abort_load_();
   /// Index `buf` into a cached item; takes ownership of `buf` either way.
@@ -391,6 +410,11 @@ class SdClip : public Component {
     std::string path;
     uint32_t started{0};
   } load_;
+
+  /// Holds one frame of whatever is being streamed. Grown to fit, never
+  /// shrunk: clips do not change size while they play.
+  uint8_t *stream_buf_{nullptr};
+  size_t stream_cap_{0};
 
   size_t max_bytes_{4000000};
   size_t cache_bytes_{5000000};

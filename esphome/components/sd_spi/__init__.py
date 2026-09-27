@@ -1,4 +1,17 @@
-"""SD card over SPI, sharing a bus that ESPHome already owns.
+"""SD card: over SPI on a bus ESPHome already owns, or over SDMMC.
+
+Two transports, one component, because only the MOUNT differs between them --
+everything above it is VFS, which does not care how the bytes arrive. Give it
+`cs_pin`/`spi_host` for SPI, or `clk_pin`/`cmd_pin`/`data_pins` for SDMMC.
+
+The name is now half a lie, kept because `sd_clip` includes this header and
+every board names it; the alternative was 350 duplicated lines in a second
+component, since ESPHome copies external sources only for components it
+actually loads.
+
+SPI gives a few hundred KB/s and SDMMC several MB/s, which is the difference
+between holding a clip in PSRAM and reading it off the card as it plays. Only
+the ESP32-P4 board here is wired for SDMMC; the other two cannot be.
 
 Both boards here need it, for different reasons:
 
@@ -35,8 +48,14 @@ from esphome.components.esp32 import include_builtin_idf_component
 from esphome.const import CONF_CS_PIN, CONF_DATA_RATE, CONF_ID
 
 CODEOWNERS = ["@tabletop_mini_screens"]
-DEPENDENCIES = ["esp32", "spi"]
+# Not "spi": a board whose card is on SDMMC has no SPI bus to speak of.
+DEPENDENCIES = ["esp32"]
 
+CONF_SLOT = "slot"
+CONF_CLK_PIN = "clk_pin"
+CONF_CMD_PIN = "cmd_pin"
+CONF_DATA_PINS = "data_pins"
+CONF_LDO_CHANNEL = "ldo_channel"
 CONF_MOUNT_POINT = "mount_point"
 CONF_SPI_HOST = "spi_host"
 CONF_FORMAT_IF_MOUNT_FAILED = "format_if_mount_failed"
@@ -58,9 +77,43 @@ def _validate_mount_point(value):
     return value
 
 
-CONFIG_SCHEMA = cv.Schema(
-    {
+def _validate_data_pins(value):
+    value = cv.ensure_list(pins.internal_gpio_output_pin_number)(value)
+    if len(value) not in (1, 4):
+        raise cv.Invalid("data_pins must list 1 pin (1-bit) or 4 pins (4-bit)")
+    return value
+
+
+def _one_transport(config):
+    """SPI or SDMMC, never both -- a card is wired one way."""
+    mmc = [k for k in (CONF_CLK_PIN, CONF_CMD_PIN, CONF_DATA_PINS) if k in config]
+    if mmc and CONF_SPI_HOST in config:
+        raise cv.Invalid(
+            f"{CONF_SPI_HOST} is for a card on SPI; {', '.join(mmc)} for one on "
+            "SDMMC. Give one set or the other."
+        )
+    if mmc and len(mmc) != 3:
+        missing = {CONF_CLK_PIN, CONF_CMD_PIN, CONF_DATA_PINS} - set(mmc)
+        raise cv.Invalid(f"an SDMMC card also needs {', '.join(sorted(missing))}")
+    return config
+
+
+CONFIG_SCHEMA = cv.All(
+    cv.Schema(
+        {
         cv.GenerateID(): cv.declare_id(SdSpi),
+        # -- SDMMC: raw pin numbers, handed to the IDF driver, which wants
+        # gpio_num_t rather than an ESPHome GPIOPin.
+        # Slot 0 by default. The IDF's own default is slot 1, which on the
+        # ESP32-P4 board here carries the SDIO link to the C6 radio -- a card
+        # there works and the screen has no network.
+        cv.Optional(CONF_SLOT, default=0): cv.int_range(min=0, max=1),
+        cv.Optional(CONF_CLK_PIN): pins.internal_gpio_output_pin_number,
+        cv.Optional(CONF_CMD_PIN): pins.internal_gpio_output_pin_number,
+        cv.Optional(CONF_DATA_PINS): _validate_data_pins,
+        # The on-chip LDO that powers the slot's IO, where the SoC needs one:
+        # channel 4 on the ESP32-P4, whose channel 3 feeds the MIPI D-PHY.
+        cv.Optional(CONF_LDO_CHANNEL): cv.int_range(min=1, max=4),
         # Raw pin number: handed to the IDF sdspi driver, which wants a
         # gpio_num_t rather than an ESPHome GPIOPin.
         #
@@ -71,19 +124,21 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_CS_PIN, default="none"): cv.Any(
             cv.one_of("none", lower=True), pins.internal_gpio_output_pin_number
         ),
-        cv.Optional(CONF_SPI_HOST, default="SPI2_HOST"): cv.enum(
-            SPI_HOSTS, upper=True
-        ),
+        cv.Optional(CONF_SPI_HOST): cv.enum(SPI_HOSTS, upper=True),
         cv.Optional(CONF_MOUNT_POINT, default="/sd"): _validate_mount_point,
         cv.Optional(CONF_FORMAT_IF_MOUNT_FAILED, default=False): cv.boolean,
         cv.Optional(CONF_MAX_FILES, default=4): cv.int_range(min=1, max=16),
         # SD cards in SPI mode are reliable to ~20 MHz on typical wiring; the
         # card is negotiated down automatically if it cannot keep up.
-        cv.Optional(CONF_DATA_RATE, default="20MHz"): cv.All(
-            cv.frequency, cv.int_range(min=400_000, max=40_000_000)
+        # 20 MHz is what SPI wiring holds; SDMMC runs to 40. Either way the
+        # card is negotiated down automatically if it cannot keep up.
+        cv.Optional(CONF_DATA_RATE): cv.All(
+            cv.frequency, cv.int_range(min=400_000, max=80_000_000)
         ),
-    }
-).extend(cv.COMPONENT_SCHEMA)
+        }
+    ).extend(cv.COMPONENT_SCHEMA),
+    _one_transport,
+)
 
 
 async def to_code(config):
@@ -97,10 +152,27 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
-    cs = config[CONF_CS_PIN]
-    cg.add(var.set_cs_pin(-1 if cs == "none" else cs))
-    cg.add(var.set_spi_host(config[CONF_SPI_HOST]))
+    if CONF_CLK_PIN in config:
+        data = config[CONF_DATA_PINS]
+        cg.add(
+            var.set_sdmmc(
+                config[CONF_SLOT],
+                config[CONF_CLK_PIN],
+                config[CONF_CMD_PIN],
+                data[0],
+                *(data[1:4] if len(data) == 4 else (-1, -1, -1)),
+                len(data),
+                config.get(CONF_LDO_CHANNEL, -1),
+            )
+        )
+        default_rate = 40_000_000
+    else:
+        cs = config[CONF_CS_PIN]
+        cg.add(var.set_cs_pin(-1 if cs == "none" else cs))
+        cg.add(var.set_spi_host(config.get(CONF_SPI_HOST, 1)))
+        default_rate = 20_000_000
+
     cg.add(var.set_mount_point(config[CONF_MOUNT_POINT]))
     cg.add(var.set_format_if_mount_failed(config[CONF_FORMAT_IF_MOUNT_FAILED]))
     cg.add(var.set_max_files(config[CONF_MAX_FILES]))
-    cg.add(var.set_max_freq_khz(int(config[CONF_DATA_RATE]) // 1000))
+    cg.add(var.set_max_freq_khz(int(config.get(CONF_DATA_RATE, default_rate)) // 1000))

@@ -44,6 +44,14 @@ def sample_png(w: int = 1200, h: int = 900) -> bytes:
     return buf.getvalue()
 
 
+def gif_bytes(n: int = 3, size: tuple[int, int] = (60, 40)) -> bytes:
+    """A tiny animation, for the paths that need motion rather than a picture."""
+    shots = [Image.new("RGB", size, (40 * i, 0, 255 - 40 * i)) for i in range(n)]
+    buf = io.BytesIO()
+    shots[0].save(buf, "GIF", save_all=True, append_images=shots[1:], duration=100, loop=0)
+    return buf.getvalue()
+
+
 def parse_clip(data: bytes) -> dict | None:
     """Read a TTMJ container the way the firmware does, bounds-checked."""
     head = srv.CLIP_HEADER
@@ -537,6 +545,40 @@ def main() -> int:
     print("\ndelete")
     check("delete", c.delete("/d/tabletop-01/content").status_code == 204)
     check("404 after delete", c.get("/d/tabletop-01/image").status_code == 404)
+
+    print("\na clip is built to a file, not held in memory")
+    c.post("/d/big/content", data={"file": (io.BytesIO(gif_bytes()), "clip.gif")},
+           content_type="multipart/form-data")
+    r = c.get("/d/big/clip.mjpeg?w=60&h=40&fps=10&max=4000000")
+    # Earlier tests have built clips of their own; this one's is named by its
+    # own ETag, which already covers the picture and every parameter.
+    mine = (DATA_TEST / "_clips") / (r.headers["ETag"].strip('"') + ".ttmj")
+    check("the build lands on disk, named by its etag", mine.exists(), mine.name)
+    check("and what is served is that file",
+          mine.read_bytes() == r.data and r.data[:4] == b"TTMJ")
+    check("nothing half-built is left behind",
+          not list((DATA_TEST / "_clips").glob("*.part")))
+    again = c.get("/d/big/clip.mjpeg?w=60&h=40&fps=10&max=4000000")
+    check("asking again serves the same bytes", again.data == r.data)
+    check("and says the same frame count",
+          again.headers["X-Frame-Count"] == r.headers["X-Frame-Count"])
+    check("a budget smaller than the cache frees something",
+          srv.clip_cache_prune(0) >= len(r.data))
+    check("leaving nothing behind", not list((DATA_TEST / "_clips").glob("*.ttmj")))
+
+    print("\nthe upload limit is stated, not just enforced")
+    check("the ceiling is big enough for a clip", srv.MAX_UPLOAD >= 64 * 1024 * 1024,
+          f"{srv.MAX_UPLOAD // (1024 * 1024)} MB")
+    # Lowered for the duration, so the test does not have to send 256 MB to
+    # find out what happens when it does.
+    srv.app.config["MAX_CONTENT_LENGTH"] = 4096
+    r = c.post("/d/big/content",
+               data={"file": (io.BytesIO(b"x" * 8192), "huge.png")},
+               content_type="multipart/form-data")
+    srv.app.config["MAX_CONTENT_LENGTH"] = srv.MAX_UPLOAD
+    check("a body over it is refused with 413", r.status_code == 413, str(r.status_code))
+    check("and the refusal says the limit",
+          b"MB limit" in r.data or b"limit_bytes" in r.data, r.data[:60].decode("utf-8", "replace"))
 
     shutil.rmtree(DATA_TEST, ignore_errors=True)
     print(f"\n{sum(results)}/{len(results)} checks passed")

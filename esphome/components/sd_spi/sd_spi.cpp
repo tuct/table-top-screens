@@ -16,6 +16,91 @@ namespace sd_spi {
 static const char *const TAG = "sd_spi";
 
 bool SdSpi::try_mount_() {
+  return this->sdmmc_ ? this->mount_sdmmc_() : this->mount_spi_();
+}
+
+/// Everything a failed mount should say, once. Returns false, always.
+bool SdSpi::mount_failed_(esp_err_t err) {
+  // Deliberately not marking the component FAILED: a missing or unreadable
+  // card should not take the whole device down.
+  this->mounted_ = false;
+  this->status_set_error(LOG_STR("SD card not mounted"));
+  if (this->retries_ > 0) {
+    ESP_LOGW(TAG, "Still no card: %s", esp_err_to_name(err));
+    return false;
+  }
+  ESP_LOGE(TAG, "Mount failed: %s (%d)", esp_err_to_name(err), err);
+  return false;
+}
+
+/// The SDMMC peripheral: four data lines, and on the ESP32-P4 a slot whose IO
+/// rail comes from an on-chip LDO that has to be switched on first.
+bool SdSpi::mount_sdmmc_() {
+  esp_log_level_set("sdmmc_common", ESP_LOG_DEBUG);
+  esp_log_level_set("sdmmc_sd", ESP_LOG_DEBUG);
+  esp_log_level_set("vfs_fat_sdmmc", ESP_LOG_DEBUG);
+
+  sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+  host.slot = this->mmc_slot_;
+  host.max_freq_khz = this->max_freq_khz_;
+
+#if SOC_SDMMC_IO_POWER_EXTERNAL
+  if (this->ldo_channel_ >= 0) {
+    sd_pwr_ctrl_ldo_config_t ldo{};
+    ldo.ldo_chan_id = this->ldo_channel_;
+    sd_pwr_ctrl_handle_t pwr = nullptr;
+    const esp_err_t lerr = sd_pwr_ctrl_new_on_chip_ldo(&ldo, &pwr);
+    if (lerr != ESP_OK) {
+      ESP_LOGE(TAG, "Cannot power the card slot from LDO channel %d: %s", this->ldo_channel_,
+               esp_err_to_name(lerr));
+      return this->mount_failed_(lerr);
+    }
+    host.pwr_ctrl_handle = pwr;
+  }
+#endif
+
+  sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+  slot.width = this->mmc_width_;
+  // Cards idle their data lines high; without pull-ups a floating D3 reads as
+  // "SPI mode wanted" and the card never answers.
+  slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+#ifdef SOC_SDMMC_USE_GPIO_MATRIX
+  slot.clk = static_cast<gpio_num_t>(this->mmc_clk_);
+  slot.cmd = static_cast<gpio_num_t>(this->mmc_cmd_);
+  slot.d0 = static_cast<gpio_num_t>(this->mmc_d_[0]);
+  if (this->mmc_width_ == 4) {
+    slot.d1 = static_cast<gpio_num_t>(this->mmc_d_[1]);
+    slot.d2 = static_cast<gpio_num_t>(this->mmc_d_[2]);
+    slot.d3 = static_cast<gpio_num_t>(this->mmc_d_[3]);
+  }
+#endif
+
+  esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
+  mount_config.format_if_mount_failed = this->format_if_mount_failed_;
+  mount_config.max_files = this->max_files_;
+  mount_config.allocation_unit_size = 16 * 1024;
+
+  const esp_err_t err = esp_vfs_fat_sdmmc_mount(this->mount_point_.c_str(), &host, &slot,
+                                                &mount_config, &this->card_);
+  if (err != ESP_OK) {
+    if (err == ESP_FAIL) {
+      ESP_LOGE(TAG, "  Card answered, but its filesystem could not be mounted.");
+      ESP_LOGE(TAG, "  Format it FAT32 with an MBR partition table.");
+    } else {
+      ESP_LOGE(TAG, "  Card did not respond. Check that a card is inserted.");
+    }
+    return this->mount_failed_(err);
+  }
+
+  this->mounted_ = true;
+  this->status_clear_error();
+  ESP_LOGI(TAG, "Mounted %s over SDMMC slot %d (%d-bit, %d kHz)", this->mount_point_.c_str(),
+           this->mmc_slot_, this->mmc_width_, this->max_freq_khz_);
+  this->self_test_();
+  return true;
+}
+
+bool SdSpi::mount_spi_() {
   // Let the IDF's own SD layers talk. sdmmc_common logs the card's CID/CSD as
   // it initialises, and vfs_fat_sdmmc logs why f_mount refused -- neither of
   // which we can print ourselves on failure, because esp_vfs_fat_sdspi_mount

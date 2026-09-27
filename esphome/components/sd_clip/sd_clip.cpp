@@ -54,6 +54,11 @@ class WdtPause {
 
 static const char *const TAG = "sd_clip";
 
+// Little- and big-endian reads, used by the indexers and by the streamer.
+uint16_t rd16le(const uint8_t *p) { return p[0] | (p[1] << 8); }
+uint32_t rd32le(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<uint32_t>(p[3]) << 24); }
+uint16_t rd16be(const uint8_t *p) { return (p[0] << 8) | p[1]; }
+
 /// mkdir, but only where there is a filesystem to make it in. Without a card
 /// driver the VFS layer is not built at all, and linking ::mkdir there raises
 /// "mkdir is not implemented and will always fail".
@@ -720,6 +725,15 @@ void SdClip::loop() {
   this->pump_playback_();
 }
 
+bool SdClip::redraw() {
+  if (this->shown_ == nullptr || this->shown_->off.empty())
+    return false;
+  // The frame last shown: play_index_ has already moved on to the next one.
+  const size_t count = this->shown_->off.size();
+  const size_t index = (this->play_index_ + count - 1) % count;
+  return this->show_frame_(index);
+}
+
 bool SdClip::show_still() {
   if (!this->has_still())
     return false;
@@ -738,6 +752,8 @@ static const char *const FILE_PREFIX = "file:";
 SdClip::Item::~Item() {
   if (this->buf != nullptr)
     heap_caps_free(this->buf);
+  if (this->fd >= 0)
+    ::close(this->fd);
 }
 
 std::string SdClip::cache_path_(const std::string &key) const {
@@ -756,7 +772,7 @@ std::string SdClip::cache_path_(const std::string &key) const {
 size_t SdClip::cache_used() const {
   size_t used = 0;
   for (auto &it : this->cache_)
-    used += it->len;
+    used += it->streamed() ? it->off.size() * 8 : it->len;
   return used;
 }
 
@@ -914,6 +930,117 @@ uint8_t *SdClip::reserve_(size_t len) {
   return buf;
 }
 
+/// Index a TTMJ file in place, by walking its length prefixes.
+///
+/// Two 4-byte reads and a seek per frame, so a clip of any size is indexed in
+/// about as long as it takes the card to seek that many times -- nothing is
+/// read that is not an index entry. Raw concatenated JPEG is deliberately not
+/// handled here: finding frame boundaries there means scanning every byte,
+/// which is what loading into memory is for.
+static bool index_ttmj_file(int fd, std::vector<uint32_t> &off, std::vector<uint32_t> &sizes,
+                            int &w, int &h, int &fps, uint32_t &widest) {
+  uint8_t head[16];
+  if (::lseek(fd, 0, SEEK_SET) != 0 || ::read(fd, head, sizeof(head)) != (ssize_t) sizeof(head))
+    return false;
+  if (memcmp(head, "TTMJ", 4) != 0 || rd16le(head + 4) != 1)
+    return false;
+  w = rd16le(head + 6);
+  h = rd16le(head + 8);
+  fps = rd16le(head + 10);
+  const uint32_t count = rd32le(head + 12);
+
+  off_t pos = sizeof(head);
+  for (uint32_t i = 0; i < count; i++) {
+    uint8_t len4[4];
+    if (::lseek(fd, pos, SEEK_SET) != pos || ::read(fd, len4, 4) != 4)
+      break;
+    const uint32_t n = rd32le(len4);
+    pos += 4;
+    if (n == 0)
+      break;
+    off.push_back(static_cast<uint32_t>(pos));
+    sizes.push_back(n);
+    if (n > widest)
+      widest = n;
+    pos += n;
+  }
+  return true;
+}
+
+bool SdClip::start_stream_(const std::string &key, const std::string &path) {
+  const std::string full = this->mount_point() + path;
+  const int fd = ::open(full.c_str(), O_RDONLY);
+  if (fd < 0) {
+    ESP_LOGW(TAG, "Cannot open %s", full.c_str());
+    return false;
+  }
+  const uint32_t started = millis();
+  std::unique_ptr<Item> item(new Item());
+  item->key = key;
+  item->path = path;
+  item->fd = fd;
+  int w = 0, h = 0, fps = 0;
+  if (!index_ttmj_file(fd, item->off, item->size, w, h, fps, item->widest) ||
+      item->off.empty()) {
+    ESP_LOGW(TAG, "%s: too big to hold, and not a TTMJ file that can be streamed",
+             path.c_str());
+    return false;  // the Item's destructor closes fd
+  }
+
+  // One frame at a time, in PSRAM: the decoders read it, they do not stream.
+  if (item->widest > this->stream_cap_) {
+    if (this->stream_buf_ != nullptr)
+      heap_caps_free(this->stream_buf_);
+    this->stream_buf_ = static_cast<uint8_t *>(
+        heap_caps_malloc(item->widest, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (this->stream_buf_ == nullptr)
+      this->stream_buf_ = static_cast<uint8_t *>(heap_caps_malloc(item->widest, MALLOC_CAP_8BIT));
+    this->stream_cap_ = this->stream_buf_ == nullptr ? 0 : item->widest;
+    if (this->stream_buf_ == nullptr) {
+      ESP_LOGE(TAG, "No memory for a %u KB frame buffer",
+               static_cast<unsigned>(item->widest / 1024));
+      return false;
+    }
+  }
+
+  this->last_load_ms_ = static_cast<float>(millis() - started);
+  ESP_LOGI(TAG, "Item %s: streamed from the card, %u frame(s), %u KB biggest frame, "
+                "file fps %d, indexed in %u ms",
+           key.c_str(), static_cast<unsigned>(item->off.size()),
+           static_cast<unsigned>(item->widest / 1024), fps,
+           static_cast<unsigned>(this->last_load_ms_));
+  if (w != this->width_ || h != this->height_) {
+    ESP_LOGW(TAG, "Item %s was rendered at %dx%d for a %dx%d panel; it will be centred/cropped",
+             key.c_str(), w, h, this->width_, this->height_);
+  }
+
+  if (Item *old = this->find_item_(key))
+    this->evict_(old);
+  Item *raw = item.get();
+  this->cache_.push_back(std::move(item));
+  this->revision_++;
+  if (key == this->want_key_)
+    this->activate_(raw);
+  return true;
+}
+
+const uint8_t *SdClip::read_frame_(const Item *item, size_t index, size_t &len) {
+  len = item->size[index];
+  if (this->stream_buf_ == nullptr || len > this->stream_cap_ || item->fd < 0)
+    return nullptr;
+  const off_t at = item->off[index];
+  if (::lseek(item->fd, at, SEEK_SET) != at)
+    return nullptr;
+  size_t got = 0;
+  while (got < len) {
+    const ssize_t n = ::read(item->fd, this->stream_buf_ + got, len - got);
+    if (n <= 0)
+      return nullptr;
+    got += static_cast<size_t>(n);
+  }
+  return this->stream_buf_;
+}
+
 bool SdClip::start_load_(const std::string &key, const std::string &path) {
   if (!this->ensure_buffer_())
     return false;
@@ -924,13 +1051,20 @@ bool SdClip::start_load_(const std::string &key, const std::string &path) {
     ESP_LOGW(TAG, "%s: missing or empty", path.c_str());
     return false;
   }
-  // At most max_bytes. Frames past the cut are dropped whole when the item is
-  // indexed, so an oversized file still plays -- just shorter.
-  const size_t cap = std::min(size, this->max_bytes_);
-  if (size > cap) {
-    ESP_LOGW(TAG, "%s is %u KB; loading the first %u KB", path.c_str(),
-             static_cast<unsigned>(size / 1024), static_cast<unsigned>(cap / 1024));
+  // Too big to hold? Play it from the card instead of truncating it. That is
+  // what makes clip length a question about the card rather than about PSRAM.
+  if (size > this->max_bytes_) {
+    ESP_LOGI(TAG, "%s is %u KB, over the %u KB memory budget -- streaming it", path.c_str(),
+             static_cast<unsigned>(size / 1024),
+             static_cast<unsigned>(this->max_bytes_ / 1024));
+    if (this->start_stream_(key, path))
+      return true;
+    // Not streamable (raw MJPEG, or no memory for a frame): fall back to
+    // holding as much of it as fits, which still plays, just shorter.
+    ESP_LOGW(TAG, "%s: cannot stream it; loading the first %u KB", path.c_str(),
+             static_cast<unsigned>(this->max_bytes_ / 1024));
   }
+  const size_t cap = std::min(size, this->max_bytes_);
   uint8_t *buf = this->reserve_(cap);
   if (buf == nullptr) {
     ESP_LOGW(TAG, "%s: cannot allocate %u KB of PSRAM", path.c_str(),
@@ -1025,7 +1159,11 @@ std::string SdClip::cache_report(size_t max_card) {
     first = false;
     out += '[';
     json_string(out, it->key);
-    out += str_sprintf(",%u,%u]", static_cast<unsigned>(it->len), static_cast<unsigned>(it->off.size()));
+    // [key, bytes held, frames, streamed?]. A streamed item holds only its
+    // index -- 8 bytes a frame -- and reads the rest off the card as it plays.
+    const size_t held = it->streamed() ? it->off.size() * 8 : it->len;
+    out += str_sprintf(",%u,%u,%d]", static_cast<unsigned>(held),
+                       static_cast<unsigned>(it->off.size()), it->streamed() ? 1 : 0);
   }
   out += "],\"card\":";
   if (!this->sd_mounted()) {
@@ -1077,9 +1215,6 @@ bool SdClip::push_report(const std::string &url) {
 
 namespace {
 
-uint16_t rd16le(const uint8_t *p) { return p[0] | (p[1] << 8); }
-uint32_t rd32le(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<uint32_t>(p[3]) << 24); }
-uint16_t rd16be(const uint8_t *p) { return (p[0] << 8) | p[1]; }
 
 /// TTMJ container. Stops at the first record that runs past `len`, which is
 /// how a clip truncated by max_bytes keeps its whole frames.
@@ -1281,8 +1416,20 @@ bool SdClip::show_frame_(size_t index) {
   const Item *item = this->shown_;
   if (this->display_ == nullptr || item == nullptr)
     return false;
-  const uint8_t *data = item->buf + item->off[index];
-  const size_t len = item->size[index];
+  size_t len = item->size[index];
+  const uint8_t *data;
+  if (item->streamed()) {
+    const uint32_t tr = micros();
+    data = this->read_frame_(item, index, len);
+    this->last_read_us_ = micros() - tr;
+    if (data == nullptr) {
+      if (this->decode_errors_++ < 3)
+        ESP_LOGW(TAG, "Frame %u: cannot read it off the card", static_cast<unsigned>(index));
+      return false;
+    }
+  } else {
+    data = item->buf + item->off[index];
+  }
 
   const uint32_t t0 = micros();
 #if defined(USE_SD_CLIP_HW_JPEG)

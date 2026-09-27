@@ -1,0 +1,47 @@
+# SD card over the SDMMC peripheral: four data lines, several MB/s.
+#
+# The alternative to common/sd-card.yaml, for a board whose card is not on a
+# SPI bus at all -- the ESP32-P4 Waveshare 4.3 wires its slot for 4-bit SDMMC
+# on GPIO39-44, and powers the slot's IO from on-chip LDO channel 4 (channel 3
+# feeds the MIPI D-PHY). Same component, same `id: sd`, same entities, so
+# nothing downstream can tell the difference except by how fast it reads.
+#
+# The board package must declare:
+#   sd_mmc_clk / sd_mmc_cmd / sd_mmc_d0..d3   the slot's pins
+#   sd_mmc_ldo                                on-chip LDO channel for slot IO
+#
+# Must be listed AFTER content-pull in the device file, so `sd_card: "1"`
+# wins over its default of "0".
+
+substitutions:
+  sd_card: "1"
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [sd_spi]
+
+# Same component as common/sd-card.yaml, wired the other way.
+sd_spi:
+  id: sd
+  # Slot 0: slot 1 is the SDIO link to the C6 radio on this board.
+  slot: ${sd_mmc_slot}
+  clk_pin: ${sd_mmc_clk}
+  cmd_pin: ${sd_mmc_cmd}
+  # A block sequence, not [a, b]: a "${" inside flow brackets is not valid
+  # YAML, and the substitution happens after parsing.
+  data_pins:
+    - ${sd_mmc_d0}
+    - ${sd_mmc_d1}
+    - ${sd_mmc_d2}
+    - ${sd_mmc_d3}
+  ldo_channel: ${sd_mmc_ldo}
+  mount_point: /sd
+  # Never reformat on a failed mount: far more likely to be wiring or a card
+  # that is not there than a genuinely unformatted one, and the recovery for
+  # that must not be "erase the user's card".
+  format_if_mount_failed: false
+
+packages:
+  entities: !include sd-entities.yaml

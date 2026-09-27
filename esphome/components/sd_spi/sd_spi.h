@@ -7,8 +7,12 @@
 
 #ifdef USE_ESP32
 #include "driver/sdspi_host.h"
+#include "driver/sdmmc_host.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
+#if SOC_SDMMC_IO_POWER_EXTERNAL
+#include "sd_pwr_ctrl_by_on_chip_ldo.h"
+#endif
 
 // Older IDF headers spell the "no chip select" sentinel differently.
 #ifndef SDSPI_SLOT_NO_CS
@@ -18,11 +22,16 @@
 namespace esphome {
 namespace sd_spi {
 
-/// An SD card attached as a device on an SPI bus ESPHome already initialised.
+/// An SD card, over SPI or over the SDMMC peripheral.
 ///
-/// esp_vfs_fat_sdspi_mount() deliberately does not initialise the bus -- it
-/// adds a device to an existing one -- which is exactly what we need, because
-/// ESPHome's `spi:` component has already called spi_bus_initialize().
+/// SPI: esp_vfs_fat_sdspi_mount() deliberately does not initialise the bus --
+/// it adds a device to an existing one -- which is exactly what we need,
+/// because ESPHome's `spi:` component has already called spi_bus_initialize().
+///
+/// SDMMC: four data lines instead of one, so several MB/s rather than a few
+/// hundred KB/s. That is the difference between holding a clip in PSRAM and
+/// reading it off the card as it plays. Only the mount differs between the
+/// two -- everything below it is VFS, and does not care how the bytes arrive.
 class SdSpi : public Component {
  public:
   void setup() override;
@@ -36,6 +45,22 @@ class SdSpi : public Component {
   float get_setup_priority() const override { return setup_priority::DATA; }
 
   void set_cs_pin(int pin) { this->cs_pin_ = pin; }
+  /// Switch to the SDMMC peripheral, with the pins the board wires it to.
+  /// `ldo_channel` is the on-chip LDO that powers the slot's IO (4 on the
+  /// ESP32-P4), or -1 where the board powers it some other way.
+  void set_sdmmc(int slot, int clk, int cmd, int d0, int d1, int d2, int d3, int width,
+                 int ldo_channel) {
+    this->mmc_slot_ = slot;
+    this->sdmmc_ = true;
+    this->mmc_clk_ = clk;
+    this->mmc_cmd_ = cmd;
+    this->mmc_d_[0] = d0;
+    this->mmc_d_[1] = d1;
+    this->mmc_d_[2] = d2;
+    this->mmc_d_[3] = d3;
+    this->mmc_width_ = width;
+    this->ldo_channel_ = ldo_channel;
+  }
   void set_spi_host(int host) { this->spi_host_ = host; }
   void set_mount_point(const std::string &mount_point) { this->mount_point_ = mount_point; }
   void set_format_if_mount_failed(bool v) { this->format_if_mount_failed_ = v; }
@@ -91,6 +116,10 @@ class SdSpi : public Component {
 
   /// One mount attempt. Returns true if the card is mounted afterwards.
   bool try_mount_();
+  bool mount_spi_();
+  bool mount_sdmmc_();
+  /// What to say when a mount fails, and whether to say it in full.
+  bool mount_failed_(esp_err_t err);
 
   uint32_t retries_{0};
 
@@ -100,6 +129,18 @@ class SdSpi : public Component {
   bool format_if_mount_failed_{false};
   int max_files_{4};
   int max_freq_khz_{20000};
+
+  bool sdmmc_{false};
+  // Slot 0 by default, NOT the SDMMC_HOST_DEFAULT() slot 1: on the ESP32-P4
+  // board here, slot 1 is the SDIO link to the ESP32-C6 radio. A card taking
+  // it repoints those pins and the radio never initialises -- the card works
+  // perfectly and the screen has no network.
+  int mmc_slot_{0};
+  int mmc_clk_{-1};
+  int mmc_cmd_{-1};
+  int mmc_d_[4]{-1, -1, -1, -1};
+  int mmc_width_{4};
+  int ldo_channel_{-1};
 
   bool mounted_{false};
   sdmmc_card_t *card_{nullptr};

@@ -40,6 +40,9 @@ packages:
   board: !include boards/waveshare-p4-wifi6-touch-lcd-4.3.yaml
   base: !include common/base.yaml
   content: !include common/content-pull.yaml
+  # microSD in the board's own slot, 4-bit SDMMC. Must come after `content`:
+  # its substitutions override content-pull's.
+  sd: !include common/sd-mmc.yaml
   # MJPEG content -- stills and clips -- decoded straight to the panel from a
   # PSRAM cache. Must come after `content`: its substitutions override
   # content-pull's.

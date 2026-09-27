@@ -19,6 +19,17 @@ substitutions:
   display_height: "800"
   display_round: "0"
   default_fit: cover        # 3:5 portrait panel; letterboxing wastes most of it
+
+  # microSD, 4-bit SDMMC on slot 0 (see the note at the end of this file).
+  # Slot 1 is taken: esp32_hosted drives the C6 radio over it.
+  sd_mmc_slot: "0"
+  sd_mmc_clk: "43"
+  sd_mmc_cmd: "44"
+  sd_mmc_d0: "39"
+  sd_mmc_d1: "40"
+  sd_mmc_d2: "41"
+  sd_mmc_d3: "42"
+  sd_mmc_ldo: "4"
   dot_x: "10"               # rectangular panel, so a corner is fine
   dot_y: "10"
 
@@ -47,7 +58,19 @@ esp32:
   cpu_frequency: 360MHz
   framework:
     type: esp-idf   # the only framework for the P4
+    advanced:
+      # Needed by common/sd-mmc.yaml. ESPHome excludes these IDF components by
+      # default to keep builds small, and disables VFS features the FAT driver
+      # relies on -- without VFS dir support the card mounts and then refuses
+      # opendir() and file creation, which reads as a read-only card.
+      include_builtin_idf_components: ["fatfs", "spiffs"]
+      disable_vfs_support_termios: false
+      disable_vfs_support_select: false
+      disable_vfs_support_dir: false
     sdkconfig_options:
+      # Without long filenames every path is truncated to 8.3, and cache keys
+      # are long.
+      CONFIG_FATFS_LFN_STACK: "y"
       # The options that actually decide the memory layout, belt and braces
       # with `board:` above.
       CONFIG_ESP32P4_SELECTS_REV_LESS_V3: "n"
