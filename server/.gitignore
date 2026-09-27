@@ -1,4 +1,5 @@
 data/
+data_test/_pool/items/
 data_test/_clips/
 data_test/_screens.json
 data_test/_variants.json
