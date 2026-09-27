@@ -5,8 +5,8 @@
 # server learns both over mDNS. This file is only an identity.
 
 substitutions:
-  device_name: tabletop-02
-  friendly_name: Tabletop 02 (round)
+  device_name: tabletop-02a
+  friendly_name: Tabletop 02a (round)
 
   # See tabletop-01.yaml for why this is long and why 0s would be wrong.
   poll_interval: 30min
