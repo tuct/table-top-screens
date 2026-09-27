@@ -38,6 +38,10 @@ HTTP_TIMEOUT = 4.0
 # 2026.7.0, so it is only a fallback for older firmware. Each tuple is
 # (preferred, legacy).
 TEXT_SET_PATHS = (f"/text/{quote('Content URL')}/set", "/text/content_url/set")
+# Read back, rather than trusting what we remember having pushed: a screen
+# restores its last URL from flash when it reboots, so the server's memory of
+# having configured it can be older than the screen's own state.
+TEXT_GET_PATHS = (f"/text/{quote('Content URL')}", "/text/content_url")
 BUTTON_PRESS_PATHS = (
     f"/button/{quote('Refresh Content')}/press",
     "/button/refresh_content/press",
@@ -412,6 +416,9 @@ class Registry:
                 if ok:
                     with self._lock:
                         screen.last_seen = time.time()
+                    # It answered, so ask the other question worth asking:
+                    # is it still pointed at us?
+                    self.verify_url(screen)
                 else:
                     log.info("no answer from %s at %s:%d -- marking offline",
                              screen.name, host, port)
@@ -433,11 +440,17 @@ class Registry:
                 back.append(restored.name)
         return {"checked": len(checked), "gone": sorted(gone), "back": sorted(back)}
 
-    def poll_sd_forever(self, interval: float = SD_POLL_INTERVAL) -> None:
+    def poll_screens_forever(self, interval: float = SD_POLL_INTERVAL) -> None:
+        """Every screen, every 30 s: is it still pointed at us, and what is on
+        its card? Both are questions only the screen can answer."""
         while True:
             for screen in self.all():
-                if screen.sd:
-                    self.refresh_sd(screen)
+                try:
+                    self.verify_url(screen)
+                    if screen.sd:
+                        self.refresh_sd(screen)
+                except Exception as exc:  # noqa: BLE001 - a poll must not die
+                    log.warning("poll of %s failed: %s", screen.name, exc)
             time.sleep(interval)
 
     def push_url(self, screen: Screen) -> bool:
@@ -466,6 +479,47 @@ class Registry:
             if r.status_code != 404:
                 return False
         return False
+
+    def current_url(self, screen: Screen) -> str | None:
+        """What the screen says its content URL is, or None if it cannot say."""
+        base = f"http://{screen.host}:{screen.port}"
+        for path in TEXT_GET_PATHS:
+            try:
+                r = requests.get(base + path, timeout=HTTP_TIMEOUT)
+            except requests.RequestException:
+                return None
+            if r.status_code == 404:
+                continue
+            if r.status_code != 200:
+                return None
+            try:
+                return str(r.json().get("value", ""))
+            except ValueError:
+                return None
+        return None
+
+    def verify_url(self, screen: Screen) -> bool:
+        """Ask the screen what it is pointed at, and correct it if it is wrong.
+
+        `push_url` only re-sends when the URL changed in OUR memory. That is
+        one boot away from wrong: a screen restores its last URL from flash,
+        so after the server's own address changes -- a new DHCP lease is
+        enough -- the screen wakes up asking a machine that is not there, and
+        the server, remembering that it configured it, never says otherwise.
+        Reading the answer costs one GET and needs no memory at all.
+        """
+        said = self.current_url(screen)
+        if said is None:
+            return False  # firmware without the entity, or not answering
+        want = self.content_url_for(screen)
+        if said == want:
+            with self._lock:
+                screen.configured_url = said
+            return False
+        log.info("%s is pointed at %s; correcting", screen.name, said or "nothing")
+        with self._lock:
+            screen.configured_url = said  # so push_url sees a difference
+        return self.push_url(screen)
 
     def notify(self, device: str) -> int:
         """Push: make every screen for `device` fetch now. Returns how many."""
@@ -583,7 +637,7 @@ def start(
         return registry, None
     zc = Zeroconf()
     ServiceBrowser(zc, SERVICE_TYPE, _Listener(registry, only))
-    threading.Thread(target=registry.poll_sd_forever, daemon=True).start()
+    threading.Thread(target=registry.poll_screens_forever, daemon=True).start()
     log.info("browsing for %s%s", SERVICE_TYPE,
              f" (only {', '.join(sorted(only))})" if only is not None else "")
     return registry, zc

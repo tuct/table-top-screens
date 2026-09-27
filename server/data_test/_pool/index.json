@@ -1,5 +1,22 @@
 [
   {
+    "id": "7dc0c75b2dea202f",
+    "sha256": "7dc0c75b2dea202f7e3f2db13964cf1e6c7dc9493dbff30032e1f4ed1a8d797c",
+    "bytes": 1086,
+    "content_type": "image/png",
+    "filename": "clip.png",
+    "source_format": "PNG",
+    "source_size": [
+      80,
+      80
+    ],
+    "uploaded_at": 1790525465.581578,
+    "animated": true,
+    "frames": 5,
+    "duration_ms": 450,
+    "browser_playable": true
+  },
+  {
     "id": "7e9b0b1ec9171435",
     "sha256": "7e9b0b1ec91714359aa37ec89b924c08f729b9c4f8970ae461f3a3e3a062ecc5",
     "bytes": 1011,

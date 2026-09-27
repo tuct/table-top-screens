@@ -1,0 +1,12 @@
+{
+  "faketop-01": {
+    "key": "faketop-01._minidisplay._tcp.local.",
+    "host": "127.0.0.1",
+    "port": 51425,
+    "width": 800,
+    "height": 480,
+    "round": false,
+    "sd": true,
+    "at": 1790525465.6457129
+  }
+}

@@ -1,6 +1,27 @@
 # Shared plumbing for every mini screen: connectivity + control surfaces.
 # Board-independent on purpose.
 
+# The task watchdog, and why it is not the one that had to change.
+#
+# Fetching happens on loopTask and blocks it: connect, headers, then a chunk
+# per tick. When the server moved to a new DHCP address, tabletop-03 blocked
+# on the stale one, the watchdog killed it at 5 s mid-connect, it rebooted,
+# fetched the same stale URL on boot, and looped -- never reaching the backoff
+# that exists for exactly this (mjpeg-clip.yaml ITEM_FAILED: 2s, 4s, 6s, then
+# 30s doubling to 5 min).
+#
+# The real fix is in components/sd_clip: it unsubscribes loopTask from the
+# watchdog around each blocking HTTP call, so the short fuse stays on
+# everything else. This is only the floor for the paths that are not ours --
+# online_image's fallback fetch decodes for ~1.9 s after a download that
+# http_request bounds at 10 s. 15 s clears that with room.
+#
+# Merges with each board's own esp32 block.
+esp32:
+  framework:
+    sdkconfig_options:
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "15"
+
 logger:
   level: DEBUG   # bring-up: show component setup + dump_config
 

@@ -71,10 +71,18 @@ class StubScreen(BaseHTTPRequestHandler):
     # Mutable so a test can pull the card out.
     sd = {"SD Mounted": True, "SD In Use": True, "SD Total": 30436.0, "SD Free": 28057.6}
 
+    # What the screen says it is pointed at. Set by a test to something stale,
+    # as a screen that restored an old URL from flash would.
+    url_state: str | None = None
+
     def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
         path = unquote(urlparse(self.path).path)
         name = path.rsplit("/", 1)[-1]
-        if path.startswith(("/sensor/", "/binary_sensor/")) and name in self.sd:
+        if path == "/text/Content URL" and StubScreen.url_state is not None:
+            body = json.dumps({"value": StubScreen.url_state}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+        elif path.startswith(("/sensor/", "/binary_sensor/")) and name in self.sd:
             value = self.sd[name]
             body = json.dumps({"value": value, "state": str(value)}).encode()
             self.send_response(200)
@@ -221,6 +229,29 @@ def main() -> int:
         )
         results.append(check("overview says the slot is empty",
                              b"no card in the slot" in client.get("/").data))
+        print("\na screen pointed somewhere else is corrected, not trusted")
+        want = srv.registry.content_url_for(screen)
+        StubScreen.url_state = "http://10.9.9.9:8099/d/faketop-01/image?w=800&h=480"
+        before = len(received["set_url"])
+        results.append(
+            check("the stale URL is read back, not assumed",
+                  srv.registry.current_url(screen) == StubScreen.url_state))
+        results.append(
+            check("and put right", srv.registry.verify_url(screen)
+                  and len(received["set_url"]) == before + 1
+                  and received["set_url"][-1] == want,
+                  received["set_url"][-1] if received["set_url"] else ""))
+        StubScreen.url_state = want
+        results.append(
+            check("a screen already pointed at us is left alone",
+                  not srv.registry.verify_url(screen)
+                  and len(received["set_url"]) == before + 1))
+        StubScreen.url_state = None
+        results.append(
+            check("firmware without the entity is not fought with",
+                  srv.registry.current_url(screen) is None
+                  and not srv.registry.verify_url(screen)))
+
         r = client.get(f"/d/{DEVICE}/")
         results.append(
             check("the screen's own page says the card is there too",

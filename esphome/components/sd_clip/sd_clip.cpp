@@ -19,10 +19,38 @@
 #include <JPEGDEC.h>
 #endif
 
+#include "esp_task_wdt.h"
+
 #include "esphome/core/log.h"
 
 namespace esphome {
 namespace sd_clip {
+
+/// Stops the task watchdog watching this task for as long as it exists.
+///
+/// Fetching happens on loopTask and blocks it: connecting, reading headers,
+/// then reading a chunk. `http_request`'s timeout bounds each of those, but
+/// the watchdog fires at 5 s -- so a server at an address that no longer
+/// answers (a new DHCP lease is enough) killed the screen mid-connect, and
+/// it rebooted, re-fetched the same stale URL on boot, and looped. It never
+/// reached the backoff that exists for exactly this.
+///
+/// Unsubscribing is better than a longer timeout: the watchdog keeps its
+/// short fuse for everything else, and simply is not watching a call that is
+/// entitled to block. Only re-subscribes if it was subscribed to begin with.
+class WdtPause {
+ public:
+  WdtPause() : was_watched_(esp_task_wdt_delete(nullptr) == ESP_OK) {}
+  ~WdtPause() {
+    if (this->was_watched_)
+      esp_task_wdt_add(nullptr);
+  }
+  WdtPause(const WdtPause &) = delete;
+  WdtPause &operator=(const WdtPause &) = delete;
+
+ private:
+  const bool was_watched_;
+};
 
 static const char *const TAG = "sd_clip";
 
@@ -271,7 +299,11 @@ bool SdClip::cache_one(const std::string &base_url, int index) {
 
   const size_t expected = this->frame_bytes();
   const std::string url = base_url + "&n=" + std::to_string(index);
-  auto container = this->http_->get(url);
+  std::shared_ptr<http_request::HttpContainer> container;
+  {
+    WdtPause no_watchdog;
+    container = this->http_->get(url);
+  }
   if (container == nullptr) {
     ESP_LOGE(TAG, "Frame %d: request failed", index);
     return false;
@@ -310,7 +342,11 @@ bool SdClip::cache_one(const std::string &base_url, int index) {
   uint32_t http_us = 0, write_us = 0;
   while (written < expected) {
     const uint32_t th = micros();
-    const int got = container->read(chunk.get(), CHUNK);
+    int got;
+    {
+      WdtPause no_watchdog;
+      got = container->read(chunk.get(), CHUNK);
+    }
     http_us += micros() - th;
     if (got <= 0)
       break;
@@ -478,7 +514,13 @@ bool SdClip::start_fetch_(FetchKind kind, const std::string &key, const std::str
   const char *what = kind == FETCH_STILL ? "Still" : "Item";
 
   const uint32_t started = millis();
-  auto container = this->http_->get(url, headers, {"etag"});
+  // Connect + response headers: blocks until the server answers, or until
+  // http_request's timeout gives up on it.
+  std::shared_ptr<http_request::HttpContainer> container;
+  {
+    WdtPause no_watchdog;
+    container = this->http_->get(url, headers, {"etag"});
+  }
   if (container == nullptr) {
     ESP_LOGW(TAG, "%s: request failed", what);
     this->fetch_failed_(kind, key);
@@ -561,7 +603,11 @@ void SdClip::pump_fetch_() {
     const size_t want = std::min(FETCH_CHUNK, fx.expected - fx.written);
     // Straight into the PSRAM buffer when there is one: no copy needed.
     uint8_t *dst = fx.mem != nullptr ? fx.mem + fx.written : chunk;
-    const int got = fx.http->read(dst, want);
+    int got;
+    {
+      WdtPause no_watchdog;  // one chunk off a stalled socket can take the lot
+      got = fx.http->read(dst, want);
+    }
     auto r = http_request::http_read_loop_result(got, fx.last_data, FETCH_STALL_MS,
                                                  fx.http->is_read_complete());
     if (r == http_request::HttpReadLoopResult::RETRY)
