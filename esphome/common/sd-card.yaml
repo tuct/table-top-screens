@@ -16,6 +16,12 @@
 #   sd_cs_pin       chip select: a GPIO number, or "none" when the board holds
 #                   it asserted itself (the Waveshare, via CH422G EXIO4)
 
+# Tells the server this screen has a card, so it asks about it -- size, free
+# space, and whether stills are being kept there. Must be listed AFTER
+# content-pull in the device file, so this wins over its default of "0".
+substitutions:
+  sd_card: "1"
+
 external_components:
   - source:
       type: local

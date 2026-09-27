@@ -32,7 +32,7 @@ Each screen also says what it can do, in the same TXT record:
 | `round` | `0` / `1` | visible area is a circle |
 | `img` | `jpeg,rgb565` | still formats the firmware accepts |
 | `anim` | `gif,apng,webp` or `none` | animation sources it can play |
-| `sd` | `0` / `1` | stores stills on an SD card when one is mounted |
+| `sd` | `0` / `1` | has an SD card slot, so the card is worth asking about |
 | `clip` | `frames` / `mjpeg` | how it takes clips: per-frame fetches, or one `/clip.mjpeg` |
 
 The server acts on these. An animated item whose format is not in `anim` is
@@ -155,7 +155,47 @@ many live screens were told to refresh.
 | `GET` | `/d/<device>/clip.mjpeg` | The whole clip as one TTMJ file (`w`, `h`, `q`, `fps`, `max`) |
 | `POST` | `/d/<device>/state` | A screen reports what it holds (sent by the screen on change) |
 | `GET` | `/d/<device>/state` | That last report, one row per cached item |
+| `POST` | `/d/<device>/remove` | Forget a screen. Offline only (409 otherwise); its pictures stay |
+| `POST` | `/screens/refresh` | Knock on every screen; ones that do not answer go offline, remembered ones that do come back |
+| `GET` | `/scenes` | Every scene (JSON) |
+| `POST` | `/scenes` | Save what the chosen screens show: `name`, `screens[]` + `pick=1` |
+| `POST` | `/scenes/<id>/apply` | Put it back on the screens |
+| `POST` | `/scenes/<id>/update` | Save into this scene: name, screens, and what they show now |
+| `POST` | `/scenes/<id>/saveas` | Save as a new scene, never replacing by name |
+| `POST` | `/scenes/<id>/labels` | Rename / describe, touching nothing it recorded |
+| `POST` | `/scenes/<id>/duplicate` | Copy it under a free name |
+| `POST` | `/scenes/release` | Leave the scene you are in; deletes nothing |
+| `GET` | `/scenes/state` | Which scene is on screen and which is starred, for a page that did not reload |
+| `DELETE` | `/scenes/<id>` | Delete a scene (`POST .../delete` for forms) |
 | `GET` | `/healthz` | Liveness + whether QOI is available |
+
+Scene requests that carry `screens[]` must also carry `pick=1` (a hidden field
+in the page's form). Without it there is no way to tell "no screens ticked"
+from a caller that never offered the choice — and that caller, the JSON API,
+keeps the old behaviour of taking every screen, online or not.
+
+### Variants: a picture plus how it is framed
+
+A screen does not show a source, it shows a **variant** — a pool source plus
+the framing to apply to it. Framing used to be one setting per screen, so
+"this photo needs a tighter crop" moved every picture on that screen.
+
+- **Keyed by source and panel shape** (`480x800`, `240x240r`), because that is
+  the distinction that always matters: a portrait panel and a round one want
+  different crops. Putting a picture on a screen auto-creates the variant for
+  that screen's shape, seeded from the screen's defaults, so nothing has to be
+  framed before it can be shown.
+- **Framing edits the variant.** The same values are kept as the screen's
+  defaults, which seed the next picture put on it.
+- **Duplicate** (`POST /d/<device>/variants/<id>/duplicate`) makes a second,
+  named variant of the same source and shape — two crops of one picture on one
+  screen, switchable like any other item.
+- The content token becomes `<source>.<variant>[.<framing hash>]`, so a screen
+  caches each framing separately and switching between them needs no download.
+
+Stored in `data/_variants.json`. Screens' `used.json` lists variant ids;
+lists that held pool ids from before variants are migrated on read, with each
+picture keeping the look it had.
 
 ### Clips as one file (`/clip.mjpeg`)
 
@@ -174,8 +214,12 @@ record   u32 len, then len bytes of JPEG                (count times)
 - **Capped at `max` bytes.** Trailing frames are dropped whole to fit the
   screen's memory budget. `X-Frame-Count` says how many were kept, and 413 means
   even the first frame is too big.
-- **Framed like a still.** It uses the screen's stored fit, rotation, zoom and
-  background. An `ETag` makes an unchanged clip a 304.
+- **Framed like a still.** It uses the screen's stored fit, rotation, zoom,
+  background **and quality** — the screen sends the quality it wants as `q`,
+  and a stored pref overrides it, the same precedence as everywhere else.
+  Quality is the most direct lever on clip length, since it sets bytes per
+  frame and the screen caches a fixed number of bytes. An `ETag` makes an
+  unchanged clip a 304.
 - **A still is one frame.** So is a clip in a format the screen didn't
   advertise. Only a screen with no content gets the synthetic test clip.
 

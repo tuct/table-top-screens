@@ -1,0 +1,173 @@
+# Bring-up config for the Waveshare ESP32-P4-WIFI6-Touch-LCD-4.3.
+#
+# NOT a screen instance -- a bisection tool. tabletop-03 bootlooped on a
+# CHIP_LP_WDT_RESET every ~3.3 s with no output at all, which means it hung
+# before ESPHome's logger ever started: in ESP-IDF's own startup, not in any
+# component. This file removes everything that is not the panel:
+#
+#   no wifi / esp32_hosted (so the C6 link cannot be the cause)
+#   no api, ota, web_server, mDNS, content pipeline
+#   IDF's log level raised to INFO, so the startup that was silent talks
+#
+# Flash it with:
+#   esphome run p4-screen-test.yaml
+#
+# Expect: IDF banner, "SPIRAM: Found ... PSRAM device", then ESPHome's own
+# log, then the display's test card (colour bars + a white border). Panel
+# parameters are copied from boards/waveshare-p4-wifi6-touch-lcd-4.3.yaml;
+# keep them in step while bringing the board up.
+
+esphome:
+  name: p4-screen-test
+
+esp32:
+  variant: esp32p4
+  # Production rev3 silicon, stated twice over.
+  #
+  # This is what the bootloop was: ESPHome generated
+  # CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y and CONFIG_ESP32P4_REV_MIN_0, i.e. an
+  # image laid out for pre-rev3 engineering samples, while this chip is
+  # v3.2 (esptool: "ESP32-P4 (revision v3.2)"). The second-stage bootloader
+  # then died between the ROM's "entry 0x..." line and its own first log
+  # line, and the LP watchdog reset the chip every ~3.3 s.
+  board: esp32-p4_r3
+  flash_size: 16MB
+  # Verified on the board itself: esptool reports "ESP32-P4 (revision v3.2)",
+  # so production silicon and ESPHome's rev3 default are correct. An
+  # engineering sample would need `engineering_sample: true` here.
+  cpu_frequency: 360MHz
+  framework:
+    type: esp-idf
+    # The reason the bootloop was silent: ESPHome defaults IDF's own log level
+    # to ERROR, which hides PSRAM and clock failures during startup.
+    log_level: INFO
+    sdkconfig_options:
+      # Belt and braces with `board:` above -- these are the options that
+      # actually decide the memory layout.
+      CONFIG_ESP32P4_SELECTS_REV_LESS_V3: "n"
+      CONFIG_ESP32P4_REV_MIN_300: "y"
+      # Console on UART0. The socket that enumerates on this board is a WCH
+      # CH343 bridge on UART0 (GPIO37/38) -- ioreg shows one USB device, "USB
+      # Single Serial". ESPHome defaults the P4 console to USB_SERIAL_JTAG,
+      # which is the OTHER socket, so every log went somewhere nothing was
+      # listening and a perfectly healthy board looked dead.
+      CONFIG_ESP_CONSOLE_UART_DEFAULT: "y"
+      CONFIG_ESP_CONSOLE_UART_NUM_0: "y"
+      CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG: "n"
+      # From Waveshare's own examples for this board. The DSI panel streams
+      # its framebuffer out of PSRAM continuously, and these three decide how
+      # that traffic is cached -- and, with XIP, whether code keeps executing
+      # from PSRAM while flash operations disable the flash cache.
+      # Waveshare's rev3_x profile pairs REV_MIN_300 with 250MHz PSRAM;
+      # ESPHome's psram component caps the P4 at 200MHz, so force it here.
+      CONFIG_SPIRAM_SPEED_200M: "n"
+      CONFIG_SPIRAM_SPEED_250M: "y"
+      CONFIG_SPIRAM_SPEED: "250"
+      CONFIG_SPIRAM_XIP_FROM_PSRAM: "y"
+      CONFIG_CACHE_L2_CACHE_256KB: "y"
+      CONFIG_CACHE_L2_CACHE_LINE_128B: "y"
+
+psram:
+  mode: hex
+  speed: 200MHz
+
+logger:
+  level: DEBUG
+  # UART0, matching the console above: the "USB to UART" socket.
+  hardware_uart: UART0
+
+# MIPI D-PHY power. Without it the DSI controller starts and the panel stays
+# black -- BSP_MIPI_DSI_PHY_PWR_LDO_CHAN 3 at 2500 mV.
+esp_ldo:
+  - channel: 3
+    voltage: 2.5V
+
+# Local copy of ESPHome's mipi_dsi with one line changed: it must leave the
+# DSI PHY clock source unset so ESP-IDF picks the one for this silicon
+# revision. Upstream's hardcoded legacy source abort()s on P4 rev >= 3.0.
+# See components/mipi_dsi/mipi_dsi.cpp:38.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [mipi_dsi]
+
+display:
+  - platform: mipi_dsi
+    model: CUSTOM
+    id: disp
+    dimensions:
+      width: 480
+      height: 800
+    lanes: 2
+    lane_bit_rate: 500Mbps
+    pclk_frequency: 30MHz
+    hsync_back_porch: 42
+    hsync_pulse_width: 12
+    hsync_front_porch: 42
+    vsync_back_porch: 2
+    vsync_pulse_width: 8
+    vsync_front_porch: 60
+    color_order: RGB
+    reset_pin: GPIO27
+    # The built-in card proves the panel, timings, colour order and byte order
+    # without any of our own drawing code.
+    show_test_card: true
+    init_sequence:
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x00]
+      - [0x36, 0x00]
+      - [0x3A, 0x55]
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x13]
+      - [0xEF, 0x08]
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x10]
+      - [0xC0, 0x63, 0x00]
+      - [0xC1, 0x0D, 0x02]
+      - [0xC2, 0x17, 0x08]
+      - [0xCC, 0x10]
+      - [0xB0, 0x40, 0xC9, 0x94, 0x0E, 0x10, 0x05, 0x0B, 0x09, 0x08, 0x26, 0x04, 0x52, 0x10, 0x69, 0x6B, 0x69]
+      - [0xB1, 0x40, 0xD2, 0x98, 0x0C, 0x92, 0x07, 0x09, 0x08, 0x07, 0x25, 0x02, 0x0E, 0x0C, 0x6E, 0x78, 0x55]
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x11]
+      - [0xB0, 0x5D]
+      - [0xB1, 0x4E]
+      - [0xB2, 0x87]
+      - [0xB3, 0x80]
+      - [0xB5, 0x4E]
+      - [0xB7, 0x85]
+      - [0xB8, 0x21]
+      - [0xB9, 0x10, 0x1F]
+      - [0xBB, 0x03]
+      - [0xBC, 0x00]
+      - [0xC1, 0x78]
+      - [0xC2, 0x78]
+      - [0xD0, 0x88]
+      - [0xE0, 0x00, 0x3A, 0x02]
+      - [0xE1, 0x04, 0xA0, 0x00, 0xA0, 0x05, 0xA0, 0x00, 0xA0, 0x00, 0x40, 0x40]
+      - [0xE2, 0x30, 0x00, 0x40, 0x40, 0x32, 0xA0, 0x00, 0xA0, 0x00, 0xA0, 0x00, 0xA0, 0x00]
+      - [0xE3, 0x00, 0x00, 0x33, 0x33]
+      - [0xE4, 0x44, 0x44]
+      - [0xE5, 0x09, 0x2E, 0xA0, 0xA0, 0x0B, 0x30, 0xA0, 0xA0, 0x05, 0x2A, 0xA0, 0xA0, 0x07, 0x2C, 0xA0, 0xA0]
+      - [0xE6, 0x00, 0x00, 0x33, 0x33]
+      - [0xE7, 0x44, 0x44]
+      - [0xE8, 0x08, 0x2D, 0xA0, 0xA0, 0x0A, 0x2F, 0xA0, 0xA0, 0x04, 0x29, 0xA0, 0xA0, 0x06, 0x2B, 0xA0, 0xA0]
+      - [0xEB, 0x00, 0x00, 0x4E, 0x4E, 0x00, 0x00, 0x00]
+      - [0xEC, 0x08, 0x01]
+      - [0xED, 0xB0, 0x2B, 0x98, 0xA4, 0x56, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xF7, 0x65, 0x4A, 0x89, 0xB2, 0x0B]
+      - [0xEF, 0x08, 0x08, 0x08, 0x45, 0x3F, 0x54]
+      - [0xFF, 0x77, 0x01, 0x00, 0x00, 0x00]
+
+# Backlight is ACTIVE LOW on this board (the BSP sets LEDC output_invert), so
+# a dark panel with a working DSI link looks exactly like a dead one.
+output:
+  - platform: ledc
+    id: backlight_pwm
+    pin:
+      number: GPIO26
+      inverted: true
+    frequency: 5000Hz
+
+light:
+  - platform: monochromatic
+    name: Backlight
+    id: backlight
+    output: backlight_pwm
+    restore_mode: ALWAYS_ON

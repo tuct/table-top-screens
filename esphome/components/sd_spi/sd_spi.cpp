@@ -191,8 +191,10 @@ void SdSpi::probe_card_(sdmmc_host_t host, sdspi_device_config_t slot) {
     ESP_LOGE(TAG, "    Name: %s", card.cid.name);
     ESP_LOGE(TAG, "    Capacity: %llu MB (%llu GB)", bytes / (1024ULL * 1024ULL),
              bytes / (1000ULL * 1000ULL * 1000ULL));
-    ESP_LOGE(TAG, "    Sector size: %d bytes, speed %d kHz", card.csd.sector_size,
-             card.max_freq_khz);
+    // Cast, don't reach for PRIu32: uint32_t is `long unsigned` on the S3 and
+    // plain `unsigned` on the P4, so only a cast reads the same on both.
+    ESP_LOGE(TAG, "    Sector size: %d bytes, speed %u kHz", card.csd.sector_size,
+             static_cast<unsigned>(card.max_freq_khz));
     if (bytes > 32ULL * 1024 * 1024 * 1024) {
       ESP_LOGE(TAG, "    Over 32 GB: this is almost certainly exFAT, which cannot be mounted.");
     }
@@ -265,7 +267,8 @@ void SdSpi::probe_sector0_(sdmmc_card_t *card) {
       case 0xEE: label = "GPT protective -- card is GPT, IDF needs MBR"; break;
       default: label = "unknown -- NOT mountable"; break;
     }
-    ESP_LOGE(TAG, "      %d: type 0x%02X (%s), start %u, %u MB", i + 1, type, label, start,
+    ESP_LOGE(TAG, "      %d: type 0x%02X (%s), start %u, %u MB", i + 1, type, label,
+             static_cast<unsigned>(start),
              static_cast<unsigned>(static_cast<uint64_t>(count) * 512 / (1024 * 1024)));
   }
   if (!any) {

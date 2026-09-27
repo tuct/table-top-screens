@@ -301,10 +301,13 @@ def main() -> int:
     check("page exposes a preview element the JS can drive", 'id="preview"' in page)
     check("page gives the JS a base URL", 'data-base="/d/tabletop-01/image' in page)
     check("page has the framing form", 'id="framing"' in page)
-    check("page has an apply button", "Apply to screen" in page)
+    check("page has an apply button", ">Apply</button>" in page)
     check("page offers bg=auto", 'value="auto"' in page)
     check("page offers the x/y fit modes", 'value="width"' in page and 'value="height"' in page)
-    check("preview JS asks for prefs=0", 'p.set("prefs", "0")' in page)
+    check("page loads the script that drives the preview",
+          'static/app.js' in page)
+    check("and that script previews the selection rather than what is stored",
+          'p.set("prefs", "0")' in c.get("/static/app.js").get_data(as_text=True))
     c.post("/d/tabletop-01/prefs", json={"reset": 1})
 
     print("\nvideo frames")
@@ -408,6 +411,19 @@ def main() -> int:
     check("a budget below one frame is 413",
           c.get("/d/vid/clip.mjpeg?w=240&h=240&max=64").status_code == 413)
     check("bad fps rejected", c.get("/d/vid/clip.mjpeg?fps=0").status_code == 400)
+    # The quality control on the device page has to reach clips, not just
+    # /image -- it is folded into the content token either way, so if it did
+    # not, changing it would force a re-download of identical bytes.
+    plain = c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=10&q=80")
+    c.post("/d/vid/prefs", json={"q": 20})
+    lowq = c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=10&q=80")
+    check("a stored quality pref overrides the screen's own q",
+          len(lowq.data) < len(plain.data),
+          f"{len(lowq.data)} vs {len(plain.data)} bytes")
+    check("and it is a different clip to the screen", lowq.headers["ETag"] != plain.headers["ETag"])
+    c.post("/d/vid/prefs", json={"reset": 1})
+    check("clearing it restores the original bytes",
+          c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=10&q=80").data == plain.data)
     still = parse_clip(c.get("/d/tabletop-01/clip.mjpeg?w=64&h=64&fps=5").data)
     check("a still is a one-frame clip", still is not None and len(still["frames"]) == 1,
           str(still and len(still["frames"])))
@@ -476,13 +492,17 @@ def main() -> int:
 
     print("\nscreen state (pushed by the screen)")
     items = c.get("/d/tabletop-01/items").get_json()
-    item_id = items["current"]
+    # The cache report names the SOURCE first, then the variant: a screen
+    # holds one entry per framing of a picture.
+    item_id = items["current_src"]
+    variant_id = items["current"]
     report = {
         "budget": 5000000, "used": 1300000, "max": 4000000,
         "psram_free": 2100000, "psram_total": 8000000, "heap_free": 120000,
-        "shown": f"{item_id}-f15-q80",
-        "mem": [[f"{item_id}-f15-q80", 900000, 1], ["file:intro.mjpeg", 400000, 240]],
-        "card": [[f"{item_id}-f15-q80", 900000], [f"{item_id}.abcd1234-f20-q80", 1200000]],
+        "shown": f"{item_id}.{variant_id}-f15-q80",
+        "mem": [[f"{item_id}.{variant_id}-f15-q80", 900000, 1], ["file:intro.mjpeg", 400000, 240]],
+        "card": [[f"{item_id}.{variant_id}-f15-q80", 900000],
+                 [f"{item_id}.{variant_id}.abcd1234-f20-q80", 1200000]],
     }
     r = c.post("/d/tabletop-01/state", json=report)
     check("state accepted", r.status_code == 204, str(r.status_code))
@@ -491,21 +511,22 @@ def main() -> int:
     st = c.get("/d/tabletop-01/state").get_json()
     check("state stored with a timestamp", st.get("report") == report and st.get("at"))
     by_key = {e["key"]: e for e in st["entries"]}
-    shown = by_key.get(f"{item_id}-f15-q80", {})
+    shown = by_key.get(f"{item_id}.{variant_id}-f15-q80", {})
     check("an item in memory and on card is one row",
           shown.get("mem") == 900000 and shown.get("card") == 900000 and shown.get("shown"),
           str(shown))
     check("keys parse back to item, fps and framing",
           shown.get("item_id") == item_id and shown.get("fps") == 15
-          and by_key[f"{item_id}.abcd1234-f20-q80"]["framed"], str(shown))
+          and by_key[f"{item_id}.{variant_id}.abcd1234-f20-q80"]["framed"], str(shown))
     check("hand-copied files are recognised", by_key["file:intro.mjpeg"]["file"] == "intro.mjpeg")
     check("the row on screen sorts first", st["entries"][0]["shown"])
     page = c.get("/d/tabletop-01/").get_data(as_text=True)
-    check("device page shows memory in use", "Memory cache: 1.2 MB of 4.8 MB" in page)
+    check("device page shows memory in use", "Memory 1.2 MB of 4.8 MB" in page)
     check("and the cached items", "intro.mjpeg" in page and "on screen" in page)
     check("library row carries a cached badge", 'class="cached"' in page)
-    check("index card shows memory too",
-          "Memory cache: 1.2 MB of 4.8 MB" in c.get("/").get_data(as_text=True))
+    # The overview says it as a bar and a line, not a sentence.
+    idx = c.get("/").get_data(as_text=True)
+    check("index card shows memory too", "1.2 MB / 4.8 MB" in idx)
 
     print("\npages")
     check("device page", c.get("/d/tabletop-01/").status_code == 200)

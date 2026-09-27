@@ -16,9 +16,12 @@ all fed from one place over the local network.
 esphome/
   tabletop-01.yaml                      device instance: identity only
   tabletop-02.yaml                      "
+  tabletop-03.yaml                      "
   boards/
     waveshare-s3-touch-lcd-4.3.yaml     800x480 RGB parallel, GT911, CH422G
     seeed-xiao-round-display.yaml       240x240 round SPI, GC9A01A, CHSC6X
+    waveshare-p4-wifi6-touch-lcd-4.3.yaml  480x800 MIPI-DSI ST7701, GT911,
+                                        ESP32-P4 + C6 radio over SDIO
   common/
     base.yaml                           wifi / api / ota / web_server / diagnostics
     content-pull.yaml                   mDNS advertisement + content path
@@ -26,7 +29,9 @@ esphome/
 server/
   app.py                                content server (Flask + Pillow)
   discovery.py                          mDNS browse + push to screens
-  library.py                            per-device image library
+  library.py                            pool, variants, scenes, screens seen
+  templates/index.html  device.html     the two pages (Jinja)
+  static/app.css  app.js                design tokens; live preview + drag
   test_library.py  test_content.py  test_discovery.py
   README.md                             API, formats, the discovery contract
 ```
@@ -66,13 +71,83 @@ file.
 | Screen | Packages | Advertises |
 |---|---|---|
 | tabletop-01 (Waveshare 4.3) | `sd-card` + `sd-still` | `anim=none sd=1 img=jpeg,rgb565` |
-| tabletop-02 (round XIAO) | `sd-card` + `mjpeg-clip` | `round=1 anim=gif,apng,webp sd=0 clip=mjpeg` |
+| tabletop-02 (round XIAO) | `sd-card` + `mjpeg-clip` | `round=1 anim=gif,apng,webp sd=1 clip=mjpeg` |
+| tabletop-03 (Waveshare P4) | `mjpeg-clip` | `anim=gif,apng,webp sd=0 clip=mjpeg` |
+
+**`sd` means "this screen has a card", not "it keeps stills on one."** It used
+to be set by `sd-still.yaml`, so tabletop-02 — which has a card and fills it
+with clips — advertised `sd=0`, and the server never asked it about the card:
+no size, no free space, nothing on the page. It is now set by `sd-card.yaml`,
+which is the package that knows. Whether stills are actually being kept there
+is a different question, and the `SD In Use` sensor already answered it.
 
 **The Waveshare 4.3 is stills only.** Its GIF path cached clips by
 JPEG-decoding every frame into a 768 KB buffer, which is exactly the memory
 this board should not spend on content. So it no longer includes
 `sd-clip.yaml`, advertises `anim=none`, and the server sends it the first
 frame of anything animated.
+
+### A second kind of chip: ESP32-P4 + ESP32-C6
+
+`tabletop-03` is the first board here whose main chip **has no radio**. The
+ESP32-P4 is a 400 MHz dual-core RISC-V with 32 MB of PSRAM and a MIPI-DSI
+display controller, but Wi-Fi and Bluetooth come from a *second* chip — an
+ESP32-C6 — reached over 4-bit SDIO and driven by ESP-IDF's `esp_hosted`.
+ESPHome wraps that as `esp32_hosted`, so the board package declares the link
+and **nothing above it changes**: the `wifi:` block, mDNS, `web_server` and
+`http_request` are the same as on an S3.
+
+```yaml
+esp32_hosted:
+  type: sdio
+  variant: ESP32C6
+  reset_pin: GPIO54           # C6 EN
+  clk_pin: GPIO18             # ESP-Hosted's default P4 pins; Waveshare's
+  cmd_pin: GPIO19             # own examples ship no overrides, which is
+  d0_pin: GPIO14              # what says this board follows them
+  ...
+```
+
+What this buys is room. The screen's content cache is PSRAM, and the P4 has
+32 MB of it against the S3's 8 MB, so `clip_cache_bytes` is set to 20 MB —
+minutes of video rather than tens of seconds.
+
+**Four traps, all found on hardware.** Each one produces a dead-looking board:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Bootloop, LP watchdog every ~3.3 s, nothing after the ROM's `entry 0x…` | ESPHome emits `CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y` + `REV_MIN_0` — a pre-rev3 image — on rev3 silicon | `board: esp32-p4_r3` and force `SELECTS_REV_LESS_V3: "n"` / `REV_MIN_300: "y"` |
+| Chip runs, no logs at all | ESPHome puts the P4 console on USB-Serial-JTAG; the socket that enumerates is a CH343 **USB-to-UART** bridge on UART0 | console and `logger` on `UART0` |
+| Silent panic in display setup, black panel | ESPHome hardcodes the DSI PHY clock source to the **legacy** (pre-rev3) `PLL_F20M`; the rev3 HAL has no case for it and calls `abort()` | the vendored `components/mipi_dsi` override below |
+| — | Waveshare's rev3_x profile pairs `REV_MIN_300` with **250 MHz** PSRAM; ESPHome caps the P4 at 200 | force `SPIRAM_SPEED_250M` |
+
+Check the silicon before assuming: `esptool --port … flash-id` prints
+`Chip type: ESP32-P4 (revision v3.2)`. An engineering sample below v3.0 wants
+the opposite settings.
+
+**`components/mipi_dsi` is a vendored copy of ESPHome's own component** with a
+single line changed: it leaves `phy_clk_src` unset so `esp_lcd_new_dsi_bus()`
+applies ESP-IDF's revision-aware default (XTAL on rev ≥ 3.0) instead of the
+legacy source. Espressif's and Waveshare's BSPs both rely on that default.
+Drop the override once ESPHome fixes it upstream.
+
+`esphome/p4-screen-test.yaml` is the bring-up config that found all of this:
+panel only, no radio, console on UART0, hardware test card.
+
+Three more things to know about the category:
+
+- **The C6 needs matching esp-hosted firmware.** Waveshare ships it flashed.
+  After an ESP-IDF jump it may need reflashing before Wi-Fi comes up at all.
+  The SDIO pins in the board package (CLK 18, CMD 19, D0-D3 14-17, reset
+  GPIO54) are **confirmed working** on this board: the screen associates and
+  gets an address.
+- **A dark panel needs the LDO.** The MIPI D-PHY is powered from the P4's own
+  LDO (`esp_ldo`, channel 3 at 2.5 V). Without it the DSI controller
+  initialises happily and the screen stays black.
+- **No SD card yet.** The P4 board's slot is wired for 4-bit SDMMC, and
+  `components/sd_spi` drives cards over SPI only. `mjpeg-clip.yaml` works
+  either way: with no card it keeps content in PSRAM and re-fetches after a
+  reboot. Giving this board its card needs an SDMMC component.
 
 ### MJPEG content from memory (`common/mjpeg-clip.yaml`)
 
@@ -100,8 +175,27 @@ nothing for content the screen already holds.
 **Why decoding every frame is fine.** ESPHome's image decoder has JPEGDEC
 produce RGB8888, then pushes every pixel through a virtual `draw_pixel()` with
 float scaling. That per-pixel output, not the JPEG decode, is where the
-~1.8 s per frame goes. `sd_clip` asks JPEGDEC for RGB565 and blits whole
-blocks, as video-Player does.
+~1.8 s per frame goes. `sd_clip` asks for RGB565 and blits whole blocks, as
+video-Player does.
+
+**Which decoder, and what it costs** (`jpeg_decoder`, default `auto`):
+
+| | 240×240 frame | fps held | flash |
+|---|---|---|---|
+| `software` — JPEGDEC | 72 ms | 13.6 of 15 | 1,143,811 B |
+| `esp_new` — [esp_new_jpeg](https://developer.espressif.com/blog/2025/09/esp-new-jpeg-introduction/) | **58 ms** | **15.2** | +74 KB |
+| `hardware` — the P4's JPEG peripheral | 12–16 ms at 480×800 | 15 | — |
+
+Measured back to back on tabletop-02, same 151-frame clip. The 20% is not the
+point: at 15 fps the budget is 66.7 ms a frame, so JPEGDEC **missed** and the
+screen quietly ran at 13.6 fps, while esp_new_jpeg holds 15.2 with ~9 ms to
+spare. `auto` is therefore `hardware` on the P4 and `esp_new` everywhere else.
+
+esp_new_jpeg runs in **block mode**, handing back 8–16 rows at a time, each
+blitted straight to the panel. That keeps it to one band of memory — the same
+trade JPEGDEC makes. Whole-frame mode would have wanted 115 KB per frame on
+this board. It also emits RGB565 in the panel's own byte order, so nothing is
+swapped on the way out.
 
 **How long a clip can be.** Real 240×240-equivalent video averages about
 2.8 KB per frame at ffmpeg `-q:v 7`, or roughly double at q80. 4 MB is about
@@ -152,6 +246,57 @@ this path removes is PSRAM use **for content**: no decode buffer, no clip cache.
 `buffer_size_rx` is 8192. The ~16 s figure in `sd-clip.yaml` matches the old
 512-byte read size (~48 KB/s), so it may well predate that fix — check the
 `Still: N KB stored in M ms` log line.
+
+## The pages (`server/templates/`)
+
+Two pages, both plain Jinja and plain forms: **the shelf** (every screen) and
+**one screen** (its picture, its framing, its library). Everything works with
+JavaScript off; the script only removes round trips.
+
+### Screens
+
+- **The panel is described as hardware**: `480×800 portrait`, `800×480
+  landscape`, `240×240 round`. A round panel is called round rather than given
+  an orientation, because it has none worth the word. A **round screen's
+  pictures are drawn round everywhere** — a crop that looks right in a square
+  thumbnail is wrong on a circular panel.
+- **Offline screens read as asleep**: the card greys, its pictures lose their
+  colour, `offline` sits over the panel, and every action but **Remove** is
+  disabled. Hovering brings the colour back.
+- **Screens are remembered** in `data/_screens.json` as they are seen — address,
+  size, roundness. Before that, a screen asleep at startup had no card at all,
+  and one that had never been given content vanished on every restart.
+- **Remove** forgets a screen for good: playlist, defaults, last report, and
+  the memory of having seen it. Its **pictures stay** — the pool is shared.
+- **Refresh** knocks on every screen's door (2 s timeout, 8 at a time) and
+  believes the answer. mDNS only reports a screen leaving when it says
+  goodbye, which one that lost power never does, so its record can sit in the
+  cache for an hour. Screens that answer from a remembered address come back.
+- **Sorting** — online first, name, or last seen — kept in a cookie.
+- **The SD card, where there is one**: `SD: card in, clips only · 29.4 of
+  29.5 GB free`, on both pages.
+
+### Scenes
+
+A scene is what a set of screens is showing, saved under a name.
+
+- **You pick the screens.** Chips under the save form; an offline screen
+  cannot join — there is no sense saving a scene you cannot put up — but one
+  already in a scene **keeps the entry it was saved with** rather than being
+  dropped for being asleep. Ticking a screen reveals its card at once, before
+  the scene is saved, because you tick it in order to set what it shows.
+- **`on screen` and `*`.** A scene is marked on screen when the screens still
+  match what it recorded — picture *and* framing, since applying it restores
+  both. Change either and the mark becomes a `*`, the way an edited document
+  is starred. Both marks belong only to the scene you are in, so **Leave
+  scene** really leaves: nothing is deleted, nothing claims to be up.
+- **Save** writes back into the scene you are in; **Save as duplicate** leaves
+  it alone and writes a new one, never replacing by name. **Edit** changes only
+  the name and description.
+- **The shelf narrows** to the scene you are in, with the others hidden rather
+  than dropped, and a line saying how many and how to see them.
+- Each row shows **what it puts up**, one small picture per screen, greyed for
+  screens that are not answering.
 
 ## Phase 1 — S3 + still images (working on hardware)
 

@@ -1,0 +1,46 @@
+# Third screen: Waveshare ESP32-P4-WIFI6-Touch-LCD-4.3.
+#
+# First P4 + C6 device here -- the P4 has no radio, so WiFi comes from an
+# ESP32-C6 over SDIO (see the board package). Nothing above the radio changes:
+# this file is still only an identity.
+#
+# No SD card package: the P4's card is on SDMMC, which components/sd_spi
+# cannot drive. Content is held in this board's 32 MB of PSRAM instead, which
+# is roomier than the card cache on the other screens anyway -- it just
+# re-fetches after a reboot.
+
+substitutions:
+  device_name: tabletop-03
+  friendly_name: Tabletop 03 (P4)
+
+  # See tabletop-01.yaml for why this is long and why 0s would be wrong.
+  poll_interval: 30min
+
+  # Cache sizes, here rather than in the board package: a device file's own
+  # substitutions beat every package's, and common/mjpeg-clip.yaml (listed
+  # after the board) defines its own 4MB/5MB defaults.
+  #
+  # Measured on the board: 26 MB of PSRAM free while holding a 3.9 MB item,
+  # so ~30 MB is ours once the DSI framebuffer (768 KB) and the hardware
+  # decoder's buffers (~850 KB) are out. 24 MB of cache leaves headroom for
+  # WiFi and the rest; the per-item cap is what one clip may occupy.
+  #
+  # At ~48 KB a frame (measured: a 61-frame clip came to 2.9 MB) 16 MB is
+  # roughly 340 frames, about 22 s at 15 fps. It is also about 40 s to
+  # download at the ~400 KB/s this screen sees, which is the real reason not
+  # to raise it further.
+  clip_max_bytes: "16000000"
+  clip_cache_bytes: "24000000"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+packages:
+  board: !include boards/waveshare-p4-wifi6-touch-lcd-4.3.yaml
+  base: !include common/base.yaml
+  content: !include common/content-pull.yaml
+  # MJPEG content -- stills and clips -- decoded straight to the panel from a
+  # PSRAM cache. Must come after `content`: its substitutions override
+  # content-pull's.
+  clip: !include common/mjpeg-clip.yaml

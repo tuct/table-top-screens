@@ -30,7 +30,10 @@
 substitutions:
   image_formats: jpeg
   anim_formats: none
-  sd_still: "0"
+  # 1 when the screen HAS a card (common/sd-card.yaml). Whether stills are
+  # being kept on it is a separate question, answered by the "SD In Use"
+  # sensor -- a screen can have a card and use it only for clips.
+  sd_card: "0"
   # How clips arrive: "frames" (fetched one by one) or "mjpeg" (one
   # /clip.mjpeg download played from memory, see common/mjpeg-clip.yaml).
   clip_transport: frames
@@ -73,13 +76,14 @@ mdns:
         #   img    still formats the firmware can take, comma separated
         #   anim   animation source formats it can play (gif,apng,webp), or none
         #          -- anything else gets the first frame as a still
-        #   sd     1 if stills are stored on and shown from an SD card when one
-        #          is mounted (the screen falls back to the network otherwise)
+        #   sd     1 if the screen has an SD card slot at all, so the server
+        #          knows to ask it about the card (mounted, size, free, and
+        #          whether stills are being kept there)
         #   clip   frames | mjpeg -- how this firmware takes clips
         round: ${display_round}
         img: ${image_formats}
         anim: ${anim_formats}
-        sd: ${sd_still}
+        sd: ${sd_card}
         clip: ${clip_transport}
 
 globals:
