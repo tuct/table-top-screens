@@ -65,6 +65,12 @@
           {{ cur.filename }} — the rest of it is not played.
         </p>
       {% endif %}
+      {% set shown = used | selectattr('current') | first | default(none) %}
+      {% if shown and shown.played %}
+        <p class="note">Playing <b>{{ shown.played }}</b> frames{% if shown.played_fps %}
+          at {{ shown.played_fps }} fps ({{ '%.1f'|format(shown.played / shown.played_fps) }}s){% endif %}{%
+          if shown.anim %} — the file has {{ shown.anim.split(' · ')[0] }}{% endif %}.</p>
+      {% endif %}
       <p class="note" id="pstatus">What is on the screen now.</p>
     {% else %}
       <p class="note">Nothing on this screen yet — upload something.</p>
@@ -200,6 +206,7 @@
                 </div>
               </div>
               {% if it.anim %}<span class="anim{{ ' muted' if it.still_here }}"
+                 title="What the file contains{% if it.played %}; the screen holds {{ it.played }}{% endif %}"
                  >&#9654; {{ it.anim }}</span>{% endif %}
               {% if it.current %}
                 <span class="live"><span class="dot"></span>on screen</span>

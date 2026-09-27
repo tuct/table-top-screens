@@ -275,6 +275,20 @@ def main() -> int:
             results.append(check("one only in memory says that instead",
                                  b">in memory<" in page and b">on card<" not in page))
 
+            # What the screen holds is not what the file contains: the clip
+            # was resampled to Target FPS and cut to the byte budget.
+            srv.library.set_screen_state(srv.DATA_DIR, DEVICE, {
+                "report": {"budget": 8000000, "used": 2400000, "shown": key,
+                           "mem": [[key, 2400000, 61, 0]], "card": []},
+                "at": time.time()})
+            page = client.get(f"/d/{DEVICE}/").data
+            results.append(
+                check("the page says how many frames the SCREEN holds",
+                      b"Playing <b>61</b> frames" in page, ""))
+            results.append(
+                check("and at what rate, from the key the screen reported",
+                      b"at 15 fps" in page))
+
         print("\na clip too big to hold is reported as streamed, not as absent")
         big = {"report": {"budget": 16000000, "used": 8000,
                           "shown": "abc.def-f15-q80",

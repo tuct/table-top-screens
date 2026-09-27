@@ -1619,25 +1619,36 @@ def device_page(device: str):
     for r in cache_entries(lib(library.screen_state, device)):
         if not r["item_id"]:
             continue
-        at = held.setdefault(r["item_id"], {"mem": 0, "card": 0})
+        at = held.setdefault(r["item_id"], {"mem": 0, "card": 0, "frames": 0, "fps": 0})
         at["mem"] += r.get("mem", 0) or 0
         at["card"] += r.get("card", 0) or 0
+        # What the SCREEN holds, which is not what the file contains: the
+        # clip was resampled to its Target FPS and cut to the byte budget.
+        at["frames"] = max(at["frames"], r.get("frames") or 0)
+        at["fps"] = r.get("fps") or at["fps"]
 
     def where_held(source_id: str) -> dict:
         at = held.get(source_id)
         if not at or not (at["mem"] or at["card"]):
-            return {"cached": "", "where": "", "at": ""}
+            return {"cached": "", "where": "", "at": "", "played": 0, "played_fps": 0}
         parts = []
         if at["card"]:
             parts.append(f'on the card: {_kb(at["card"])}')
         if at["mem"]:
             parts.append(f'in memory: {_kb(at["mem"])}')
+        if at["frames"] > 1:
+            played = f'{at["frames"]} frames'
+            if at["fps"]:
+                played += f' at {at["fps"]} fps ({at["frames"] / at["fps"]:.1f}s)'
+            parts.append(played)
         return {
             "cached": _kb(at["card"] or at["mem"]),
             # The card is the interesting half: memory is emptied by a reboot
             # and by the next few switches, the card is not.
             "where": "on card" if at["card"] else "in memory",
             "at": " · ".join(parts),
+            "played": at["frames"] if at["frames"] > 1 else 0,
+            "played_fps": at["fps"],
         }
 
     def row(it: dict) -> dict:
