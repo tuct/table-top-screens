@@ -1,0 +1,13 @@
+data/
+data_test/_clips/
+data_test/_screens.json
+data_test/_variants.json
+data_test/*/prefs.json
+data_test/*/state.json
+data_lib_test/
+data_vid_t/
+data_clip_t/
+data_rng/
+data_dbg/
+.venv/
+__pycache__/

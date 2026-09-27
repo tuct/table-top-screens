@@ -258,7 +258,7 @@ interval:
           id(sd_clip_cached).publish_state(id(clip)->cached());
           if (id(clip)->cached() > 0) {
             id(sd_clip_read_ms).publish_state(id(clip)->last_read_ms());
-            id(sd_clip_blit_ms).publish_state(id(clip)->last_blit_ms());
+            id(sd_clip_blit_ms).publish_state(id(clip)->still_blit_ms());
             id(sd_clip_write_ms).publish_state(id(clip)->last_write_ms());
           }
 

@@ -36,6 +36,12 @@ substitutions:
   # device on the bus ESPHome already initialised. Used by common/sd-card.yaml.
   sd_spi_host: SPI2_HOST
   sd_cs_pin: "3"
+  # 20MHz, though the panel on the same bus runs at 40: the card simply does
+  # not mount at 40 here -- tried it, "SD Mounted: OFF" -- and Seeed's own
+  # driver uses 20 too. Different clocks on one bus cost a reconfiguration
+  # between a card read and a frame, which measures as nothing next to a
+  # card that is not there.
+  sd_data_rate: 20MHz
 
 esp32:
   board: seeed_xiao_esp32s3
@@ -86,7 +92,12 @@ display:
     id: disp
     cs_pin: GPIO2           # D1
     dc_pin: GPIO4           # D3
-    data_rate: 20MHz        # what Seeed's own driver uses
+    # 40MHz, not the 20 Seeed's own driver uses. A 240x240 RGB565 frame is
+    # 115 KB, which at 20MHz takes ~46ms to push -- most of the per-frame
+    # budget at 15 fps, and far more than the JPEG decode itself. The
+    # GC9A01A is rated well past this; if the panel ever tears or shows
+    # speckle, this is the first thing to put back.
+    data_rate: 40MHz
     # This panel needs display inversion. Confirmed the honest way: with the
     # driver's plain defaults and nothing else overridden, the picture came
     # out a photographic negative, so this is the single change that fixes it.

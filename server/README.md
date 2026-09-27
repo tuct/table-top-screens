@@ -152,7 +152,7 @@ many live screens were told to refresh.
 | `DELETE` | `/d/<device>/content` | Clear content |
 | `GET` | `/d/<device>/meta` | Stored content metadata (JSON) |
 | `GET` | `/d/<device>/image` | Render for a device — **what the screen calls** |
-| `GET` | `/d/<device>/clip.mjpeg` | The whole clip as one TTMJ file (`w`, `h`, `q`, `fps`, `max`) |
+| `GET` | `/d/<device>/clip.mjpeg` | The whole clip as one TTMJ file (`w`, `h`, `q`, `fps`, `max`). Built to disk a frame at a time, served with Range support |
 | `POST` | `/d/<device>/state` | A screen reports what it holds (sent by the screen on change) |
 | `GET` | `/d/<device>/state` | That last report, one row per cached item |
 | `POST` | `/d/<device>/remove` | Forget a screen. Offline only (409 otherwise); its pictures stay |
@@ -198,6 +198,18 @@ lists that held pool ids from before variants are migrated on read, with each
 picture keeping the look it had.
 
 ### Clips as one file (`/clip.mjpeg`)
+
+Built to `data/_clips/<etag>.ttmj` a frame at a time and served from there.
+The ETag already covers the picture and every render parameter, so the file IS
+the cache: asking again is a sendfile, and 4 GB of them are pruned
+least-recently-used. Nothing is assembled in memory, because a clip can now be
+longer than the server should hold -- and `conditional=True` answers `Range`,
+which is how a screen picks a 16 MB download up where it stopped rather than
+starting again.
+
+Sources may be images or video: an MP4 is decoded through ffmpeg (see
+`video.py`) and resampled to the screen's Target FPS exactly as a GIF is.
+
 
 A screen with `clip=mjpeg` downloads its clip in one request and plays it from
 memory. The response is a small container of baseline JPEGs, all

@@ -140,7 +140,7 @@ class SdClip : public Component {
   /// Milliseconds spent in the last card read and the last blit. Exposed so
   /// the real frame budget is visible without a serial cable.
   float last_read_ms() const { return this->last_read_us_ / 1000.0f; }
-  float last_blit_ms() const { return this->last_blit_us_ / 1000.0f; }
+  float still_blit_ms() const { return this->last_blit_us_ / 1000.0f; }
 
   // -- stills ---------------------------------------------------------------
   //
@@ -248,11 +248,16 @@ class SdClip : public Component {
   /// Put the current frame back, after something else drew over it.
   bool redraw();
   size_t shown_bytes() const { return this->shown_ != nullptr ? this->shown_->len : 0; }
+  /// Whether what is playing is being read off the card frame by frame.
+  bool shown_streamed() const { return this->shown_ != nullptr && this->shown_->streamed(); }
   size_t cache_count() const { return this->cache_.size(); }
   size_t cache_used() const;
   /// Frames decoded since boot; the caller diffs it for a rate.
   uint32_t frames_shown() const { return this->frames_shown_; }
   float last_decode_ms() const { return this->last_decode_us_ / 1000.0f; }
+  /// Of the decode time, how much was spent pushing pixels at the panel
+  /// rather than decoding. On an SPI display that is most of it.
+  float last_blit_ms() const { return this->blit_us_ / 1000.0f; }
   float last_load_ms() const { return this->last_load_ms_; }
 
   /// Bumped whenever what is cached or shown changes, so a caller can publish
@@ -277,6 +282,19 @@ class SdClip : public Component {
   /// want. See the element_order option.
   void set_bgr_order(bool bgr) { this->bgr_order_ = bgr; }
   void set_max_bytes(size_t max_bytes) { this->max_bytes_ = max_bytes; }
+  /// Play from the card even when the clip would fit in memory. Reading a
+  /// frame off 4-bit SDMMC costs about as long as decoding it, and the card
+  /// holds hundreds of times what PSRAM does.
+  void set_prefer_card(bool prefer) { this->prefer_card_ = prefer; }
+  /// How big a clip may be when it is going onto the card, as opposed to
+  /// into memory. 0 means "the same as max_bytes".
+  void set_card_bytes(size_t n) { this->card_bytes_ = n; }
+  /// What to ask the server for: the card's budget when there is a card, the
+  /// memory budget otherwise. Sent as `max` on every clip request, so this
+  /// is what decides how long a clip can be.
+  size_t download_limit() const {
+    return (this->sd_mounted() && this->card_bytes_ > 0) ? this->card_bytes_ : this->max_bytes_;
+  }
   size_t max_bytes() const { return this->max_bytes_; }
   /// PSRAM for all items together.
   void set_cache_bytes(size_t cache_bytes) { this->cache_bytes_ = cache_bytes; }
@@ -301,8 +319,10 @@ class SdClip : public Component {
     std::string live;        ///< final file name inside dir
     std::string etag_file;   ///< file inside dir that holds the ETag, or empty
     std::string etag;
+    std::string url;         ///< kept, so a stopped transfer can be resumed
     size_t expected{0};
     size_t written{0};
+    int attempt{0};          ///< how many times this transfer has been resumed
     uint32_t last_data{0};
     uint32_t started{0};
   };
@@ -311,6 +331,9 @@ class SdClip : public Component {
                     bool offer_etag, bool to_memory);
   void pump_fetch_();
   void finish_fetch_(bool ok);
+  /// Ask the server for the rest of a transfer that stopped short, rather
+  /// than starting the whole thing again. True if a new request is running.
+  bool resume_fetch_(Fetch &fx);
   /// Drop a download without reporting anything, e.g. when the screen has
   /// been switched to something else meanwhile.
   void abort_fetch_();
@@ -393,6 +416,8 @@ class SdClip : public Component {
   int cached_{0};
   uint32_t last_read_us_{0};
   uint32_t last_blit_us_{0};
+  /// Panel time inside the last frame's decode, accumulated band by band.
+  uint32_t blit_us_{0};
   uint32_t last_write_us_{0};
   uint32_t last_http_us_{0};
 
@@ -416,6 +441,8 @@ class SdClip : public Component {
   uint8_t *stream_buf_{nullptr};
   size_t stream_cap_{0};
 
+  bool prefer_card_{false};
+  size_t card_bytes_{0};
   size_t max_bytes_{4000000};
   size_t cache_bytes_{5000000};
   std::vector<std::unique_ptr<Item>> cache_;

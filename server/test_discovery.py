@@ -252,6 +252,29 @@ def main() -> int:
                   srv.registry.current_url(screen) is None
                   and not srv.registry.verify_url(screen)))
 
+        print("\nthe list says where a picture is held, not just that it is")
+        buf = io.BytesIO()
+        Image.new("RGB", (40, 30), (9, 40, 90)).save(buf, "PNG")
+        pool_id = client.post(f"/d/{DEVICE}/content",
+                              data={"file": (io.BytesIO(buf.getvalue()), "where.png")},
+                              content_type="multipart/form-data").get_json()["id"]
+        if pool_id:
+            key = f"{pool_id}.000000000000-f15-q80"
+            client.post(f"/d/{DEVICE}/items/{pool_id}/select")
+            srv.library.set_screen_state(srv.DATA_DIR, DEVICE, {
+                "report": {"budget": 8000000, "used": 0, "shown": key,
+                           "mem": [], "card": [[key, 2400000]]},
+                "at": time.time()})
+            page = client.get(f"/d/{DEVICE}/").data
+            results.append(check("a picture on the card says so", b">on card<" in page))
+            srv.library.set_screen_state(srv.DATA_DIR, DEVICE, {
+                "report": {"budget": 8000000, "used": 2400000, "shown": key,
+                           "mem": [[key, 2400000, 1, 0]], "card": []},
+                "at": time.time()})
+            page = client.get(f"/d/{DEVICE}/").data
+            results.append(check("one only in memory says that instead",
+                                 b">in memory<" in page and b">on card<" not in page))
+
         print("\na clip too big to hold is reported as streamed, not as absent")
         big = {"report": {"budget": 16000000, "used": 8000,
                           "shown": "abc.def-f15-q80",

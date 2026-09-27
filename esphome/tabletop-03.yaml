@@ -29,7 +29,21 @@ substitutions:
   # roughly 340 frames, about 22 s at 15 fps. It is also about 40 s to
   # download at the ~400 KB/s this screen sees, which is the real reason not
   # to raise it further.
-  clip_max_bytes: "16000000"
+  # What one clip may occupy in MEMORY. Not a length limit: with the card in,
+  # anything bigger is streamed off it instead. Kept well under the PSRAM that
+  # is free, because an item needs its bytes in ONE block -- 15.6 MB was
+  # refused on a heap with 26 MB free, the framebuffer and decode buffers
+  # having split it.
+  clip_max_bytes: "8000000"
+
+  # Play off the card, whatever the size. 4-bit SDMMC reads a frame in about
+  # as long as the JPEG peripheral takes to decode it, so holding the clip in
+  # PSRAM buys nothing here -- and the card holds hundreds of times more.
+  clip_prefer_card: "true"
+  # What one clip may occupy ON THE CARD -- about 7 hours at 480x800, 15 fps.
+  # The card holds far more; this is a sane ask, not a ceiling of the
+  # hardware. Frame offsets are 32-bit, so 4 GB is the real one.
+  clip_card_bytes: "1000000000"
   clip_cache_bytes: "24000000"
 
 esphome:

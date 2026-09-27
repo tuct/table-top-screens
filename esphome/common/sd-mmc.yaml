@@ -43,5 +43,11 @@ sd_spi:
   # that must not be "erase the user's card".
   format_if_mount_failed: false
 
+# Hand the card to sd_clip, when a device includes both. `sd_id` is optional
+# there -- a board can have no card at all -- so without this it never asks
+# for one, and content that belongs on the card is held in memory instead.
+sd_clip:
+  sd_id: sd
+
 packages:
   entities: !include sd-entities.yaml

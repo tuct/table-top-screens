@@ -1,7 +1,7 @@
 {% macro upload_form(cls, label, id='') %}
   <form method="post" action="/d/{{ device }}/content" enctype="multipart/form-data" class="inline">
     <label class="{{ cls }}"{% if id %} id="{{ id }}"{% endif %}>{{ label|safe }}
-      <input type="file" name="file" accept="image/*" hidden onchange="this.form.submit()">
+      <input type="file" name="file" accept="image/*,video/*" hidden onchange="this.form.submit()">
     </label>
   </form>
 {% endmacro %}
@@ -195,7 +195,8 @@
                      reflow the list every time you switch. The picture on the
                      screen names its file in the preview beside this list,
                      and every row carries it as a tooltip. #}
-                  {{ it.facts }}{% if it.cached %} · <span class="cached" title="Held by the screen: {{ it.cached }}">cached</span>{% endif %}
+                  {{ it.facts }}{% if it.cached %} · <span class="cached{{ ' oncard' if it.where == 'on card' }}"
+                    title="{{ it.at }}">{{ it.where }}</span>{% endif %}
                 </div>
               </div>
               {% if it.anim %}<span class="anim{{ ' muted' if it.still_here }}"
@@ -233,7 +234,8 @@
                 <div class="nameline"><span class="nm" title="{{ it.filename }}">{{ it.title }}</span></div>
                 {% if it.desc %}<div class="sub desc">{{ it.desc }}</div>{% endif %}
                 <div class="mono sub">
-                  {{ it.facts }}{% if it.cached %} · <span class="cached" title="Held by the screen: {{ it.cached }}">cached</span>{% endif %}
+                  {{ it.facts }}{% if it.cached %} · <span class="cached{{ ' oncard' if it.where == 'on card' }}"
+                    title="{{ it.at }}">{{ it.where }}</span>{% endif %}
                 </div>
               </div>
               {% if it.anim %}<span class="anim">&#9654; {{ it.anim }}</span>{% endif %}
@@ -255,7 +257,7 @@
       {% else %}
         <p class="note" style="padding:0 20px">Everything in the library is already on this screen.</p>
       {% endif %}
-      {{ upload_form('drop', icon.up ~ '<span>Drop an image or <b>browse</b> — shows immediately</span>'|safe, 'drop') }}
+      {{ upload_form('drop', icon.up ~ '<span>Drop an image or video, or <b>browse</b> — shows immediately</span>'|safe, 'drop') }}
     </div>
 
     {% if cache or sd %}

@@ -24,6 +24,8 @@ import math
 
 from PIL import Image, ImageDraw, ImageSequence
 
+import video
+
 # Keep the synthetic clip short enough to loop visibly, long enough that a
 # stuck frame counter is obvious.
 SYNTHETIC_FRAMES = 60
@@ -36,8 +38,15 @@ SYNTHETIC_FRAMES = 60
 ANIMATED_FORMATS = {"GIF", "PNG", "WEBP"}
 
 
+def is_video(body: bytes | None, filename: str = "") -> bool:
+    """A video container, which Pillow cannot open and ffmpeg can."""
+    return bool(body) and video.looks_like_video(body, filename)
+
+
 def frame_count(body: bytes) -> int:
     """How many frames the uploaded image has. 1 for a still."""
+    if is_video(body):
+        return video.probe(body)["frames"]
     try:
         with Image.open(io.BytesIO(body)) as im:
             return getattr(im, "n_frames", 1) or 1
@@ -54,8 +63,16 @@ def describe_motion(body: bytes) -> dict:
 
     Covers APNG as well as GIF and animated WebP. Pillow calls an APNG
     "PNG" with n_frames > 1, so this asks `is_animated` / `n_frames` rather
-    than trusting the format name.
+    than trusting the format name. A video is read by ffmpeg instead, and is
+    never "browser playable" here: the lists show a rendered thumbnail, not
+    the file.
     """
+    if is_video(body):
+        info = video.probe(body)
+        return {"animated": True, "frames": info["frames"],
+                "duration_ms": info["duration_ms"], "browser_playable": False,
+                "format": "VIDEO", "fps": info["fps"],
+                "size": [info["width"], info["height"]]}
     try:
         with Image.open(io.BytesIO(body)) as im:
             fmt = im.format or ""
@@ -138,6 +155,12 @@ def durations(body: bytes | None) -> list[int]:
     Same rule as describe_motion(): a missing or zero duration means "as fast
     as you can", which browsers treat as ~100 ms, so that is what we use too.
     """
+    if is_video(body):
+        # Every frame the same length, which is what a constant frame rate
+        # means -- and a variable-rate file is resampled by ffmpeg anyway.
+        info = video.probe(body)
+        step = max(1, round(1000 / (info["fps"] or 25.0)))
+        return [step] * max(1, info["frames"])
     if body is not None and is_animated(body):
         with Image.open(io.BytesIO(body)) as im:
             return [int(f.info.get("duration") or 0) or 100
@@ -172,6 +195,25 @@ def iter_frames(body: bytes | None, indices: list[int], w: int, h: int):
     which for a long GIF is quadratic -- fine for one frame, not for a clip.
     """
     wanted = sorted(set(indices))
+    if is_video(body):
+        # ffmpeg is already resampling to the rate the caller asked for, so
+        # what comes out of the pipe IS the output sequence -- numbered as
+        # the caller numbered it, however many source frames it took.
+        info = video.probe(body)
+        fps = (len(indices) * 1000.0) / max(1, sum(durations(body))) if indices else info["fps"]
+        n = 0
+        for img in video.iter_video_frames(body, fps or info["fps"], w, h,
+                                           limit=len(wanted), info=info):
+            yield wanted[n], img
+            n += 1
+            if n >= len(wanted):
+                break
+        # A container that ends early still has to fill the sequence, or the
+        # caller is left with a hole it cannot render.
+        while n < len(wanted):
+            yield wanted[n], Image.new("RGB", (w, h), (0, 0, 0))
+            n += 1
+        return
     if body is not None and is_animated(body):
         with Image.open(io.BytesIO(body)) as im:
             for n in wanted:
@@ -184,6 +226,8 @@ def iter_frames(body: bytes | None, indices: list[int], w: int, h: int):
 
 def source_info(body: bytes | None) -> dict:
     """What the device is about to play, for the UI and the API."""
+    if is_video(body):
+        return {"source": "video", "frames": video.probe(body)["frames"]}
     if body is not None and is_animated(body):
         return {"source": "uploaded", "frames": frame_count(body)}
     return {"source": "synthetic", "frames": SYNTHETIC_FRAMES}
@@ -191,6 +235,10 @@ def source_info(body: bytes | None) -> dict:
 
 def frame(body: bytes | None, n: int, w: int, h: int) -> Image.Image:
     """Frame `n` from the best available source, as an RGB image."""
+    if is_video(body):
+        # Seeking to an arbitrary frame costs a decode from the last keyframe;
+        # the one caller that wants a single frame wants the first.
+        return video.first_frame(body, w, h)
     if body is not None and is_animated(body):
         return extract(body, n)
     return synthetic(n, w, h)

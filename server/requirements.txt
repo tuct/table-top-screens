@@ -3,6 +3,11 @@ Pillow>=10.0
 zeroconf>=0.130      # mDNS discovery of screens
 requests>=2.31       # pushing URL + refresh to a screen's web_server REST API
 
+# Video upload (MP4/AVI/MOV/MKV). Only a fallback: a system ffmpeg on PATH is
+# preferred, and is what `brew install ffmpeg` / `apt install ffmpeg` gives.
+# Without either, videos are refused and everything else works.
+imageio-ffmpeg>=0.5
+
 # Optional: lossless QOI output (fmt=qoi). Decodes far faster on-device
 # than PNG, at roughly PNG-ish size. Skip if you only use JPEG.
 # qoi>=0.6

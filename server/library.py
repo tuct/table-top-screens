@@ -47,6 +47,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import time
@@ -55,6 +56,7 @@ from pathlib import Path
 from PIL import Image
 
 import frames
+import video
 
 DEVICE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 ITEM_RE = re.compile(r"^[0-9a-f]{16}$")
@@ -169,12 +171,28 @@ def body_of(root: Path, item_id: str) -> bytes:
 
 
 def _describe(body: bytes, content_type: str, filename: str) -> dict:
-    try:
-        with Image.open(io.BytesIO(body)) as probe:
-            probe.load()
-            size, fmt = probe.size, probe.format
-    except Exception as exc:  # noqa: BLE001 - Pillow raises many types
-        raise LibraryError(f"not a decodable image: {exc}") from exc
+    if video.looks_like_video(body, filename):
+        # Stored exactly as uploaded, like every other source: framing, size
+        # and frame rate are per screen, so there is nothing to transcode to
+        # that would be right for all of them.
+        if not video.have_ffmpeg():
+            raise LibraryError(
+                "this is a video, and no ffmpeg is available to read it -- "
+                "install ffmpeg, or pip install imageio-ffmpeg"
+            )
+        try:
+            probe = video.probe(body)
+        except Exception as exc:  # noqa: BLE001 - ffmpeg fails many ways
+            raise LibraryError(f"not a readable video: {exc}") from exc
+        size = (probe["width"], probe["height"])
+        fmt = (os.path.splitext(filename)[1].lstrip(".") or "video").upper()
+    else:
+        try:
+            with Image.open(io.BytesIO(body)) as probe:
+                probe.load()
+                size, fmt = probe.size, probe.format
+        except Exception as exc:  # noqa: BLE001 - Pillow raises many types
+            raise LibraryError(f"not a decodable image: {exc}") from exc
     sha = hashlib.sha256(body).hexdigest()
     # Detect motion once, at upload, so lists and pages never re-decode to
     # find out. Covers GIF, APNG and animated WebP -- Pillow reports an APNG

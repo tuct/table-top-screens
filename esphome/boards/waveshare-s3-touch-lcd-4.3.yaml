@@ -27,6 +27,8 @@ substitutions:
   # CS is not a GPIO, so the board holds it asserted and sd_spi is told "none".
   sd_spi_host: SPI2_HOST
   sd_cs_pin: none
+  # Its own pins, not the panel's (that is RGB parallel), so nothing to match.
+  sd_data_rate: 20MHz
 
 esp32:
   board: esp32-s3-devkitc-1

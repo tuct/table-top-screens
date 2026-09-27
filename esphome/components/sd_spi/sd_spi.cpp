@@ -232,13 +232,20 @@ void SdSpi::self_test_() {
 }
 
 void SdSpi::dump_config() {
-  ESP_LOGCONFIG(TAG, "SD card (SPI):");
+  ESP_LOGCONFIG(TAG, this->sdmmc_ ? "SD card (SDMMC):" : "SD card (SPI):");
   ESP_LOGCONFIG(TAG, "  Mount point: %s", this->mount_point_.c_str());
-  ESP_LOGCONFIG(TAG, "  SPI host: %d", this->spi_host_);
-  if (this->cs_pin_ < 0) {
-    ESP_LOGCONFIG(TAG, "  CS pin: none (held externally)");
+  if (this->sdmmc_) {
+    ESP_LOGCONFIG(TAG, "  Slot: %d, %d-bit", this->mmc_slot_, this->mmc_width_);
+    ESP_LOGCONFIG(TAG, "  Pins: CLK%d CMD%d D0..D3 %d %d %d %d", this->mmc_clk_,
+                  this->mmc_cmd_, this->mmc_d_[0], this->mmc_d_[1], this->mmc_d_[2],
+                  this->mmc_d_[3]);
   } else {
-    ESP_LOGCONFIG(TAG, "  CS pin: GPIO%d", this->cs_pin_);
+    ESP_LOGCONFIG(TAG, "  SPI host: %d", this->spi_host_);
+    if (this->cs_pin_ < 0) {
+      ESP_LOGCONFIG(TAG, "  CS pin: none (held externally)");
+    } else {
+      ESP_LOGCONFIG(TAG, "  CS pin: GPIO%d", this->cs_pin_);
+    }
   }
   ESP_LOGCONFIG(TAG, "  Max frequency: %d kHz", this->max_freq_khz_);
   ESP_LOGCONFIG(TAG, "  Mounted: %s", YESNO(this->mounted_));

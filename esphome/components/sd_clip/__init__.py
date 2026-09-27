@@ -62,6 +62,8 @@ CONF_HTTP_REQUEST_ID = "http_request_id"
 CONF_DIRECTORY = "directory"
 CONF_MAX_BYTES = "max_bytes"
 CONF_CACHE_BYTES = "cache_bytes"
+CONF_PREFER_CARD = "prefer_card"
+CONF_CARD_BYTES = "card_bytes"
 CONF_BYTE_ORDER = "byte_order"
 CONF_JPEG_DECODER = "jpeg_decoder"
 CONF_ELEMENT_ORDER = "element_order"
@@ -114,6 +116,14 @@ CONFIG_SCHEMA = cv.Schema(
         ),
         # `auto` means the JPEG peripheral on an ESP32-P4 and JPEGDEC on
         # anything else. Only the P4 has the peripheral.
+        # Play from the card even when the clip would fit in memory. Reading
+        # a frame off 4-bit SDMMC costs about as long as decoding it, and the
+        # card holds hundreds of times what PSRAM does.
+        cv.Optional(CONF_PREFER_CARD, default=False): cv.boolean,
+        # How long a clip may be when it goes to the card rather than to
+        # memory. This is what the server is told, so it is the real length
+        # limit; 0 keeps the old behaviour of asking for max_bytes.
+        cv.Optional(CONF_CARD_BYTES, default=0): cv.int_range(min=0, max=3_000_000_000),
         cv.Optional(CONF_JPEG_DECODER, default="auto"): cv.one_of(
             "auto", "hardware", "software", "esp_new", lower=True
         ),
@@ -142,6 +152,8 @@ async def to_code(config):
     cg.add(var.set_cache_bytes(max(config[CONF_CACHE_BYTES], config[CONF_MAX_BYTES])))
     cg.add(var.set_big_endian(config[CONF_BYTE_ORDER] == "big_endian"))
     cg.add(var.set_bgr_order(config[CONF_ELEMENT_ORDER] == "bgr"))
+    cg.add(var.set_prefer_card(config[CONF_PREFER_CARD]))
+    cg.add(var.set_card_bytes(config[CONF_CARD_BYTES]))
 
     decoder = config[CONF_JPEG_DECODER]
     is_p4 = get_esp32_variant() == VARIANT_ESP32P4

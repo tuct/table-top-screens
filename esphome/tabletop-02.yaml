@@ -11,6 +11,15 @@ substitutions:
   # See tabletop-01.yaml for why this is long and why 0s would be wrong.
   poll_interval: 30min
 
+  # Play off the card here too, to see whether SPI can keep up: this card is
+  # on the LCD's own bus at 20 MHz, a tenth of the P4's 4-bit SDMMC, and the
+  # S3 decodes in software. The per-frame log line says whether it holds.
+  clip_prefer_card: "true"
+  # What one clip may occupy ON THE CARD -- about 25 hours at 240x240, 15 fps.
+  # The card holds far more; this is a sane ask, not a ceiling of the
+  # hardware. Frame offsets are 32-bit, so 4 GB is the real one.
+  clip_card_bytes: "500000000"
+
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}

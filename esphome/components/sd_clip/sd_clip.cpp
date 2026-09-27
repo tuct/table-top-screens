@@ -570,6 +570,7 @@ bool SdClip::start_fetch_(FetchKind kind, const std::string &key, const std::str
   Fetch fetch;
   fetch.kind = kind;
   fetch.key = key;
+  fetch.url = url;
   fetch.dir = dir;
   fetch.live = live;
   fetch.etag_file = etag_file;
@@ -577,7 +578,15 @@ bool SdClip::start_fetch_(FetchKind kind, const std::string &key, const std::str
   if (to_memory) {
     fetch.mem = this->reserve_(len);
     if (fetch.mem == nullptr) {
-      ESP_LOGW(TAG, "%s: cannot allocate %u KB of PSRAM", what, static_cast<unsigned>(len / 1024));
+      // The largest BLOCK, not the total: a 16 MB item needs 16 MB in one
+      // piece, and a heap with 26 MB free can still refuse it.
+      ESP_LOGW(TAG, "%s: cannot allocate %u KB of PSRAM (%u KB free, biggest block %u KB)",
+               what, static_cast<unsigned>(len / 1024),
+               static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+               static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
+      if (!this->sd_mounted())
+        ESP_LOGW(TAG, "%s: no card to fall back to -- lower clip_max_bytes for this board",
+                 what);
       container->end();
       this->fetch_failed_(kind, key);
       return false;
@@ -651,6 +660,66 @@ void SdClip::abort_fetch_() {
   fx.http->end();
 }
 
+/// How many times one transfer may pick itself up before it is a failure.
+static const int FETCH_RESUMES = 4;
+
+bool SdClip::resume_fetch_(Fetch &fx) {
+  if (fx.attempt >= FETCH_RESUMES || fx.written == 0 || fx.written >= fx.expected)
+    return false;
+  if (this->http_ == nullptr || fx.url.empty())
+    return false;
+
+  const std::string range = "bytes=" + std::to_string(fx.written) + "-";
+  std::vector<http_request::Header> headers{{"Range", range}};
+  std::shared_ptr<http_request::HttpContainer> container;
+  {
+    WdtPause no_watchdog;
+    container = this->http_->get(fx.url, headers, {"etag"});
+  }
+  if (container == nullptr)
+    return false;
+  // 206 is the rest of it. A server that ignores Range answers 200 with the
+  // whole file, which is no use here: we have already written the first part
+  // and cannot rewind a card file cheaply.
+  if (container->status_code != 206) {
+    ESP_LOGW(TAG, "Resume refused (HTTP %d); starting over", container->status_code);
+    container->end();
+    return false;
+  }
+
+  Fetch next;
+  next.kind = fx.kind;
+  next.key = fx.key;
+  next.url = fx.url;
+  next.dir = fx.dir;
+  next.live = fx.live;
+  next.etag_file = fx.etag_file;
+  next.etag = fx.etag;
+  next.expected = fx.expected;
+  next.written = fx.written;
+  next.attempt = fx.attempt + 1;
+  next.started = fx.started;
+  next.last_data = millis();
+  next.http = container;
+  if (fx.mem != nullptr) {
+    next.mem = fx.mem;
+    fx.mem = nullptr;  // moved, not copied: finish_fetch_ must not free it
+  } else {
+    const std::string temp = fx.dir + "/" + FETCH_TEMP;
+    next.file = fopen(temp.c_str(), "ab");
+    if (next.file == nullptr) {
+      ESP_LOGW(TAG, "Cannot reopen %s to resume", temp.c_str());
+      container->end();
+      return false;
+    }
+  }
+  ESP_LOGI(TAG, "Resuming %s from %u KB of %u KB (attempt %d)", fx.key.c_str(),
+           static_cast<unsigned>(next.written / 1024),
+           static_cast<unsigned>(next.expected / 1024), next.attempt);
+  this->fetch_ = std::move(next);
+  return true;
+}
+
 void SdClip::finish_fetch_(bool ok) {
   // Move the state out first: what happens next may start the next step (a
   // load), and must see the download slot as free.
@@ -665,6 +734,12 @@ void SdClip::finish_fetch_(bool ok) {
   if (!ok) {
     ESP_LOGW(TAG, "%s: transfer stopped at %u of %u bytes", what,
              static_cast<unsigned>(fx.written), static_cast<unsigned>(fx.expected));
+    // Ask for the rest rather than the whole thing again. A 16 MB clip takes
+    // long enough that one stall near the end -- a card pausing to erase, a
+    // moment of bad wifi -- would otherwise throw away everything already
+    // received, and the retry would meet the same odds.
+    if (this->resume_fetch_(fx))
+      return;
     if (fx.mem != nullptr)
       heap_caps_free(fx.mem);
     else
@@ -1051,12 +1126,18 @@ bool SdClip::start_load_(const std::string &key, const std::string &path) {
     ESP_LOGW(TAG, "%s: missing or empty", path.c_str());
     return false;
   }
-  // Too big to hold? Play it from the card instead of truncating it. That is
-  // what makes clip length a question about the card rather than about PSRAM.
-  if (size > this->max_bytes_) {
-    ESP_LOGI(TAG, "%s is %u KB, over the %u KB memory budget -- streaming it", path.c_str(),
-             static_cast<unsigned>(size / 1024),
-             static_cast<unsigned>(this->max_bytes_ / 1024));
+  // Play it from the card: always, if this board prefers that, and otherwise
+  // whenever it is too big to hold. Either way clip length becomes a question
+  // about the card rather than about PSRAM.
+  if (this->prefer_card_ || size > this->max_bytes_) {
+    if (this->prefer_card_ && size <= this->max_bytes_) {
+      ESP_LOGI(TAG, "%s is %u KB and would fit in memory; playing it off the card anyway",
+               path.c_str(), static_cast<unsigned>(size / 1024));
+    } else {
+      ESP_LOGI(TAG, "%s is %u KB, over the %u KB memory budget -- streaming it", path.c_str(),
+               static_cast<unsigned>(size / 1024),
+               static_cast<unsigned>(this->max_bytes_ / 1024));
+    }
     if (this->start_stream_(key, path))
       return true;
     // Not streamable (raw MJPEG, or no memory for a frame): fall back to
@@ -1431,6 +1512,7 @@ bool SdClip::show_frame_(size_t index) {
     data = item->buf + item->off[index];
   }
 
+  this->blit_us_ = 0;
   const uint32_t t0 = micros();
 #if defined(USE_SD_CLIP_HW_JPEG)
   const bool ok = this->hw_decode_(data, len);
@@ -1642,6 +1724,7 @@ bool SdClip::esp_new_decode_(const uint8_t *data, size_t len) {
 void SdClip::blit_band_(const uint8_t *pixels, int img_w, int img_h, int y, int rows) {
   if (rows <= 0)
     return;
+  const uint32_t t0 = micros();
   // Same centring and clipping as blit_image_, but for a slice of the image:
   // the band's own top edge is `y` rows down from the image's.
   const int ox = (this->width_ - img_w) / 2;
@@ -1657,6 +1740,7 @@ void SdClip::blit_band_(const uint8_t *pixels, int img_w, int img_h, int y, int 
   this->display_->draw_pixels_at(x0, y0, w, h, pixels, display::COLOR_ORDER_RGB,
                                  display::COLOR_BITNESS_565, this->big_endian_, skip_left, skip_top,
                                  img_w - skip_left - w);
+  this->blit_us_ += micros() - t0;
 }
 
 #else  // software decoder

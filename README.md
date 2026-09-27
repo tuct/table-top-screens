@@ -25,9 +25,12 @@ esphome/
   common/
     base.yaml                           wifi / api / ota / web_server / diagnostics
     content-pull.yaml                   mDNS advertisement + content path
+    sd-card.yaml / sd-mmc.yaml          a card over SPI, or over SDMMC
+    sd-entities.yaml                    the buttons and sensors both share
   secrets.yaml.example
 server/
   app.py                                content server (Flask + Pillow)
+  video.py                              MP4/AVI/MOV read through ffmpeg
   discovery.py                          mDNS browse + push to screens
   library.py                            pool, variants, scenes, screens seen
   templates/index.html  device.html     the two pages (Jinja)
@@ -72,7 +75,7 @@ file.
 |---|---|---|
 | tabletop-01 (Waveshare 4.3) | `sd-card` + `sd-still` | `anim=none sd=1 img=jpeg,rgb565` |
 | tabletop-02 (round XIAO) | `sd-card` + `mjpeg-clip` | `round=1 anim=gif,apng,webp sd=1 clip=mjpeg` |
-| tabletop-03 (Waveshare P4) | `mjpeg-clip` | `anim=gif,apng,webp sd=0 clip=mjpeg` |
+| tabletop-03 (Waveshare P4) | `sd-mmc` + `mjpeg-clip` | `anim=gif,apng,webp sd=1 clip=mjpeg` |
 
 **`sd` means "this screen has a card", not "it keeps stills on one."** It used
 to be set by `sd-still.yaml`, so tabletop-02 — which has a card and fills it
@@ -197,15 +200,71 @@ trade JPEGDEC makes. Whole-frame mode would have wanted 115 KB per frame on
 this board. It also emits RGB565 in the panel's own byte order, so nothing is
 swapped on the way out.
 
-**How long a clip can be.** Real 240×240-equivalent video averages about
-2.8 KB per frame at ffmpeg `-q:v 7`, or roughly double at q80. 4 MB is about
-35–70 s at 20 fps. `Clip Seconds` reports the real figure.
+**How long a clip can be: as long as the card.** A clip that will not fit in
+memory -- or any clip at all, on a board with `prefer_card` -- is indexed on
+the card and read a frame at a time as it plays. Only the index is held, 8
+bytes a frame, so length stops being a memory question.
+
+| | frame | at 15 fps | 30 GB card |
+|---|---|---|---|
+| tabletop-02, 240×240 | ~5.6 KB | 84 KB/s | ~100 hours |
+| tabletop-03, 480×800 | ~40 KB | 600 KB/s | ~14 hours |
+
+The real ceilings are elsewhere and both are stated in the device files: frame
+offsets are 32-bit, so **4 GB per clip**, and the index costs 8 bytes a frame
+of PSRAM. `clip_card_bytes` is what each screen actually asks the server for
+(500 MB and 1 GB here); `clip_max_bytes` remains the MEMORY budget, used when
+there is no card.
+
+Without a card, it is still 4 MB: about 35–70 s at 20 fps for real video at
+2.8 KB a frame, double that at q80. `Clip Seconds` reports the real figure.
+
+**Measured on hardware, playing off the card:**
+
+```
+tabletop-03  15.7 of 15 fps | 11.7 ms card read +  8.1 ms decode | 480×800, SDMMC 4-bit
+tabletop-02  15.2 of 15 fps | 13.0 ms card read + 24.6 ms decode | 240×240, SPI 20MHz
+```
+
+The P4 spends 20 ms of a 66 ms budget and would hold ~50 fps. The round screen
+spends 38 ms, most of it pushing pixels at the panel rather than decoding --
+which is why its SPI clock is 40 MHz and not the 20 Seeed use (that alone was
+22 ms a frame, and cost the 1.5 fps that streaming had taken).
 
 **Files on the card.** Put them in `/mjpeg`. Two formats work: the server's
 TTMJ, or plain back-to-back JPEGs such as `ffmpeg -c:v mjpeg` or
 video-Player's converter produce. Pick a file with **Next SD Clip** or by
 typing its name into **SD Clip**. The choice survives reboots, and new content
 from the server replaces it.
+
+### SD cards, two transports (`common/sd-card.yaml`, `common/sd-mmc.yaml`)
+
+One component, `components/sd_spi`, because only the MOUNT differs: everything
+above it is VFS and does not care how the bytes arrive. `cs_pin`/`spi_host`
+give SPI; `clk_pin`/`cmd_pin`/`data_pins` give SDMMC.
+
+| Board | Wiring | Clock | Read of one frame |
+|---|---|---|---|
+| Seeed round | SPI, shares the LCD bus (CS D2) | 20 MHz | ~13 ms at 240×240 |
+| Waveshare 4.3 | SPI, CS held low on the expander | 20 MHz | stills only |
+| Waveshare P4 | SDMMC 4-bit, GPIO39-44, LDO channel 4 | 40 MHz | ~12 ms at 480×800 |
+
+Four things cost a flash each to find, and all four are one line:
+
+* **ESPHome compiles out VFS directory support.** The card mounts, then
+  refuses `opendir()` and file creation -- which reads exactly like a
+  read-only card. Every board with a slot needs the `advanced:` block that
+  keeps `fatfs` and the VFS features.
+* **`SDMMC_HOST_DEFAULT()` picks slot 1**, which on the P4 board is the SDIO
+  link to the C6 radio. The card worked perfectly and the screen had no
+  network. The slot is a config option now, defaulting to 0.
+* **`sd_id` is optional on `sd_clip`** -- a board may have no slot -- so
+  leaving it out is not "find the card", it is "there is no card". Both card
+  packages pass it now; before that, every screen silently ran memory-only.
+* **The card does not have to match the panel's clock.** The Seeed card does
+  not mount at 40 MHz even though the panel beside it is driven at 40; they
+  are separate devices on one bus, and the reconfiguration between them costs
+  nothing measurable.
 
 ### Stills on the SD card (`common/sd-still.yaml`)
 
@@ -246,6 +305,31 @@ this path removes is PSRAM use **for content**: no decode buffer, no clip cache.
 `buffer_size_rx` is 8192. The ~16 s figure in `sd-clip.yaml` matches the old
 512-byte read size (~48 KB/s), so it may well predate that fix — check the
 `Still: N KB stored in M ms` log line.
+
+## Video in, MJPEG out (`server/video.py`)
+
+An uploaded MP4, AVI, MOV or MKV is stored in the pool exactly as it arrived,
+like every other source, and read back a frame at a time through ffmpeg.
+Nothing is transcoded at upload: framing, size and frame rate are per screen
+and per variant, so a canonical intermediate would be wrong for someone or
+huge for everyone.
+
+```
+upload  →  ffmpeg -i … -vf scale=W:H,fps=N -pix_fmt rgb24 -f rawvideo -
+        →  one PIL frame at a time  →  existing framing  →  JPEG  →  TTMJ record
+```
+
+A frame at a time on both sides, so a two-hour file costs the same memory as a
+two-second one. ffmpeg is whichever is on PATH, else the static build that
+ships with `imageio-ffmpeg` (a pip dependency, no system install); without
+either, videos are refused with a line saying why and everything else works.
+
+Two details worth keeping: the output size is computed and passed to ffmpeg as
+exact numbers, because `force_original_aspect_ratio=decrease` quietly UPSCALES
+a source smaller than the box and a stride that disagrees by one pixel turns
+the stream into garbage; and a video is never "playable as a still" except on
+a screen that advertises no animation at all, because the server decodes it
+and sends TTMJ like everything else.
 
 ## The pages (`server/templates/`)
 

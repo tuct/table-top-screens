@@ -34,7 +34,7 @@
          asks which: the first live one, else the first known. #}
       <form method="post" action="/d/{{ upload_to }}/content" enctype="multipart/form-data" class="inline">
         <label class="btn dark">{{ icon.up }} Upload to {{ upload_to }}
-          <input type="file" name="file" accept="image/*" hidden onchange="this.form.submit()">
+          <input type="file" name="file" accept="image/*,video/*" hidden onchange="this.form.submit()">
         </label>
       </form>
     </div>

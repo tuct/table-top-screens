@@ -531,7 +531,10 @@ def main() -> int:
     page = c.get("/d/tabletop-01/").get_data(as_text=True)
     check("device page shows memory in use", "Memory 1.2 MB of 4.8 MB" in page)
     check("and the cached items", "intro.mjpeg" in page and "on screen" in page)
-    check("library row carries a cached badge", 'class="cached"' in page)
+    check("library row says where the picture is held",
+          'class="cached oncard"' in page or 'class="cached"' in page)
+    check("and names the place, not just the fact",
+          ">on card<" in page or ">in memory<" in page)
     # The overview says it as a bar and a line, not a sentence.
     idx = c.get("/").get_data(as_text=True)
     check("index card shows memory too", "1.2 MB / 4.8 MB" in idx)
@@ -565,6 +568,19 @@ def main() -> int:
     check("a budget smaller than the cache frees something",
           srv.clip_cache_prune(0) >= len(r.data))
     check("leaving nothing behind", not list((DATA_TEST / "_clips").glob("*.ttmj")))
+
+    print("\na stopped download can be picked up where it stopped")
+    whole = c.get("/d/big/clip.mjpeg?w=60&h=40&fps=10&max=4000000")
+    cut = len(whole.data) // 3
+    rest = c.get("/d/big/clip.mjpeg?w=60&h=40&fps=10&max=4000000",
+                 headers={"Range": f"bytes={cut}-"})
+    check("a range request is answered with 206", rest.status_code == 206,
+          str(rest.status_code))
+    check("it says which bytes it is sending",
+          rest.headers.get("Content-Range") == f"bytes {cut}-{len(whole.data)-1}/{len(whole.data)}",
+          rest.headers.get("Content-Range", ""))
+    check("and they are the bytes that were missing", rest.data == whole.data[cut:])
+    check("the whole file still comes back whole", whole.status_code == 200)
 
     print("\nthe upload limit is stated, not just enforced")
     check("the ceiling is big enough for a clip", srv.MAX_UPLOAD >= 64 * 1024 * 1024,

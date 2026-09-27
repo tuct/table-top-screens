@@ -33,6 +33,10 @@ substitutions:
   anim_formats: gif,apng,webp
   clip_transport: mjpeg
   clip_jpeg_decoder: auto
+  clip_prefer_card: "false"
+  # 0: ask for no more than fits in memory. A board with a card sets this to
+  # what the card should hold.
+  clip_card_bytes: "0"
   clip_max_bytes: "4000000"
   clip_cache_bytes: "5000000"
   clip_quality: "80"
@@ -57,6 +61,10 @@ sd_clip:
   # `clip_jpeg_decoder: esp_new` in a device file to try Espressif's
   # SIMD-optimised software decoder instead, and watch `Clip Decode`.
   jpeg_decoder: ${clip_jpeg_decoder}
+  # With a card in, play off it rather than holding the clip -- see
+  # clip_prefer_card in the board or device file.
+  prefer_card: ${clip_prefer_card}
+  card_bytes: ${clip_card_bytes}
 
 globals:
   - id: mjpeg_frames_prev
@@ -218,7 +226,9 @@ interval:
               u.replace(pos, 7, "/clip.mjpeg?");
               u += "&q=${clip_quality}";
               u += "&fps=" + to_string((int) id(clip_target_fps).state);
-              u += "&max=" + to_string((unsigned) id(clip)->max_bytes());
+              // The card's budget when there is a card, memory's otherwise:
+              // this number is what decides how long a clip may be.
+              u += "&max=" + to_string((unsigned) id(clip)->download_limit());
             }
             if (!local) {
               if (u.empty()) {
@@ -257,6 +267,24 @@ interval:
             const float fps = id(clip_target_fps).state;
             id(clip_seconds).publish_state(frames > 1 && fps > 0 ? frames / fps : 0);
           }
+          // Say how playback is actually going, every 5s while a clip runs.
+          // The sensors carry the same numbers, but a log line is what you
+          // have when you are watching a screen rather than a dashboard.
+          static uint32_t said_at = 0;
+          if (id(clip)->shown_frames() > 1 && now - said_at >= 5000) {
+            said_at = now;
+            const float target = id(clip_target_fps).state;
+            const float blit = id(clip)->last_blit_ms();
+            ESP_LOGI("mjpeg", "%.1f of %.0f fps | %s%.1f ms decode (%.1f of it panel) | "
+                              "%d frames, %s",
+                     id(clip_fps).state, target,
+                     id(clip)->shown_streamed()
+                         ? str_sprintf("%.1f ms card read + ", id(clip)->last_read_ms()).c_str()
+                         : "",
+                     id(clip)->last_decode_ms(), blit, id(clip)->shown_frames(),
+                     id(clip)->shown_streamed() ? "off the card" : "from memory");
+          }
+
           const std::string key = id(clip)->shown_key();
           if (id(clip_loaded_name).state != key)
             id(clip_loaded_name).publish_state(key);

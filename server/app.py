@@ -39,6 +39,7 @@ from PIL import Image, ImageColor, ImageOps, ImageStat
 import discovery
 import frames
 import library
+import video
 
 # numpy is worth having on its own, independently of QOI: it makes RGB565
 # packing a vectorised shift instead of a per-pixel Python loop, which at
@@ -105,6 +106,11 @@ registry, _zc = discovery.start(
 )
 
 
+# Source formats that only ffmpeg reads. Held as names because that is what
+# a pool entry records; the bytes were sniffed once, at upload.
+VIDEO_FORMATS = {ext.lstrip(".").upper() for ext in video.VIDEO_EXTENSIONS} | {"VIDEO"}
+
+
 def anim_format(item: dict) -> str | None:
     """The capability name for an animated item's source: gif, apng or webp.
 
@@ -120,11 +126,24 @@ def anim_format(item: dict) -> str | None:
 
 def plays_as_still(screen, item: dict | None) -> bool:
     """True when `item` is animated but `screen` cannot play it, so it shows
-    the first frame instead."""
+    the first frame instead.
+
+    A screen's `anim` record lists the SOURCE formats it can play, from when
+    clips were sent as the source file. A video is never in that list and
+    never will be -- the server decodes it and sends TTMJ like everything
+    else -- so what matters is only whether the screen does motion at all.
+    """
     if not item or not item.get("animated"):
         return False
+    if is_video_item(item):
+        return screen.anim is not None and not screen.anim
     fmt = anim_format(item)
     return fmt is None or not screen.can_animate(fmt)
+
+
+def is_video_item(item: dict | None) -> bool:
+    """A pool entry whose source is a video container rather than an image."""
+    return bool(item) and str(item.get("source_format", "")).upper() in VIDEO_FORMATS
 
 
 def screen_shape(screen) -> str:
@@ -699,6 +718,11 @@ def render(
     once the screen is physically rotated. Doing this here rather than with
     ESPHome's display `rotation:` keeps the device on its zero-copy draw path.
     """
+    if frames.is_video(body):
+        # A video shown as a still is its first frame -- which is also what a
+        # thumbnail is, and what a screen that cannot animate will be sent.
+        src = video.first_frame(body, max(w, h) * 2, max(w, h) * 2)
+        return render_image(src, w, h, fmt, fit, quality, bg, rot, zoom)
     with Image.open(io.BytesIO(body)) as src:
         return render_image(src, w, h, fmt, fit, quality, bg, rot, zoom)
 
@@ -1040,17 +1064,15 @@ def get_clip(device: str):
             count = CLIP_HEADER.unpack(fh.read(CLIP_HEADER.size))[5]
         os.utime(path, None)  # it is the least recently USED that goes
 
-    return send_file(
-        path,
-        mimetype="application/octet-stream",
-        conditional=True,
-        etag=False,
-        last_modified=None,
-    ), 200, {
-        "ETag": etag,
-        "Cache-Control": "no-cache",
-        "X-Frame-Count": str(count),
-    }
+    # conditional=True is what answers Range, which is how a screen picks a
+    # 16 MB download up where it stopped instead of starting again. The status
+    # has to come from send_file (206 for a range), not be forced to 200.
+    resp = send_file(path, mimetype="application/octet-stream", conditional=True,
+                     etag=False, last_modified=None)
+    resp.headers["ETag"] = etag
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Frame-Count"] = str(count)
+    return resp
 
 
 @app.get("/d/<device>/frame")
@@ -1420,9 +1442,12 @@ ICONS = {
 # Quality: low values exist for clips, where quality sets bytes per frame and
 # a screen caches a fixed number of BYTES -- so dropping it is what buys a
 # longer clip and a faster download.
+# No 100: the panels are RGB565, so past ~95 the extra bytes encode detail
+# the hardware cannot show -- and on a clip they buy nothing but a shorter
+# clip and a slower download. 95 is the sharpest setting worth offering.
 QUALITIES = [
     (35, "35 · longest"), (50, "50"), (65, "65"), (75, "75"),
-    (85, "85"), (95, "95 · default"), (100, "100 · sharpest"),
+    (85, "85"), (95, "95 · sharpest"),
 ]
 FIT_CHOICES = [("contain", "Contain"), ("cover", "Cover"),
                ("width", "Width"), ("height", "Height")]
@@ -1587,10 +1612,33 @@ def device_page(device: str):
     # "cached" belongs in the row you choose from: whether the screen already
     # holds a picture is the difference between switching instantly and
     # waiting for a download.
-    held: dict[str, int] = {}
+    # Where, not just whether: a picture on the card switches without a
+    # download but is read as it plays, one in memory switches instantly, and
+    # the difference is worth seeing before you pick.
+    held: dict[str, dict] = {}
     for r in cache_entries(lib(library.screen_state, device)):
-        if r["item_id"]:
-            held[r["item_id"]] = held.get(r["item_id"], 0) + (r.get("mem", 0) or r.get("card", 0))
+        if not r["item_id"]:
+            continue
+        at = held.setdefault(r["item_id"], {"mem": 0, "card": 0})
+        at["mem"] += r.get("mem", 0) or 0
+        at["card"] += r.get("card", 0) or 0
+
+    def where_held(source_id: str) -> dict:
+        at = held.get(source_id)
+        if not at or not (at["mem"] or at["card"]):
+            return {"cached": "", "where": "", "at": ""}
+        parts = []
+        if at["card"]:
+            parts.append(f'on the card: {_kb(at["card"])}')
+        if at["mem"]:
+            parts.append(f'in memory: {_kb(at["mem"])}')
+        return {
+            "cached": _kb(at["card"] or at["mem"]),
+            # The card is the interesting half: memory is emptied by a reboot
+            # and by the next few switches, the card is not.
+            "where": "on card" if at["card"] else "in memory",
+            "at": " · ".join(parts),
+        }
 
     def row(it: dict) -> dict:
         source_id = it.get("src_id", it["id"])
@@ -1609,7 +1657,7 @@ def device_page(device: str):
             "variant": it.get("variant", ""),
             "thumb": thumb_src(it),
             "facts": f'{it["source_size"][0]}×{it["source_size"][1]} · {_kb(it["bytes"])}',
-            "cached": _kb(held[source_id]) if held.get(source_id) else "",
+            **where_held(source_id),
             "current": it["id"] == used_state["current"],
             "still_here": plays_as_still(screen, it) if screen else False,
             "source_format": it.get("source_format", ""),
@@ -1634,7 +1682,12 @@ def device_page(device: str):
             "zoom_min": ZOOM_MIN,
             "zoom_max": ZOOM_MAX,
             "q": config.get("q", DEFAULT_QUALITY),
-            "qualities": QUALITIES,
+            # A picture framed before 100 was dropped keeps it, and keeps it
+            # visible: silently moving someone's setting would be worse than
+            # one odd entry in the list.
+            "qualities": (QUALITIES if any(v == int(config.get("q", DEFAULT_QUALITY))
+                                           for v, _ in QUALITIES)
+                          else sorted(QUALITIES + [(int(config["q"]), f'{config["q"]} · kept')])),
             "bg": bg_now,
             "bgs": [(value, label, colour, "bg-" + re.sub(r"[^a-z0-9]", "", value))
                     for value, label, colour in BG_CHOICES],

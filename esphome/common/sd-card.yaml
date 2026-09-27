@@ -12,6 +12,9 @@
 #     drive it high. Tried it; "Failed to mount card".
 #
 # The board package must declare:
+#   sd_data_rate    the card's SPI clock. What the wiring holds, not what the
+#                   panel runs at -- the Seeed card shares the LCD's bus and
+#                   mounts at 20MHz while the panel is driven at 40.
 #   sd_spi_bus_id   the SPI bus the card is on
 #   sd_cs_pin       chip select: a GPIO number, or "none" when the board holds
 #                   it asserted itself (the Waveshare, via CH422G EXIO4)
@@ -37,6 +40,16 @@ sd_spi:
   # wiring or chip select than a genuinely unformatted card, and the recovery
   # for that must not be "erase the user's card".
   format_if_mount_failed: false
+  # Matched to the panel's clock where they share a bus: a card and a display
+  # asking for different speeds make the driver reconfigure the bus between
+  # every card read and every frame pushed.
+  data_rate: ${sd_data_rate}
+
+# Hand the card to sd_clip, when a device includes both. `sd_id` is optional
+# there -- a board can have no card at all -- so without this it never asks
+# for one, and content that belongs on the card is held in memory instead.
+sd_clip:
+  sd_id: sd
 
 packages:
   entities: !include sd-entities.yaml
