@@ -370,6 +370,13 @@ class SdClip : public Component {
   bool start_stream_(const std::string &key, const std::string &path);
   /// One frame of a streamed item, read into `stream_buf_`.
   const uint8_t *read_frame_(const Item *item, size_t index, size_t &len);
+  /// Open a streamed item's file, if it is not open already. Only the item
+  /// on the panel holds one: FATFS is mounted with a handful of descriptors,
+  /// and a cache of streamed clips would use every one of them.
+  bool open_stream_(Item *item);
+  /// Let go of the file, keeping the index. The item stays playable: the
+  /// next frame reopens it.
+  void close_stream_(Item *item);
   void pump_load_();
   void abort_load_();
   /// Index `buf` into a cached item; takes ownership of `buf` either way.
@@ -377,6 +384,11 @@ class SdClip : public Component {
   void activate_(Item *item);
   void update_high_freq_();
   void pump_playback_();
+  /// A bar across the panel while a clip is downloading. Playback stops for
+  /// the duration: the card cannot serve a download and a clip at once --
+  /// measured at 2.6 fps trying -- and a stuttering picture says less about
+  /// what is happening than a bar does.
+  void draw_progress_();
   bool show_frame_(size_t index);
   /// Blit one decoded RGB565 image, centred and cropped to the panel.
   /// `stride` is the source row length in PIXELS, which the hardware decoder
@@ -415,6 +427,7 @@ class SdClip : public Component {
   int band_rows_{0};
   int cached_{0};
   uint32_t last_read_us_{0};
+  uint32_t progress_at_{0};
   uint32_t last_blit_us_{0};
   /// Panel time inside the last frame's decode, accumulated band by band.
   uint32_t blit_us_{0};

@@ -40,6 +40,9 @@ sd_spi:
   # wiring or chip select than a genuinely unformatted card, and the recovery
   # for that must not be "erase the user's card".
   format_if_mount_failed: false
+  # A download opens two (temp + etag) while a clip is being played from a
+  # third; four left no room for a mistake.
+  max_files: 8
   # Matched to the panel's clock where they share a bus: a card and a display
   # asking for different speeds make the driver reconfigure the bus between
   # every card read and every frame pushed.

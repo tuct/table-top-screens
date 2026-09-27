@@ -721,6 +721,7 @@ bool SdClip::resume_fetch_(Fetch &fx) {
 }
 
 void SdClip::finish_fetch_(bool ok) {
+  this->progress_at_ = 0;
   // Move the state out first: what happens next may start the next step (a
   // load), and must see the download slot as free.
   Fetch fx = std::move(this->fetch_);
@@ -1101,6 +1102,8 @@ bool SdClip::start_stream_(const std::string &key, const std::string &path) {
 
 const uint8_t *SdClip::read_frame_(const Item *item, size_t index, size_t &len) {
   len = item->size[index];
+  if (item->fd < 0)
+    this->open_stream_(const_cast<Item *>(item));
   if (this->stream_buf_ == nullptr || len > this->stream_cap_ || item->fd < 0)
     return nullptr;
   const off_t at = item->off[index];
@@ -1443,7 +1446,37 @@ void SdClip::adopt_(const std::string &key, uint8_t *buf, size_t len, uint32_t s
     this->activate_(raw);
 }
 
+bool SdClip::open_stream_(Item *item) {
+  if (item == nullptr || !item->streamed())
+    return false;
+  if (item->fd >= 0)
+    return true;
+  const std::string full = this->mount_point() + item->path;
+  item->fd = ::open(full.c_str(), O_RDONLY);
+  if (item->fd < 0) {
+    ESP_LOGW(TAG, "Cannot reopen %s to play it", full.c_str());
+    return false;
+  }
+  return true;
+}
+
+void SdClip::close_stream_(Item *item) {
+  if (item != nullptr && item->fd >= 0) {
+    ::close(item->fd);
+    item->fd = -1;
+  }
+}
+
 void SdClip::activate_(Item *item) {
+  // One open file at a time. Every streamed item used to keep its own, and
+  // FATFS is mounted with four descriptors -- so after a few switches there
+  // were none left, and the next download could not even create its temp
+  // file. The index stays in memory either way; only the handle moves.
+  for (auto &other : this->cache_) {
+    if (other.get() != item)
+      this->close_stream_(other.get());
+  }
+  this->open_stream_(item);
   this->shown_ = item;
   this->revision_++;
   item->used = millis();
@@ -1477,6 +1510,13 @@ void SdClip::update_high_freq_() {
 }
 
 void SdClip::pump_playback_() {
+  // Downloading an item: hold the picture still and show how far along it is.
+  // Playing while fetching means both want the card, and both get a third of
+  // it; the clip stutters and the download crawls.
+  if (this->fetch_.http != nullptr && this->fetch_.kind == FETCH_ITEM) {
+    this->draw_progress_();
+    return;
+  }
   if (!this->playing_ || this->shown_ == nullptr || this->shown_->off.size() < 2 || this->fps_ <= 0)
     return;
   const uint32_t now = millis();
@@ -1491,6 +1531,45 @@ void SdClip::pump_playback_() {
   // resume from now instead of racing through frames to catch up.
   if (static_cast<int32_t>(now - this->next_due_) > static_cast<int32_t>(period))
     this->next_due_ = now + period;
+}
+
+void SdClip::draw_progress_() {
+  if (this->display_ == nullptr || this->buffer_ == nullptr || this->fetch_.expected == 0)
+    return;
+  const uint32_t now = millis();
+  if (this->progress_at_ != 0 && now - this->progress_at_ < 250)
+    return;
+  this->progress_at_ = now;
+
+  // Inset from both edges, so the whole bar is inside a round panel's circle
+  // as well as a rectangular one's corners.
+  const int inset = this->width_ / 6;
+  const int w = this->width_ - 2 * inset;
+  const int rows = std::max(4, this->height_ / 48);
+  const int y = this->height_ / 2 - rows / 2;
+  // `buffer_` is one BAND of rows, not a frame; the bar has to fit in it.
+  if (w <= 0 || rows <= 0 || rows > this->band_rows_)
+    return;
+
+  const uint64_t got = this->fetch_.written;
+  const int done = static_cast<int>(got * static_cast<uint64_t>(w) / this->fetch_.expected);
+  // RGB565, in the panel's own byte order -- draw_pixels_at is told which,
+  // but the VALUE has to be written the way the display expects to read it.
+  auto rgb565 = [this](uint8_t r, uint8_t g, uint8_t b) -> uint16_t {
+    uint16_t v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+    return this->big_endian_ ? static_cast<uint16_t>((v >> 8) | (v << 8)) : v;
+  };
+  const uint16_t filled = rgb565(0xF0, 0xF0, 0xF0);
+  const uint16_t empty = rgb565(0x20, 0x20, 0x20);
+
+  auto *px = reinterpret_cast<uint16_t *>(this->buffer_);
+  for (int x = 0; x < w; x++)
+    px[x] = x < done ? filled : empty;
+  for (int row = 1; row < rows; row++)
+    memcpy(px + row * w, px, static_cast<size_t>(w) * 2);
+
+  this->display_->draw_pixels_at(inset, y, w, rows, this->buffer_, display::COLOR_ORDER_RGB,
+                                 display::COLOR_BITNESS_565, this->big_endian_, 0, 0, 0);
 }
 
 bool SdClip::show_frame_(size_t index) {
