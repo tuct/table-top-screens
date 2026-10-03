@@ -115,6 +115,33 @@ Measured on an M1 Pro / 32 GB, 16 frames at 384×640:
 A CUDA machine is several times faster. CPU-only is slow enough to feel broken —
 the installer warns if that is what you are about to get.
 
+## Extra models
+
+`./install.sh --extras` fetches ~20 GB more, none of which the stack needs:
+
+| | |
+|---|---|
+| **LTX-Video 2B** (0.9.8 distilled) + T5 encoder | text-to-video, ~8 steps |
+| **SVD img2vid-xt** | image-to-video, purpose-built for it |
+
+They exist to answer the question the AnimateDiff models cannot: what better
+motion costs. One measurement so far, on the M1 Pro — about a second of video
+at 512x512:
+
+| | time | motion |
+|---|---|---|
+| AnimateDiff + LCM | 101 s | subtle flicker; loops seamlessly |
+| LTX-Video 2B | **45 s** | genuine frame-to-frame movement |
+
+So LTX is both faster and visibly better here. What it does not do is close a
+loop: AnimateDiff's looped context is why a clip can play forever on a screen
+without a visible seam, and nothing in LTX replaces that yet. Neither extra is
+wired into the content server — `server/generate.py` still builds AnimateDiff
+graphs, and switching it over is an open decision rather than an oversight.
+
+SVD is untested so far. Note that `svd_xt_1_1` is gated on HuggingFace and
+needs an account; the manifest pins the original `svd_xt`, which is not.
+
 ## Pins, and updating them
 
 `manifest.toml` pins ComfyUI and every node pack to a commit, and every model to

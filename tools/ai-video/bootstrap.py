@@ -13,6 +13,7 @@ stopped instead of beginning again from zero.
 
     python bootstrap.py                 install or repair
     python bootstrap.py --no-models     code only, skip the weights
+    python bootstrap.py --extras        also fetch LTX-Video and SVD (~20 GB)
     python bootstrap.py --update        bump the pins to current upstream
     python bootstrap.py --dir D         install somewhere other than ~/ComfyUI
 
@@ -290,6 +291,8 @@ def main() -> None:
                     help="install location (default ~/ComfyUI)")
     ap.add_argument("--no-models", action="store_true",
                     help="skip the weights; install code only")
+    ap.add_argument("--extras", action="store_true",
+                    help="also fetch the extra models (LTX-Video, SVD): ~20 GB more")
     ap.add_argument("--update", action="store_true",
                     help="bump manifest pins to upstream HEAD and exit")
     args = ap.parse_args()
@@ -350,12 +353,18 @@ def main() -> None:
     if args.no_models:
         R.say("Models skipped (--no-models)")
     else:
-        models = data.get("models", [])
+        models = list(data.get("models", []))
+        if args.extras:
+            models += data.get("extra_models", [])
         total_mb = sum(m.get("size_mb", 0) for m in models)
         R.say(f"Models (~{total_mb/1024:.1f} GB total)")
         for m in models:
             download(m["url"], comfy / "models" / m["dir"] / m["name"],
                      m.get("sha256"), m["name"])
+        if not args.extras and data.get("extra_models"):
+            extra_mb = sum(m.get("size_mb", 0) for m in data["extra_models"])
+            R.info(f"(--extras would add {len(data['extra_models'])} more, "
+                   f"~{extra_mb/1024:.0f} GB: LTX-Video and SVD)")
 
     R.say("Scripts")
     tabletop = comfy / "tabletop"

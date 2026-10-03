@@ -107,3 +107,33 @@ size_mb = 1895
 why = "image-to-video: anchors a still from the pool and animates outward from it"
 
 # RIFE fetches its own weights into models/frame_interpolation on first use.
+
+# -------------------------------------------------------------- extra models
+#
+# Not installed by default: another ~20 GB, and nothing in the stack requires
+# them. `bootstrap.py --extras` fetches them. They exist to answer a question
+# the AnimateDiff models cannot -- what better motion costs on each machine.
+
+[[extra_models]]
+name = "ltxv-2b-0.9.8-distilled.safetensors"
+dir = "checkpoints"
+url = "https://huggingface.co/Lightricks/LTX-Video/resolve/main/ltxv-2b-0.9.8-distilled.safetensors"
+sha256 = "76aa8c4786af752fa6f951947129d5290c3c6c0b2fadcadea6b5e114ae2cad8f"
+size_mb = 6047
+why = "LTX-Video 2B, distilled so it samples in ~8 steps; far better motion than AnimateDiff"
+
+[[extra_models]]
+name = "t5xxl_fp8_e4m3fn.safetensors"
+dir = "text_encoders"
+url = "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors"
+sha256 = "7d330da4816157540d6bb7838bf63a0f02f573fc48ca4d8de34bb0cbfd514f09"
+size_mb = 4667
+why = "the text encoder LTX-Video reads its prompt with; the fp8 build, which halves the download"
+
+[[extra_models]]
+name = "svd_xt.safetensors"
+dir = "checkpoints"
+url = "https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt/resolve/main/svd_xt.safetensors"
+sha256 = "b2652c23d64a1da5f14d55011b9b6dce55f2e72e395719f1cd1f8a079b00a451"
+size_mb = 9116
+why = "Stable Video Diffusion: image-to-video only, and purpose-built for it. The 1-1 release is gated on HuggingFace; this one is not"
