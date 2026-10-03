@@ -72,6 +72,17 @@ def main() -> int:  # noqa: PLR0915
           g["sampler"]["inputs"]["positive"] == ["pos", 0])
 
     print("\ngraphs -- image to video")
+    # Ping-pong was wired into gen.py's CLI from the start but hardcoded off
+    # here, so the web UI could not close a loop the way the CLI could.
+    off = generate.clip_graph("x", None, "square", 1)
+    on = generate.clip_graph("x", None, "square", 1, pingpong=True)
+    check("a clip does not ping-pong by default",
+          off["out"]["inputs"]["pingpong"] is False)
+    check("and does when asked", on["out"]["inputs"]["pingpong"] is True)
+    check("it changes nothing else",
+          {k: v for k, v in off["out"]["inputs"].items() if k != "pingpong"}
+          == {k: v for k, v in on["out"]["inputs"].items() if k != "pingpong"})
+
     g = generate.clip_graph("a tavern", "ref.png", "square", 1)
     check("SparseCtrl is loaded", g["sparse"]["inputs"]["sparsectrl_name"] == generate.SPARSECTRL)
     check("the still is pinned to both ends",
@@ -119,7 +130,7 @@ def main() -> int:  # noqa: PLR0915
     generate.upload_reference = fake_upload
     generate.submit = lambda kind, prompt, reference, size, seed, \
         length=generate.DEFAULT_LENGTH, adopted_from="", \
-        keep=generate.DEFAULT_KEEP: generate.Job(
+        keep=generate.DEFAULT_KEEP, pingpong=False: generate.Job(
             id="t", kind=kind, prompt=prompt, size=size, seed=seed,
             has_reference=bool(reference), length=length,
             adopted_from=adopted_from, keep=keep)
@@ -241,7 +252,7 @@ def main() -> int:  # noqa: PLR0915
     real_submit2 = generate.submit
     generate.submit = lambda kind, prompt, reference, size, seed, \
         length=generate.DEFAULT_LENGTH, adopted_from="", \
-        keep=generate.DEFAULT_KEEP: generate.Job(
+        keep=generate.DEFAULT_KEEP, pingpong=False: generate.Job(
             id="t2", kind=kind, prompt=prompt, size=size, seed=seed,
             has_reference=bool(reference), length=length,
             adopted_from=adopted_from, keep=keep)
@@ -315,7 +326,8 @@ def main() -> int:  # noqa: PLR0915
     generate.upload_reference = fake_upload
     generate.submit = lambda kind, prompt, reference, size, seed, \
         length=generate.DEFAULT_LENGTH, adopted_from="", \
-        keep=generate.DEFAULT_KEEP: (seen.update(size=size, keep=keep) or generate.Job(
+        keep=generate.DEFAULT_KEEP, pingpong=False: (
+            seen.update(size=size, keep=keep, pingpong=pingpong) or generate.Job(
             id="t3", kind=kind, prompt=prompt, size=size, seed=seed,
             has_reference=bool(reference), length=length,
             adopted_from=adopted_from, keep=keep))
@@ -336,6 +348,19 @@ def main() -> int:  # noqa: PLR0915
         r = c.post("/generate/run", data={"kind": "verify", "prompt": "x", "size": "oblong"},
                    content_type="multipart/form-data")
         check("an unknown size is still refused", r.status_code == 400, str(r.status_code))
+
+        # An unchecked HTML checkbox sends no field at all, so the route has to
+        # read absence as off rather than as missing input.
+        seen.clear()
+        c.post("/generate/run", data={"kind": "clip", "prompt": "x"},
+               content_type="multipart/form-data")
+        check("an absent checkbox means no ping-pong", seen.get("pingpong") is False,
+              str(seen.get("pingpong")))
+        seen.clear()
+        c.post("/generate/run", data={"kind": "clip", "prompt": "x", "pingpong": "1"},
+               content_type="multipart/form-data")
+        check("and a ticked one reaches the job", seen.get("pingpong") is True,
+              str(seen.get("pingpong")))
     finally:
         generate.upload_reference, generate.submit = real_up2, real_sub2
 

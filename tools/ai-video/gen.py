@@ -35,6 +35,15 @@ ADAPTER = "v3_sd15_adapter.ckpt"
 SPARSECTRL = "v3_sd15_sparsectrl_rgb.ckpt"
 LCM = "lcm_lora_sd15.safetensors"
 
+# Wan 2.2, used only by --flf. Fetched by `bootstrap.py --wan`; a plain install
+# does not have these and --flf will fail at the loader, not silently.
+WAN_HIGH = "Wan2.2-I2V-A14B-HighNoise-Q4_K_M.gguf"
+WAN_LOW = "Wan2.2-I2V-A14B-LowNoise-Q4_K_M.gguf"
+WAN_ENCODER = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+WAN_VAE = "wan_2.1_vae.safetensors"
+WAN_LORA_HIGH = "Wan2.2-Lightning_I2V-A14B-4steps-lora_HIGH_fp16.safetensors"
+WAN_LORA_LOW = "Wan2.2-Lightning_I2V-A14B-4steps-lora_LOW_fp16.safetensors"
+
 # Panel -> render size. Multiples of 8, kept near SD1.5's native pixel budget:
 # much above ~640x384 and a 16-frame batch stops fitting comfortably in 32 GB.
 SCREENS = {
@@ -245,6 +254,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="frame indexes the still is pinned to. Defaults to both "
                         "ends (\"0,N-1\"): anchoring only frame 0 lets everything "
                         "after it drift off the subject")
+    p.add_argument("--flf", action="store_true",
+                   help="Wan 2.2 first-last-frame instead of AnimateDiff: the "
+                        "same --image at both ends, so the loop closes exactly. "
+                        "Needs `bootstrap.py --wan` (~26 GB). UNTESTED")
     p.add_argument("--negative", default=NEGATIVE)
     p.add_argument("--name", default="tabletop", help="output filename prefix")
     p.add_argument("--loop", action=argparse.BooleanOptionalAction,
@@ -257,8 +270,132 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def build_wan(args) -> tuple[dict, int, tuple[int, int]]:
+    """Wan 2.2 image-to-video, with the loop closed by conditioning.
+
+    The one thing the AnimateDiff and LTX graphs cannot do. WanFirstLastFrameToVideo
+    takes a first AND a last frame, so passing the SAME picture to both ends
+    makes the clip return exactly to where it started -- no sliding-window
+    context, no seam, and the motion in between is Wan's rather than
+    AnimateDiff's.
+
+    A14B is a mixture of experts and both halves run: the high-noise model
+    takes the early steps and hands the latent over mid-sample to the
+    low-noise one, each with its own matching Lightning LoRA. That is why
+    there are two loaders and two samplers rather than one of each.
+
+    UNTESTED. The pins and hashes in manifest.toml are verified, this graph is
+    not -- validate it against ComfyUI's own Wan 2.2 I2V template before
+    trusting it.
+    """
+    w, h = SCREENS[args.screen] if args.size is None else args.size
+    seed = args.seed if args.seed is not None else random.randrange(2**31)
+
+    # Wan samples in blocks of 4 frames plus one, so an arbitrary count is
+    # rounded rather than quietly mangled by the node.
+    length = max(5, round((args.frames - 1) / 4) * 4 + 1)
+    split = max(1, args.steps // 2)
+    # What actually gets written, after the duplicate end frame is trimmed, so
+    # the line main() prints is the truth rather than what was asked for.
+    args.frames = length - 1
+
+    g: dict = {
+        "unet_hi": {"class_type": "UnetLoaderGGUF",
+                    "inputs": {"unet_name": WAN_HIGH}},
+        "unet_lo": {"class_type": "UnetLoaderGGUF",
+                    "inputs": {"unet_name": WAN_LOW}},
+        # Each expert takes the LoRA trained for it. Mixing them, or giving one
+        # expert both, is what makes the result go soft.
+        "lora_hi": {"class_type": "LoraLoaderModelOnly",
+                    "inputs": {"model": ["unet_hi", 0], "lora_name": WAN_LORA_HIGH,
+                               "strength_model": 1.0}},
+        "lora_lo": {"class_type": "LoraLoaderModelOnly",
+                    "inputs": {"model": ["unet_lo", 0], "lora_name": WAN_LORA_LOW,
+                               "strength_model": 1.0}},
+        "clip": {"class_type": "CLIPLoader",
+                 "inputs": {"clip_name": WAN_ENCODER, "type": "wan"}},
+        "vae": {"class_type": "VAELoader",
+                "inputs": {"vae_name": WAN_VAE}},
+        "pos": {"class_type": "CLIPTextEncode",
+                "inputs": {"clip": ["clip", 0], "text": args.prompt}},
+        "neg": {"class_type": "CLIPTextEncode",
+                "inputs": {"clip": ["clip", 0], "text": args.negative}},
+        "img": {"class_type": "LoadImage", "inputs": {"image": args.image}},
+        # The same image at both ends. This is the whole trick.
+        "flf": {"class_type": "WanFirstLastFrameToVideo",
+                "inputs": {"positive": ["pos", 0], "negative": ["neg", 0],
+                           "vae": ["vae", 0],
+                           "width": w, "height": h,
+                           "length": length, "batch_size": 1,
+                           "start_image": ["img", 0], "end_image": ["img", 0]}},
+        # Stage one stops partway and keeps its leftover noise, which stage two
+        # picks up without adding any of its own.
+        "k_hi": {"class_type": "KSamplerAdvanced",
+                 "inputs": {"model": ["lora_hi", 0],
+                            "positive": ["flf", 0], "negative": ["flf", 1],
+                            "latent_image": ["flf", 2],
+                            "add_noise": "enable", "noise_seed": seed,
+                            "steps": args.steps, "cfg": args.cfg,
+                            "sampler_name": "euler", "scheduler": "simple",
+                            "start_at_step": 0, "end_at_step": split,
+                            "return_with_leftover_noise": "enable"}},
+        "k_lo": {"class_type": "KSamplerAdvanced",
+                 "inputs": {"model": ["lora_lo", 0],
+                            "positive": ["flf", 0], "negative": ["flf", 1],
+                            "latent_image": ["k_hi", 0],
+                            "add_noise": "disable", "noise_seed": seed,
+                            "steps": args.steps, "cfg": args.cfg,
+                            "sampler_name": "euler", "scheduler": "simple",
+                            "start_at_step": split, "end_at_step": 10000,
+                            "return_with_leftover_noise": "disable"}},
+        "decode": {"class_type": "VAEDecode",
+                   "inputs": {"samples": ["k_lo", 0], "vae": ["vae", 0]}},
+        # Drop the last frame: it is the same picture as the first, so keeping
+        # both shows it twice at the seam. ImageFromBatch is core ComfyUI, so
+        # this needs no extra node pack.
+        "trim": {"class_type": "ImageFromBatch",
+                 "inputs": {"image": ["decode", 0],
+                            "batch_index": 0, "length": length - 1}},
+        "out": {"class_type": "VHS_VideoCombine",
+                "inputs": {"images": ["trim", 0],
+                           "frame_rate": args.fps, "loop_count": 0,
+                           "filename_prefix": args.name,
+                           "format": "video/h264-mp4",
+                           # Never with Wan: the loop already closes, and
+                           # ping-pong on top would just play it twice.
+                           "pingpong": False, "save_output": True}},
+    }
+
+    if args.interpolate > 1:
+        g["rife"] = {"class_type": "RIFE VFI",
+                     "inputs": {"ckpt_name": "rife49.pth",
+                                "frames": ["trim", 0],
+                                "clear_cache_after_n_frames": 10,
+                                "multiplier": args.interpolate,
+                                "fast_mode": True, "ensemble": True,
+                                "scale_factor": 1.0, "dtype": "float32",
+                                "torch_compile": False, "batch_size": 1}}
+        g["out"]["inputs"]["images"] = ["rife", 0]
+        g["out"]["inputs"]["frame_rate"] = args.fps * args.interpolate
+
+    return g, seed, (w, h)
+
+
 def resolve(args):
     """Defaults that depend on --lcm, applied after parsing."""
+    if args.flf:
+        # Wan needs a picture to animate: without --image there are no ends to
+        # pin, and the whole point of this path is that both of them are the
+        # same frame.
+        if not args.image:
+            raise SystemExit("--flf animates a picture: pass --image too")
+        # The Lightning LoRAs are 4-step, at cfg 1. The AnimateDiff defaults
+        # below are wrong for Wan in both directions.
+        if args.steps is None: args.steps = 4
+        if args.cfg is None:   args.cfg = 1.0
+        if args.loop is None:  args.loop = True   # closed by construction
+        if args.anchor is None: args.anchor = "0"  # unused; keeps printing simple
+        return args
     if args.steps is None:   args.steps = 8 if args.lcm else 20
     if args.cfg is None:     args.cfg = 2.0 if args.lcm else 8.0
     if args.sampler is None: args.sampler = "lcm" if args.lcm else "euler"
@@ -275,12 +412,17 @@ def resolve(args):
 def main() -> None:
     args = resolve(build_parser().parse_args())
 
-    graph, seed, (w, h) = build(args)
+    graph, seed, (w, h) = build_wan(args) if args.flf else build(args)
     if args.dump:
         print(json.dumps(graph, indent=2))
         return
 
-    mode = f"image->video from {args.image}" if args.image else "text->video"
+    if args.flf:
+        mode = f"wan first-last from {args.image}"
+    elif args.image:
+        mode = f"image->video from {args.image}"
+    else:
+        mode = "text->video"
     out_fps = args.fps * max(1, args.interpolate)
     out_frames = args.frames * max(1, args.interpolate)
     print(f"{mode}  {w}x{h}  {args.frames}f @ {args.fps}fps motion "

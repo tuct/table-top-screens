@@ -14,6 +14,7 @@ import io
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -75,10 +76,33 @@ def parse_clip(data: bytes) -> dict | None:
     return {"w": w, "h": h, "fps": fps, "frames": out}
 
 
+def rmtree_retry(path: Path, attempts: int = 6) -> None:
+    """rmtree, retried briefly.
+
+    On Windows a file that was just written is often still held for a moment
+    by the virus scanner, and deleting it fails with WinError 32 ("used by
+    another process") even though nothing in this process has it open. POSIX
+    unlinks an open file happily, so this only ever bites here.
+
+    It matters at startup rather than at exit: a run that died leaves
+    data_test behind, and the NEXT run then fails before its first check.
+    """
+    for i in range(attempts):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(0.25 * (i + 1))
+
+
 def main() -> int:
     srv.DATA_DIR = DATA_TEST
     if DATA_TEST.exists():
-        shutil.rmtree(DATA_TEST)
+        rmtree_retry(DATA_TEST)
     DATA_TEST.mkdir(parents=True)
     srv.app.config["TESTING"] = True
     c = srv.app.test_client()
@@ -432,6 +456,43 @@ def main() -> int:
     c.post("/d/vid/prefs", json={"reset": 1})
     check("clearing it restores the original bytes",
           c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=10&q=80").data == plain.data)
+    # Released for the same reason as in the prune section below: these are
+    # send_file responses, so each holds its .ttmj open until closed, and the
+    # prune there can only delete what nothing is reading.
+    plain.close()
+    lowq.close()
+    print("\nping-pong: a clip that joins end to start")
+    base = parse_clip(c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=10").data)
+    pp = parse_clip(c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=10&pingpong=1").data)
+    n = len(base["frames"]) if base else 0
+    check("ping-pong plays down as well as up",
+          pp is not None and len(pp["frames"]) == 2 * n - 2, f"{len(pp['frames'])} vs {n}")
+    # The turning points must not repeat, or the screen stutters at both ends.
+    check("neither turning point is doubled",
+          pp["frames"][0] != pp["frames"][-1] or n <= 2)
+    check("the way back is the way out, reversed",
+          pp["frames"][n:] == base["frames"][-2:0:-1])
+    # Every added frame is a repeat, so no new JPEG is encoded -- only stored.
+    check("it reuses the bytes it already had",
+          set(map(bytes, pp["frames"])) == set(map(bytes, base["frames"])))
+    check("and it is a different clip to cache",
+          c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=10&pingpong=1").headers["ETag"]
+          != c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=10").headers["ETag"])
+    # A stored pref has to beat the query string, as it does for q and framing.
+    c.post("/d/vid/prefs", json={"pingpong": "1"})
+    pref = parse_clip(c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=10").data)
+    check("a stored pref turns it on without the screen asking",
+          pref is not None and len(pref["frames"]) == 2 * n - 2,
+          str(pref and len(pref["frames"])))
+    c.post("/d/vid/prefs", json={"pingpong": "0"})
+    off = parse_clip(c.get("/d/vid/clip.mjpeg?w=240&h=240&fps=10").data)
+    check("and off again", off is not None and len(off["frames"]) == n)
+    c.post("/d/vid/prefs", json={"reset": 1})
+    # A still has nothing to reverse.
+    one = parse_clip(c.get("/d/tabletop-01/clip.mjpeg?w=64&h=64&fps=5&pingpong=1").data)
+    check("a still is unaffected", one is not None and len(one["frames"]) == 1,
+          str(one and len(one["frames"])))
+
     still = parse_clip(c.get("/d/tabletop-01/clip.mjpeg?w=64&h=64&fps=5").data)
     check("a still is a one-frame clip", still is not None and len(still["frames"]) == 1,
           str(still and len(still["frames"])))
@@ -565,6 +626,13 @@ def main() -> int:
     check("asking again serves the same bytes", again.data == r.data)
     check("and says the same frame count",
           again.headers["X-Frame-Count"] == r.headers["X-Frame-Count"])
+    # Both downloads are finished, so release them before pruning. send_file
+    # keeps the .ttmj open until the response is closed, and a prune cannot
+    # delete a file that is still open on Windows -- it skips it, by design,
+    # so a clip streaming to a screen is never pulled out from under it.
+    # Closing here is what "nothing is downloading any more" looks like.
+    r.close()
+    again.close()
     check("a budget smaller than the cache frees something",
           srv.clip_cache_prune(0) >= len(r.data))
     check("leaving nothing behind", not list((DATA_TEST / "_clips").glob("*.ttmj")))
@@ -596,7 +664,12 @@ def main() -> int:
     check("and the refusal says the limit",
           b"MB limit" in r.data or b"limit_bytes" in r.data, r.data[:60].decode("utf-8", "replace"))
 
-    shutil.rmtree(DATA_TEST, ignore_errors=True)
+    try:
+        rmtree_retry(DATA_TEST)
+    except PermissionError:
+        # Not worth failing a green run over; the retry at startup
+        # will clear it next time.
+        pass
     print(f"\n{sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1
 

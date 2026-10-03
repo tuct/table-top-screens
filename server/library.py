@@ -70,7 +70,7 @@ DEFAULT_SHAPE = "800x480"
 SHAPE_RE = re.compile(r"^[1-9][0-9]{0,3}x[1-9][0-9]{0,3}r?$")
 # Everything a variant can say about how its source is rendered. More will
 # join it (crop box, filters); each needs a default here.
-CONFIG_KEYS = ("fit", "rot", "zoom", "bg", "q")
+CONFIG_KEYS = ("fit", "rot", "zoom", "bg", "q", "pingpong")
 # Leading underscore, so DEVICE_RE can never match it and a device cannot
 # collide with the pool directory.
 POOL = "_pool"

@@ -851,6 +851,18 @@ def video_info(device: str):
     return jsonify(info)
 
 
+def _pingpong(device: str, fallback) -> bool:
+    """Whether this screen's clips play forwards then backwards.
+
+    Same precedence as _quality: a stored pref beats the query string, so the
+    control on the device page reaches a screen that is already asking for
+    clips without it having to know anything new.
+    """
+    prefs = lib(library.config_for, device)
+    raw = prefs["pingpong"] if "pingpong" in prefs else fallback
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _framing(device: str) -> tuple[str, int, int, str]:
     """(fit, rot, zoom, bg) for what this screen is showing.
 
@@ -925,7 +937,16 @@ def clip_cache_prune(budget: int = CLIP_CACHE_BYTES) -> int:
         if total - freed <= budget:
             break
         size = f.stat().st_size
-        f.unlink(missing_ok=True)
+        try:
+            f.unlink(missing_ok=True)
+        except PermissionError:
+            # Windows will not unlink a file that is still open, and a clip
+            # being streamed to a screen right now is exactly that -- the
+            # response holds it until the last byte goes out. Skip it: it is
+            # still the least recently used, so the next prune gets it.
+            # POSIX unlinks it happily and the reader keeps its handle, which
+            # is why this only ever shows up here.
+            continue
         freed += size
     return freed
 
@@ -935,7 +956,7 @@ class ClipTooLarge(Exception):
 
 
 def write_clip(out, body: bytes | None, w: int, h: int, fps: int, max_bytes: int,
-               framing: tuple, still: bool = False) -> int:
+               framing: tuple, still: bool = False, pingpong: bool = False) -> int:
     """Write one cycle of the clip to `out` as TTMJ. Returns the frame count.
 
     Written a frame at a time, never assembled whole: a long clip is bigger
@@ -965,6 +986,10 @@ def write_clip(out, body: bytes | None, w: int, h: int, fps: int, max_bytes: int
         count = 1
     else:
         indices = frames.resample(frames.durations(body), fps)
+        if pingpong:
+            # Free in encoding terms: every added frame is a repeat of one
+            # already in `encoded`, so this costs bytes but no extra JPEGs.
+            indices = frames.pingpong(indices)
         # Keyed by source frame: a repeat writes the same JPEG again without
         # re-encoding it, which is most of the work on a slow GIF.
         encoded: dict[int, bytes] = {}
@@ -991,11 +1016,12 @@ def write_clip(out, body: bytes | None, w: int, h: int, fps: int, max_bytes: int
 
 
 def build_clip(body: bytes | None, w: int, h: int, fps: int, max_bytes: int,
-               framing: tuple, still: bool = False) -> tuple[bytes, int]:
+               framing: tuple, still: bool = False,
+               pingpong: bool = False) -> tuple[bytes, int]:
     """The whole clip in memory. For callers small enough to want it -- tests,
     and the preview paths. Everything serving a screen writes to a file."""
     buf = io.BytesIO()
-    count = write_clip(buf, body, w, h, fps, max_bytes, framing, still)
+    count = write_clip(buf, body, w, h, fps, max_bytes, framing, still, pingpong)
     return buf.getvalue(), count
 
 
@@ -1035,7 +1061,9 @@ def get_clip(device: str):
         not meta.get("animated", frames.is_animated(body))
         or (bool(screens) and plays_as_still(screens[0], meta))
     )
-    params = (w, h, fps, max_bytes, fit, quality, bg, rot, zoom, still)
+    # A still has nothing to reverse, so ping-pong is a clip-only concern.
+    pingpong = (not still) and _pingpong(device, request.args.get("pingpong", "0"))
+    params = (w, h, fps, max_bytes, fit, quality, bg, rot, zoom, still, pingpong)
 
     etag = '"%s"' % hashlib.sha256(
         (sha + "clip" + repr(params)).encode("utf-8")
@@ -1052,7 +1080,7 @@ def get_clip(device: str):
         try:
             with tmp.open("wb") as fh:
                 count = write_clip(fh, body, w, h, fps, max_bytes,
-                                   (fit, quality, bg, rot, zoom), still)
+                                   (fit, quality, bg, rot, zoom), still, pingpong)
         except ClipTooLarge:
             tmp.unlink(missing_ok=True)
             abort(413, "the first frame alone exceeds max")
@@ -1344,6 +1372,13 @@ def post_prefs(device: str):
             prefs["q"] = max(1, min(100, int(q)))
         except (TypeError, ValueError):
             abort(400, "q must be an integer")
+
+    # Stored as "1"/"0" rather than a bool: config values are round-tripped
+    # through str() on their way to a variant, so a bool would come back as
+    # the string "True" and only work by accident.
+    if (pp := form.get("pingpong")) is not None:
+        prefs["pingpong"] = "1" if str(pp).strip().lower() in (
+            "1", "true", "yes", "on") else "0"
 
     if (bg := form.get("bg")) is not None:
         prefs["bg"] = str(bg)
@@ -2284,9 +2319,15 @@ def generate_run():
     if length not in generate.LENGTHS:
         abort(400, f"length must be one of {', '.join(generate.LENGTHS)}")
 
+    # Forwards-then-backwards, so the clip joins end to start even when the
+    # sampler drifted. An unchecked HTML checkbox sends nothing at all, so
+    # absence has to mean off.
+    pingpong = str(request.form.get("pingpong", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
     try:
         job = generate.submit(kind, prompt, reference, size, seed, length,
-                              adopted, keep)
+                              adopted, keep, pingpong)
     except ValueError as exc:
         abort(400, str(exc))
     # Without JavaScript the page still works: it redirects back, and the job

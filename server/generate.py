@@ -265,13 +265,20 @@ def still_graph(prompt: str, reference: str | None, size: str,
 
 
 def clip_graph(prompt: str, reference: str | None, size: str, seed: int,
-               length: str = DEFAULT_LENGTH, keep: str = DEFAULT_KEEP) -> dict:
+               length: str = DEFAULT_LENGTH, keep: str = DEFAULT_KEEP,
+               pingpong: bool = False) -> dict:
     """The looping MP4.
 
     With a reference, SparseCtrl pins it to both ends of the sequence and the
     closed loop comes off: anchored only at frame 0 the animation drifts off
     the subject well before the end, and a closed loop then fights the anchor
     it is trying to return to.
+
+    `pingpong` is the blunt instrument for the seam that leaves: the clip is
+    written out forwards then backwards, so it joins end to start whatever the
+    sampler did. gen.py has had this as --pingpong all along; it was hardcoded
+    off here, so the web UI could not do what the CLI could. Only sound for
+    non-directional motion -- fire, water, drifting light.
     """
     w, h = SIZES.get(size, SIZES[DEFAULT_SIZE])
     frames = LENGTHS.get(length, LENGTHS[DEFAULT_LENGTH])
@@ -340,7 +347,7 @@ def clip_graph(prompt: str, reference: str | None, size: str, seed: int,
                 "inputs": {"images": ["rife", 0],
                            "frame_rate": OUT_FPS, "loop_count": 0,
                            "filename_prefix": "clip", "format": "video/h264-mp4",
-                           "pingpong": False, "save_output": True}}
+                           "pingpong": pingpong, "save_output": True}}
     return g
 
 
@@ -487,7 +494,7 @@ def _remember(job: Job) -> None:
 
 def submit(kind: str, prompt: str, reference: str | None, size: str, seed: int,
            length: str = DEFAULT_LENGTH, adopted_from: str = "",
-           keep: str = DEFAULT_KEEP) -> Job:
+           keep: str = DEFAULT_KEEP, pingpong: bool = False) -> Job:
     """Queue a job and return at once; the work happens on a thread."""
     if not prompt.strip() and kind == "clip" and not reference:
         raise ValueError("a clip needs a description, a reference image, or both")
@@ -498,7 +505,7 @@ def submit(kind: str, prompt: str, reference: str | None, size: str, seed: int,
     _remember(job)
 
     graph = (still_graph(prompt, reference, size, seed, keep) if kind == "verify"
-             else clip_graph(prompt, reference, size, seed, length, keep))
+             else clip_graph(prompt, reference, size, seed, length, keep, pingpong))
     threading.Thread(target=_run, args=(job, graph), daemon=True).start()
     return job
 

@@ -188,6 +188,24 @@ def resample(durs: list[int], fps: int) -> list[int]:
     return out
 
 
+def pingpong(indices: list[int]) -> list[int]:
+    """Play the cycle forwards then backwards, so it joins end to start.
+
+    A model that animates a still -- SparseCtrl, LTX-Video -- anchors the first
+    frame and lets the rest drift, so the last frame rarely matches the first
+    and a looping screen shows a visible jump. Playing the sequence back down
+    removes the seam by construction, whatever produced the frames.
+
+    The two turning points are NOT repeated: [0,1,2,3] becomes [0,1,2,3,2,1],
+    which on repeat reads ...2,1,0,1,2,3,2,1,0... Appending a plain reverse
+    would show frames 3 and 0 twice each, as a stutter at both ends.
+
+    Only worth it for non-directional motion -- fire, water, drifting light.
+    Rain falling or smoke rising reads as wrong played backwards.
+    """
+    return indices + indices[-2:0:-1]
+
+
 def iter_frames(body: bytes | None, indices: list[int], w: int, h: int):
     """Yield (index, RGB image) for each DISTINCT index, in ascending order.
 

@@ -142,6 +142,59 @@ graphs, and switching it over is an open decision rather than an oversight.
 SVD is untested so far. Note that `svd_xt_1_1` is gated on HuggingFace and
 needs an account; the manifest pins the original `svd_xt`, which is not.
 
+## Wan 2.2 — a still, animated, in a real loop
+
+`./install.sh --wan` (or `bootstrap.py --wan`) fetches ~26 GB more. It is the
+only thing here that animates an existing picture **and** closes the loop.
+
+The gap it fills is the one the table above describes: AnimateDiff loops but
+barely moves, LTX moves but seams, and a screen that plays forever needs both.
+Wan 2.2 gets there by construction rather than by scheduling —
+`WanFirstLastFrameToVideo` takes a first *and* a last frame, so handing it the
+**same picture twice** makes the loop exact.
+
+| | |
+|---|---|
+| `Wan2.2-I2V-A14B-{High,Low}Noise-Q4_K_M.gguf` | 9.2 GB each |
+| `umt5_xxl_fp8_e4m3fn_scaled` | 6.4 GB — Wan reads its prompt with umt5, not CLIP |
+| `wan_2.1_vae` | 242 MB |
+| `Wan2.2-Lightning_I2V-A14B-4steps` LoRAs, high + low | 585 MB each |
+
+Both experts are needed on disk — A14B is a mixture of experts, high-noise for
+the early steps and low-noise for the rest — but only one is resident at a
+time, which is why ~9 GB of weights runs on a 12 GB card. Q4_K_M measures
+around 10.5 GB of VRAM in practice. Drop to `Q4_K_S` (0.9 GB smaller per
+expert) if that is too tight; `Q5_K_M` wants 16 GB.
+
+GGUF needs `ComfyUI-GGUF` for `UnetLoaderGGUF`, which is why `--wan` installs a
+node pack of its own. Nothing else here reads GGUF, so a plain install does
+not get it.
+
+Two things to know before spending the download:
+
+- **Untested in this repo.** The pins, hashes and sizes are all verified
+  against HuggingFace, and every URL answers 200 with a byte-exact length. The
+  graph is not — validate it with ComfyUI's own Wan 2.2 I2V template first,
+  swapping in the first/last-frame node with one picture in both slots.
+- **Drop the duplicate frame.** First and last are the same image, so keeping
+  both puts the same frame twice at the seam. The ComfyUI templates use an
+  image selector to trim the last one. Same class of off-by-one as RIFE
+  returning `2N-1`, noted below.
+
+### The cheap alternative, which needs no download
+
+`--pingpong` writes the clip out forwards and then backwards, so it joins end
+to start whatever the sampler did. It costs nothing, works with any model, and
+is now available in three places: `gen.py --pingpong`, a **Seamless** checkbox
+on the generate page, and a `pingpong` pref on the content server, which
+applies it when a clip is built for a screen and so covers uploaded GIFs and
+video too.
+
+It is only honest for motion with no direction — fire, water, drifting light,
+smoke seen head-on. Anything that travels (rain, a walk, a pan) runs backwards
+for half the loop and reads as wrong. Where it does fit, it is strictly better
+than paying 26 GB.
+
 ## Pins, and updating them
 
 `manifest.toml` pins ComfyUI and every node pack to a commit, and every model to

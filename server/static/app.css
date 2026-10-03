@@ -151,6 +151,16 @@ header.top {
 /* settings */
 .field { display: flex; flex-direction: column; gap: 8px; margin-bottom: 18px; }
 .field.narrow { width: 124px; flex: none; }
+/* A checkbox sits on its label's line, unlike the stacked inputs above, so it
+   needs the row back and the 38px height the selects use, to keep the bottom
+   of the control row level. */
+.checkrow {
+  display: flex; align-items: center; gap: 8px; height: 38px;
+  font-size: 13px; color: var(--ink); cursor: pointer;
+}
+.checkrow input { margin: 0; }
+/* This one carries an explanation, so it cannot be 124px wide. */
+.field.narrow#ppfield { width: 200px; }
 .pair { display: flex; gap: 16px; }
 .pair .field { flex: 1; }
 .lbl, .field label { font-size: 12px; font-weight: 500; color: var(--muted); }

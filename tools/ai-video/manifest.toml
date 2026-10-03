@@ -137,3 +137,78 @@ url = "https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt/reso
 sha256 = "b2652c23d64a1da5f14d55011b9b6dce55f2e72e395719f1cd1f8a079b00a451"
 size_mb = 9116
 why = "Stable Video Diffusion: image-to-video only, and purpose-built for it. The 1-1 release is gated on HuggingFace; this one is not"
+
+# ---------------------------------------------------------------- wan 2.2
+#
+# `bootstrap.py --wan` fetches these: ~26 GB, and the only thing here that
+# animates a still AND closes the loop properly.
+#
+# Why it is worth that much disk. AnimateDiff loops seamlessly but barely
+# moves; LTX-Video moves well but cannot join end to start, which is the one
+# thing a screen playing forever actually needs. Wan 2.2 solves it by
+# construction instead of by scheduling: WanFirstLastFrameToVideo takes a
+# first AND a last frame, so handing it the SAME picture twice makes the loop
+# exact. Nothing else in this manifest can do that.
+#
+# A14B is a mixture of experts: the high-noise model runs the early steps and
+# the low-noise one the rest, so both are required on disk -- but only one is
+# resident at a time, which is why ~9 GB of weights fits a 12 GB card. Q4_K_M
+# is the quantisation to use there (~10.5 GB VRAM in practice); Q4_K_S is
+# ~0.9 GB smaller per expert if that is too tight, and Q5_K_M wants 16 GB.
+#
+# GGUF needs a loader node, hence the separate node pack below. It is NOT in
+# node_packs because nothing else here reads GGUF.
+
+[[wan_node_packs]]
+name = "ComfyUI-GGUF"
+repo = "https://github.com/city96/ComfyUI-GGUF.git"
+commit = "6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
+why = "UnetLoaderGGUF, without which a quantised Wan model cannot be loaded at all"
+
+[[wan_models]]
+name = "Wan2.2-I2V-A14B-HighNoise-Q4_K_M.gguf"
+dir = "diffusion_models"
+url = "https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF/resolve/main/HighNoise/Wan2.2-I2V-A14B-HighNoise-Q4_K_M.gguf"
+sha256 = "836250abfaa3411694e2c9cf3a0cc18265329d5156d81aa116d5366b0f8f02e7"
+size_mb = 9205
+why = "the high-noise expert: the early, structure-setting steps"
+
+[[wan_models]]
+name = "Wan2.2-I2V-A14B-LowNoise-Q4_K_M.gguf"
+dir = "diffusion_models"
+url = "https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF/resolve/main/LowNoise/Wan2.2-I2V-A14B-LowNoise-Q4_K_M.gguf"
+sha256 = "e2f98d834af009d035c6b0918268f2eba0aa8a63025ce942277e2384d40b0866"
+size_mb = 9205
+why = "the low-noise expert: the later steps, where the detail arrives"
+
+[[wan_models]]
+name = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+dir = "text_encoders"
+url = "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+sha256 = "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68"
+size_mb = 6424
+why = "Wan reads its prompt with umt5, not CLIP; the fp8 build halves the download"
+
+[[wan_models]]
+name = "wan_2.1_vae.safetensors"
+dir = "vae"
+url = "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors"
+sha256 = "2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b"
+size_mb = 242
+why = "the 2.1 VAE is the one the A14B models use; the 5B variant wants a different one"
+
+[[wan_models]]
+name = "Wan2.2-Lightning_I2V-A14B-4steps-lora_HIGH_fp16.safetensors"
+dir = "loras"
+url = "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/LoRAs/Wan22-Lightning/old/Wan2.2-Lightning_I2V-A14B-4steps-lora_HIGH_fp16.safetensors"
+sha256 = "216cce62ecb5687d55fdc035b1cdbea01d1a9a8100ee924d2155cf1d64f1050b"
+size_mb = 585
+why = "4 steps instead of 20, the same bargain LCM makes for AnimateDiff. Pairs with the high-noise expert"
+
+[[wan_models]]
+name = "Wan2.2-Lightning_I2V-A14B-4steps-lora_LOW_fp16.safetensors"
+dir = "loras"
+url = "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/LoRAs/Wan22-Lightning/old/Wan2.2-Lightning_I2V-A14B-4steps-lora_LOW_fp16.safetensors"
+sha256 = "a3d474925042ec908c212c6c4c1e338637e27585c3970253f65b9638a9f5874b"
+size_mb = 585
+why = "the same, for the low-noise expert. Both or neither -- mixing step counts across the two is what makes a clip go soft"
