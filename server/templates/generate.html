@@ -1,0 +1,226 @@
+{% macro keepform(j, devices, cls='') %}
+  <form method="post" action="/generate/job/{{ j.id }}/keep" class="inline keep {{ cls }}">
+    <button type="submit" class="quiet" title="Put this in the pool">
+      {{ 'in the pool' if j.pool_id else 'To library' }}
+    </button>
+  </form>
+{% endmacro %}
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Make a clip — mini screens</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+
+<nav class="crumbs" aria-label="Breadcrumb">
+  <a href="/">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M19 12H5M11 18l-6-6 6-6"/></svg>
+    All screens
+  </a>
+  <span class="sep" aria-hidden="true">/</span>
+  <span class="here" aria-current="page">Make a clip</span>
+</nav>
+
+<header class="top">
+  <div class="ident">
+    <h1>Make a clip</h1>
+    {% if up %}
+      <span class="pill on"><span class="dot"></span>ready</span>
+    {% else %}
+      <span class="pill off"><span class="dot"></span>no generator</span>
+    {% endif %}
+    <span class="mono sub">{{ status }}</span>
+  </div>
+</header>
+
+{% if not up %}
+  <section class="card pad">
+    <p class="warnline"><b>Nothing to generate with.</b> {{ status }}</p>
+    <p class="note">Everything else on this server works without it — this page
+      is the only thing that needs a generator running.</p>
+  </section>
+{% else %}
+
+<div class="cols gen">
+  <section class="card pad">
+    <div class="eyebrow">What to make</div>
+
+    <form id="genform" method="post" action="/generate/run" enctype="multipart/form-data">
+      {# Set when a verify result is adopted; cleared by picking any other
+         reference, since they are all answers to the same question. #}
+      <input type="hidden" name="from_job" id="fromjob" value="">
+
+      <div class="field">
+        <label for="prompt">Description</label>
+        <textarea id="prompt" name="prompt" rows="3" class="desc-input"
+                  placeholder="a torchlit tavern at night, firelight flickering"></textarea>
+      </div>
+
+      <div class="field">
+        <label>Reference <span class="sub">— optional</span></label>
+        <div class="refrow">
+          <label class="drop" id="refdrop">
+            <input type="file" id="reference" name="reference" accept="image/*" hidden>
+            <span id="reflabel">Choose a picture, or drop one here</span>
+          </label>
+          <div class="refshot" id="refshot" hidden>
+            <img id="refpreview" alt="">
+            <button type="button" class="icon danger" id="refclear" title="Use no reference">×</button>
+          </div>
+        </div>
+        <p class="note" id="refnote" hidden>Adopted from a verify. Edit the words
+          and run verify again to keep refining.</p>
+      </div>
+
+      {% if pool %}
+      <details class="field">
+        <summary class="lbl">…or start from something in the pool</summary>
+        <div class="poolpick" id="poolpick">
+          {% for it in pool %}
+            <label class="pooltile" title="{{ it.filename }}">
+              <input type="radio" name="pool_id" value="{{ it.id }}" hidden>
+              <img src="/pool/{{ it.id }}/thumb" alt="{{ it.filename }}" loading="lazy">
+            </label>
+          {% endfor %}
+        </div>
+      </details>
+      {% endif %}
+
+      <div class="pair">
+        <div class="field narrow">
+          <label for="size">Shape</label>
+          <select id="size" name="size">
+            {% for s in sizes %}
+              <option value="{{ s }}"{{ ' selected' if s == default_size }}>{{ s }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field narrow">
+          <label for="length">Loop length</label>
+          <select id="length" name="length">
+            {% for l in lengths %}
+              <option value="{{ l }}"{{ ' selected' if l == default_length }}>{{ l }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field narrow">
+          <label for="seed">Seed <span class="sub">— 0 is random</span></label>
+          <input type="number" id="seed" name="seed" value="0" min="0" class="mono">
+        </div>
+      </div>
+
+      <div class="row-actions genactions">
+        <button type="submit" name="kind" value="verify" class="primary">
+          Verify
+          <span class="sub">one still, ~10s</span>
+        </button>
+        <button type="submit" name="kind" value="clip" class="secondary">
+          Create loop
+          <span class="sub" id="clipcost">animated, ~4 min</span>
+        </button>
+      </div>
+      <p class="note">Verify, adopt the result, adjust the words, verify again —
+        each turn costs about ten seconds. Animate once the still is the one you
+        wanted; that is the part that costs minutes.</p>
+    </form>
+  </section>
+
+  <section class="card pad">
+    <div class="eyebrow">Result</div>
+    <div id="result" class="result">
+      <p class="note" id="resultempty">Nothing yet. Verify and it appears here.</p>
+      <div id="resultbox" hidden>
+        <div class="bezel wide"><div class="glass">
+          <img id="resultimg" alt="Generated still" hidden>
+          <video id="resultvid" controls loop muted playsinline hidden></video>
+        </div></div>
+        <div class="nameline"><span class="mono sub" id="resultmeta"></span></div>
+        <div class="row-actions">
+          <button type="button" class="primary" id="adopt" hidden>
+            Adopt as reference
+          </button>
+          <form method="post" id="keepform" class="inline">
+            <select name="device" id="keepdevice" class="mono">
+              <option value="">Add to pool only</option>
+              {% for d in devices %}<option value="{{ d }}">…and show on {{ d }}</option>{% endfor %}
+            </select>
+            <button type="submit" class="secondary">Keep it</button>
+          </form>
+        </div>
+      </div>
+      <div id="working" hidden>
+        <div class="bar"><div class="fill" id="workfill" style="width:0%"></div></div>
+        <p class="note mono" id="workline">starting…</p>
+      </div>
+      <p class="warnline" id="failed" hidden></p>
+    </div>
+  </section>
+</div>
+
+<section class="card pad">
+  <div class="eyebrow">Working on <span class="count" id="activecount"></span></div>
+  <ul class="joblist" id="activelist">
+    {% for j in active %}
+      <li class="{{ 'mine' if j.mine else 'foreign' }}">
+        <span class="pill {{ 'on' if j.state == 'running' else 'off' }}">
+          <span class="dot"></span>{{ j.state }}</span>
+        <span class="jk mono">{{ j.kind }}</span>
+        <span class="jp">{{ j.prompt or '(no description)' }}</span>
+        {% if not j.mine %}<span class="sub">not from this page</span>{% endif %}
+      </li>
+    {% else %}
+      <li class="note">Idle — nothing queued, here or in ComfyUI.</li>
+    {% endfor %}
+  </ul>
+</section>
+
+<div class="cols gen">
+  <section class="card pad">
+    <div class="eyebrow">Last stills</div>
+    <div class="gallery" id="stills">
+      {% for j in stills %}
+        <figure class="shot" data-id="{{ j.id }}">
+          <img src="/generate/job/{{ j.id }}/result" alt="{{ j.prompt }}" loading="lazy">
+          <figcaption>
+            <span class="jp" title="{{ j.prompt }}">{{ j.prompt or '(no description)' }}</span>
+            <span class="acts">
+              <button type="button" class="quiet adoptone" data-id="{{ j.id }}">Adopt</button>
+              {{ keepform(j, devices) }}
+            </span>
+          </figcaption>
+        </figure>
+      {% else %}
+        <p class="note">No stills yet.</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="card pad">
+    <div class="eyebrow">Last loops</div>
+    <div class="gallery" id="clips">
+      {% for j in clips %}
+        <figure class="shot" data-id="{{ j.id }}">
+          <video src="/generate/job/{{ j.id }}/result" loop muted playsinline
+                 preload="metadata" onmouseenter="this.play()"
+                 onmouseleave="this.pause()"></video>
+          <figcaption>
+            <span class="jp" title="{{ j.prompt }}">{{ j.prompt or '(no description)' }}</span>
+            <span class="acts">
+              <span class="mono sub">{{ j.length }}</span>
+              {{ keepform(j, devices) }}
+            </span>
+          </figcaption>
+        </figure>
+      {% else %}
+        <p class="note">No loops yet.</p>
+      {% endfor %}
+    </div>
+  </section>
+</div>
+{% endif %}
+
+<script src="{{ url_for('static', filename='generate.js') }}"></script>

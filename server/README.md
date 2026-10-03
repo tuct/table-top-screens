@@ -364,12 +364,72 @@ size, fit, rotation, quality or format re-renders from source with no
 re-upload, and two screens of different sizes share one library. Renders live
 in a 32-entry in-memory LRU keyed by `(image sha, parameters)`.
 
+## Making a clip
+
+`/generate` makes short looping clips with a local [ComfyUI](https://github.com/comfyanonymous/ComfyUI),
+installed by `tools/ai-video/`. The server generates nothing itself: it hands
+over a graph and collects the file. With no ComfyUI reachable the page says so
+and everything else works, the same way videos behave without ffmpeg.
+
+The flow is **look, adjust, look again — then animate**:
+
+1. **Verify.** A description, optionally a reference picture (uploaded, or
+   picked out of the pool), renders one still. About ten seconds.
+2. **Adopt.** That still becomes the reference for the next verify. Edit the
+   words and go again. Each turn costs ten seconds, so the picture is settled
+   cheaply.
+3. **Create loop.** Only once the still is right. `1s` is the test size, `4s`
+   the default; cost scales with length, so a 1-second loop is about a minute
+   where a 4-second one is about four.
+
+Animating is roughly twenty times the cost of looking, which is the whole
+reason the first two steps exist. The last ten stills and the last ten loops
+are kept and shown, and either moves into the pool with one click.
+
+With a reference, the still is pinned to **both ends** of the clip and the
+closed loop comes off. Anchored only at frame 0 the animation drifts off the
+subject well before the end — in testing a painted elf ranger became an
+unrelated hooded figure by frame 6 — and a closed loop then fights the anchor
+it is trying to return to. Describe what is *already in* the reference, too:
+asking for something it does not contain tends to replace the picture rather
+than add to it.
+
+### How it runs
+
+Generation takes seconds to minutes, which is far too long to hold a request
+open, so `/generate/run` answers at once with a job and the page polls it every
+five seconds, ticking the clock locally in between.
+
+ComfyUI runs one prompt at a time, so a second job waits. The page distinguishes
+**waiting** from **working** and counts only the latter, because time spent
+queued behind something else says nothing about how long a clip takes. The
+"Working on" list shows the whole queue, **including prompts started from
+ComfyUI's own interface** — those delay yours just as much, and a page that hid
+them would be explaining a long wait with an empty list.
+
+| Route | |
+|---|---|
+| `GET /generate` | the page |
+| `POST /generate/run` | start one. `kind` is `verify` or `clip`; reference is `reference` (upload), `pool_id`, or `from_job` (adopt). 202 with a job |
+| `GET /generate/job/<id>` | state, queue position, seconds of work |
+| `GET /generate/job/<id>/result` | the bytes |
+| `POST /generate/job/<id>/keep` | into the pool, optionally onto a screen |
+| `GET /generate/jobs` | active queue, recent runs, and both galleries |
+
+`COMFYUI_URL` points at a ComfyUI somewhere else; it defaults to
+`http://127.0.0.1:8188`. Without JavaScript the form still submits — the server
+redirects back and the job appears in the lists with whatever state it reached.
+
+Results live in memory and the newest 30 are kept, so a clip worth having is
+worth keeping into the pool rather than leaving on the page.
+
 ## Tests
 
 ```bash
 ./.venv/bin/python test_library.py      # 140 checks, no network
 ./.venv/bin/python test_content.py      # 121 checks, no network
 ./.venv/bin/python test_discovery.py    # 38 checks, uses real mDNS
+./.venv/bin/python test_generate.py     # 62 checks, no ComfyUI needed
 ```
 
 (On Windows: `./.venv/Scripts/python.exe` instead of `./.venv/bin/python`.)

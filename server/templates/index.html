@@ -11,6 +11,9 @@
   <div class="ident" style="align-items:baseline">
     <h1>Mini screens</h1>
     <span class="sub" style="font-size:14px">{{ online_count }} of {{ screens|length }} online</span>
+    {# Outside the screens check: making a clip is worth reaching even before
+       any screen has been found. #}
+    <a href="/generate" class="linky">Make a clip</a>
   </div>
   {% if screens %}
     <div class="topright">

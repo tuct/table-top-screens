@@ -25,6 +25,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import struct
 import time
@@ -38,6 +39,7 @@ from PIL import Image, ImageColor, ImageOps, ImageStat
 
 import discovery
 import frames
+import generate
 import library
 import video
 
@@ -2174,6 +2176,146 @@ def remove_device(device: str):
     if from_browser_form():
         return Response(status=303, headers={"Location": redirect_target("/")})
     return "", 204
+
+
+# ----------------------------------------------------------------- generating
+
+@app.get("/generate")
+def generate_page():
+    """The make-a-clip page. Works with ComfyUI down; it just says so."""
+    return render_template(
+        "generate.html",
+        up=generate.available(),
+        status=generate.status_line(),
+        sizes=list(generate.SIZES),
+        default_size=generate.DEFAULT_SIZE,
+        lengths=list(generate.LENGTHS),
+        default_length=generate.DEFAULT_LENGTH,
+        active=generate.queue_view(),
+        stills=[j.public() for j in generate.recent(generate.GALLERY, "verify", True)],
+        clips=[j.public() for j in generate.recent(generate.GALLERY, "clip", True)],
+        jobs=[j.public() for j in generate.recent(generate.GALLERY)],
+        devices=sorted(set(lib(library.devices)) | set(lib(library.seen))),
+        pool=lib(library.pool)[:24],
+    )
+
+
+@app.post("/generate/run")
+def generate_run():
+    """Start a verify or a clip. Returns at once with a job to poll."""
+    kind = request.form.get("kind", "verify")
+    if kind not in ("verify", "clip"):
+        abort(400, "kind must be verify or clip")
+    prompt = (request.form.get("prompt") or "").strip()
+    size = request.form.get("size") or generate.DEFAULT_SIZE
+    try:
+        seed = int(request.form.get("seed") or 0) or random.randrange(2**31)
+    except ValueError:
+        abort(400, "seed must be a number")
+
+    # A reference comes either as an upload or as something already in the
+    # pool, so a picture that is already on a screen can be animated without
+    # being fetched back out of the browser first.
+    reference = None
+    adopted = ""
+    try:
+        if (up := request.files.get("reference")) is not None and up.filename:
+            reference = generate.upload_reference(up.read(), up.filename)
+        elif from_job := request.form.get("from_job"):
+            # Adopting: the still a previous verify produced becomes the
+            # reference for the next one. That is the refining loop -- look,
+            # adjust the words, look again -- and it only costs seconds a turn.
+            src = generate.get(from_job)
+            if src is None or src.state != "done" or not src.result:
+                abort(404, "no finished result for that job")
+            if not src.content_type.startswith("image/"):
+                abort(400, "only a still can be adopted as a reference")
+            reference = generate.upload_reference(src.result, f"{from_job}.png")
+            adopted = from_job
+        elif item_id := request.form.get("pool_id"):
+            body = lib(library.body_of, item_id)
+            if body:
+                # The same split /image makes. Not frames.frame(): that picks a
+                # frame out of an animation and answers a plain still with the
+                # synthetic test pattern, which as a reference is worse than
+                # useless -- it generates confidently from the wrong picture.
+                if frames.is_video(body):
+                    src = video.first_frame(body, 1024, 1024)
+                else:
+                    src = Image.open(io.BytesIO(body))
+                buf = io.BytesIO()
+                src.convert("RGB").save(buf, format="PNG")
+                reference = generate.upload_reference(buf.getvalue(), f"{item_id}.png")
+    except generate.NoComfyUI as exc:
+        abort(503, str(exc))
+
+    length = request.form.get("length") or generate.DEFAULT_LENGTH
+    if length not in generate.LENGTHS:
+        abort(400, f"length must be one of {', '.join(generate.LENGTHS)}")
+
+    try:
+        job = generate.submit(kind, prompt, reference, size, seed, length, adopted)
+    except ValueError as exc:
+        abort(400, str(exc))
+    # Without JavaScript the page still works: it redirects back, and the job
+    # appears in the list with whatever state it has reached by then.
+    if from_browser_form():
+        return Response(status=303, headers={"Location": "/generate"})
+    return jsonify(job.public()), 202
+
+
+@app.get("/generate/jobs")
+def generate_jobs():
+    """Recent runs, the galleries, and everything ComfyUI is busy with.
+
+    The queue is included whole rather than filtered to ours: a clip started
+    from ComfyUI's own page holds ours up just the same, and a page that hid
+    it would be explaining a long wait with an empty list.
+    """
+    return jsonify({
+        "active": generate.queue_view(),
+        "recent": [j.public() for j in generate.recent(generate.GALLERY)],
+        "stills": [j.public() for j in generate.recent(generate.GALLERY, "verify", True)],
+        "clips": [j.public() for j in generate.recent(generate.GALLERY, "clip", True)],
+    })
+
+
+@app.get("/generate/job/<job_id>")
+def generate_job(job_id: str):
+    job = generate.get(job_id)
+    if job is None:
+        abort(404, "no such job")
+    return jsonify(job.public())
+
+
+@app.get("/generate/job/<job_id>/result")
+def generate_result(job_id: str):
+    """The bytes themselves, for the preview on the page."""
+    job = generate.get(job_id)
+    if job is None or job.state != "done":
+        abort(404, "no result for that job")
+    return Response(job.result, content_type=job.content_type,
+                    headers={"Cache-Control": "no-store",
+                             "Content-Length": str(len(job.result))})
+
+
+@app.post("/generate/job/<job_id>/keep")
+def generate_keep(job_id: str):
+    """Put a finished job into the pool, where it is an item like any other."""
+    job = generate.get(job_id)
+    if job is None or job.state != "done":
+        abort(404, "no result for that job")
+    name = job.filename or (f"generated.mp4" if job.kind == "clip" else "generated.png")
+    item = lib(library.pool_add, job.result, job.content_type, name)
+    job.pool_id = item["id"]
+    # Assigning is optional: a clip is often made for the pool, not for one
+    # screen, and picking the screen later is the normal way round.
+    if device := request.form.get("device"):
+        lib(library.select, device, item["id"])
+        registry.notify(device)
+    if from_browser_form():
+        return Response(status=303, headers={"Location": "/generate"})
+    return jsonify({"pool_id": item["id"], "item": item}), 201
 
 
 @app.get("/healthz")
