@@ -1,0 +1,109 @@
+# Everything the AI video stack downloads. The repository carries none of it:
+# no ComfyUI checkout, no node packs, no weights -- only this list of what to
+# fetch and exactly which version.
+#
+# Commits are pinned rather than tracking main, because ComfyUI and the
+# AnimateDiff nodes both move quickly and an unpinned install is reproducible
+# only by luck. `bootstrap.py --update` bumps every pin to current upstream;
+# review that diff, re-run bootstrap, confirm it still generates, then commit.
+#
+# Hashes are the files this stack was actually verified against on an M1 Pro.
+
+[python]
+# PyTorch publishes wheels a release or two behind the newest CPython, so the
+# version is pinned here and fetched by uv rather than taken from the system.
+version = "3.12"
+
+[torch]
+# Used only off macOS. If a Windows install fails to find a matching wheel,
+# this is the line to change -- the CUDA suffix must match the driver.
+cuda_index = "https://download.pytorch.org/whl/cu126"
+cpu_index = "https://download.pytorch.org/whl/cpu"
+
+[comfyui]
+repo = "https://github.com/comfyanonymous/ComfyUI.git"
+commit = "e9027f2b30f37bb3052714eb08fcf479542f4fc0"
+
+# ---------------------------------------------------------------- node packs
+
+[[node_packs]]
+name = "ComfyUI-AnimateDiff-Evolved"
+repo = "https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved.git"
+commit = "9257651221002dcba0a12f9cff37e1944e58fb60"
+why = "the motion modules, and the looped context scheduler that makes a clip join end to start"
+
+[[node_packs]]
+name = "ComfyUI-Advanced-ControlNet"
+repo = "https://github.com/Kosinkadink/ComfyUI-Advanced-ControlNet.git"
+commit = "27a67fee80cf46c198b10588a5651f23d67d1e95"
+why = "SparseCtrl, which pins an existing still into frame 0 so a pool picture gains motion"
+
+[[node_packs]]
+name = "ComfyUI-VideoHelperSuite"
+repo = "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git"
+commit = "4d907bee61e92c2e65af3bd6383a4e4d356126d1"
+why = "writes the h264 MP4 the content server reads back"
+
+[[node_packs]]
+name = "ComfyUI-Frame-Interpolation"
+repo = "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git"
+commit = "26545cc2dd95bc3d27f056016300673bdeee78f5"
+why = "RIFE, to turn 8fps of generated motion into 16fps of playback for free"
+
+[[node_packs]]
+name = "ComfyUI-Manager"
+repo = "https://github.com/Comfy-Org/ComfyUI-Manager.git"
+commit = "855a0f50ecc842adacab08aa24d8655a742fae40"
+why = "installs further node packs from inside the GUI"
+
+# -------------------------------------------------------------------- models
+
+[[models]]
+name = "DreamShaper_8_pruned.safetensors"
+dir = "checkpoints"
+url = "https://huggingface.co/Lykon/DreamShaper/resolve/main/DreamShaper_8_pruned.safetensors"
+sha256 = "879db523c30d3b9017143d56705015e15a2cb5628762c11d086fed9538abd7fd"
+size_mb = 2033
+why = "the SD1.5 checkpoint every frame is rendered through"
+
+[[models]]
+name = "vae-ft-mse-840000-ema-pruned.safetensors"
+dir = "vae"
+url = "https://huggingface.co/stabilityai/sd-vae-ft-mse-original/resolve/main/vae-ft-mse-840000-ema-pruned.safetensors"
+sha256 = "735e4c3a447a3255760d7f86845f09f937809baa529c17370d83e4c3758f3c75"
+size_mb = 319
+why = "a better decoder than the one baked into the checkpoint; fewer mushy darks"
+
+[[models]]
+name = "v3_sd15_mm.ckpt"
+dir = "animatediff_models"
+url = "https://huggingface.co/guoyww/animatediff/resolve/main/v3_sd15_mm.ckpt"
+sha256 = "2412711886f61091846f53204aabc38aa6e09356d62a9808abe4daa802168343"
+size_mb = 1595
+why = "AnimateDiff v3 motion module: the thing that actually animates"
+
+[[models]]
+name = "v3_sd15_adapter.ckpt"
+dir = "loras"
+url = "https://huggingface.co/guoyww/animatediff/resolve/main/v3_sd15_adapter.ckpt"
+sha256 = "fd2d8e26480f6ab013c1e6af86fdf1dedbb1ed5baf850ccd5f365f39d6c3472c"
+size_mb = 97
+why = "keeps the v3 motion module on the checkpoint's style instead of drifting off it"
+
+[[models]]
+name = "lcm_lora_sd15.safetensors"
+dir = "loras"
+url = "https://huggingface.co/latent-consistency/lcm-lora-sdv1-5/resolve/main/pytorch_lora_weights.safetensors"
+sha256 = "8f90d840e075ff588a58e22c6586e2ae9a6f7922996ee6649a7f01072333afe4"
+size_mb = 128
+why = "8 steps instead of 20, which on Apple Silicon is the difference between iterating and waiting"
+
+[[models]]
+name = "v3_sd15_sparsectrl_rgb.ckpt"
+dir = "controlnet"
+url = "https://huggingface.co/guoyww/animatediff/resolve/main/v3_sd15_sparsectrl_rgb.ckpt"
+sha256 = "c93f27a3cd15edf99bbddf4522509f2e831f515cc7db9c820d955037ddafbe45"
+size_mb = 1895
+why = "image-to-video: anchors a still from the pool and animates outward from it"
+
+# RIFE fetches its own weights into models/frame_interpolation on first use.

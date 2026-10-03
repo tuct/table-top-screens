@@ -3,3 +3,12 @@ server/data/
 esphome/secrets.yaml
 esphome/.esphome/
 __pycache__/
+
+# AI video stack. ComfyUI, its node packs and the model weights are downloaded
+# by tools/ai-video/bootstrap.py, never committed -- these patterns only matter
+# if someone installs with --dir pointing inside the repo.
+ComfyUI/
+tools/ai-video/**/*.safetensors
+tools/ai-video/**/*.ckpt
+tools/ai-video/**/*.pth
+tools/ai-video/output/
