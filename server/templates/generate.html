@@ -74,6 +74,9 @@
         </div>
         <p class="note" id="refnote" hidden>Adopted from a verify. Edit the words
           and run verify again to keep refining.</p>
+        <p class="note" id="keepnote" hidden><b>close</b> holds the reference
+          tightly — same subject, restyled. <b>loose</b> treats it as a starting
+          point and will happily change who or what is in it.</p>
       </div>
 
       {% if pool %}
@@ -94,8 +97,17 @@
         <div class="field narrow">
           <label for="size">Shape</label>
           <select id="size" name="size">
+            <option value="{{ auto_size }}" selected>auto — match reference</option>
             {% for s in sizes %}
-              <option value="{{ s }}"{{ ' selected' if s == default_size }}>{{ s }}</option>
+              <option value="{{ s }}">{{ s }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field narrow" id="keepfield">
+          <label for="keep">Keep reference</label>
+          <select id="keep" name="keep">
+            {% for k in keeps %}
+              <option value="{{ k }}"{{ ' selected' if k == default_keep }}>{{ k }}</option>
             {% endfor %}
           </select>
         </div>

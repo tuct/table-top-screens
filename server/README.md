@@ -386,6 +386,18 @@ Animating is roughly twenty times the cost of looking, which is the whole
 reason the first two steps exist. The last ten stills and the last ten loops
 are kept and shown, and either moves into the pool with one click.
 
+**Keep reference** decides how much of the picture survives, and the default is
+`close`. At `loose` the model treats the reference as a starting point and will
+change who is in it — a painted elf ranger came back as a different character
+in a different pose. `close` holds the subject and restyles it. The control
+reaches both kinds of run: for a still it is the denoise, for a clip it is how
+hard SparseCtrl pulls.
+
+**Shape** defaults to `auto`, which reads the reference's own proportions. A
+16:9 picture forced into a square loses its sides to a centre crop before the
+model sees it, and the result then looks like the reference was ignored when
+most of it simply was not there.
+
 With a reference, the still is pinned to **both ends** of the clip and the
 closed loop comes off. Anchored only at frame 0 the animation drifts off the
 subject well before the end — in testing a painted elf ranger became an
@@ -429,7 +441,7 @@ worth keeping into the pool rather than leaving on the page.
 ./.venv/bin/python test_library.py      # 140 checks, no network
 ./.venv/bin/python test_content.py      # 121 checks, no network
 ./.venv/bin/python test_discovery.py    # 38 checks, uses real mDNS
-./.venv/bin/python test_generate.py     # 62 checks, no ComfyUI needed
+./.venv/bin/python test_generate.py     # 74 checks, no ComfyUI needed
 ```
 
 (On Windows: `./.venv/Scripts/python.exe` instead of `./.venv/bin/python`.)

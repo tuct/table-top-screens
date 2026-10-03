@@ -93,10 +93,10 @@ def main() -> int:  # noqa: PLR0915
     check("with no reference it denoises fully", g["sampler"]["inputs"]["denoise"] == 1.0)
     check("it saves an image, not a video", g["out"]["class_type"] == "SaveImage")
 
-    g = generate.still_graph("a tavern", "ref.png", "square", 1, strength=0.6)
+    g = generate.still_graph("a tavern", "ref.png", "square", 1, "balanced")
     check("with a reference it is img2img", g["latent"]["class_type"] == "VAEEncode")
     check("and only partially denoised, so the reference survives",
-          g["sampler"]["inputs"]["denoise"] == 0.6)
+          g["sampler"]["inputs"]["denoise"] == generate.KEEP["balanced"]["denoise"])
 
     print("\nevery link points at a node that exists")
     for kind, graph in (("clip", generate.clip_graph("x", "r.png", "portrait", 1)),
@@ -118,10 +118,11 @@ def main() -> int:  # noqa: PLR0915
     real_upload, real_submit = generate.upload_reference, generate.submit
     generate.upload_reference = fake_upload
     generate.submit = lambda kind, prompt, reference, size, seed, \
-        length=generate.DEFAULT_LENGTH, adopted_from="": generate.Job(
+        length=generate.DEFAULT_LENGTH, adopted_from="", \
+        keep=generate.DEFAULT_KEEP: generate.Job(
             id="t", kind=kind, prompt=prompt, size=size, seed=seed,
             has_reference=bool(reference), length=length,
-            adopted_from=adopted_from)
+            adopted_from=adopted_from, keep=keep)
     try:
         c = srv.app.test_client()
         r = c.post("/generate/run", data={"kind": "verify", "prompt": "x",
@@ -239,9 +240,11 @@ def main() -> int:  # noqa: PLR0915
     generate.upload_reference = fake_upload
     real_submit2 = generate.submit
     generate.submit = lambda kind, prompt, reference, size, seed, \
-        length=generate.DEFAULT_LENGTH, adopted_from="": generate.Job(
+        length=generate.DEFAULT_LENGTH, adopted_from="", \
+        keep=generate.DEFAULT_KEEP: generate.Job(
             id="t2", kind=kind, prompt=prompt, size=size, seed=seed,
-            has_reference=bool(reference), length=length, adopted_from=adopted_from)
+            has_reference=bool(reference), length=length,
+            adopted_from=adopted_from, keep=keep)
     try:
         c = srv.app.test_client()
         r = c.post("/generate/run", data={"kind": "verify", "prompt": "refined",
@@ -275,6 +278,66 @@ def main() -> int:  # noqa: PLR0915
     check("the gallery is capped at ten", len(generate.recent(generate.GALLERY)) <= 10)
     check("a still is flagged as an image", finished.public()["is_image"] is True)
     check("a clip is not", a_clip.public()["is_image"] is False)
+
+    print("\nholding on to the reference")
+    close = generate.still_graph("x", "r.png", "square", 1, "close")
+    loose = generate.still_graph("x", "r.png", "square", 1, "loose")
+    check("close denoises less, so more of the picture survives",
+          close["sampler"]["inputs"]["denoise"] < loose["sampler"]["inputs"]["denoise"],
+          f'{close["sampler"]["inputs"]["denoise"]} < {loose["sampler"]["inputs"]["denoise"]}')
+    check("the default is the one that keeps the subject",
+          generate.DEFAULT_KEEP == "close")
+    check("it reaches a clip's control strength too",
+          generate.clip_graph("x", "r.png", "square", 1, "1s", "loose")["cnet"]["inputs"]["strength"]
+          < generate.clip_graph("x", "r.png", "square", 1, "1s", "close")["cnet"]["inputs"]["strength"])
+    check("with no reference it changes nothing",
+          generate.still_graph("x", None, "square", 1, "close")["sampler"]["inputs"]["denoise"]
+          == generate.still_graph("x", None, "square", 1, "loose")["sampler"]["inputs"]["denoise"]
+          == 1.0)
+    r = srv.app.test_client().post("/generate/run",
+                                   data={"kind": "verify", "prompt": "x", "keep": "tight"},
+                                   content_type="multipart/form-data")
+    check("an unknown keep level is refused", r.status_code == 400, str(r.status_code))
+
+    print("\nmatching the reference's proportions")
+    # A 16:9 picture centre-cropped into a square loses its sides before the
+    # model ever sees it, which is indistinguishable from being ignored.
+    check("a wide picture asks for landscape", generate.shape_for(800, 450) == "landscape")
+    check("a tall one asks for portrait", generate.shape_for(480, 800) == "portrait")
+    check("a square one asks for square", generate.shape_for(800, 800) == "square")
+    check("and nothing known falls back to the default",
+          generate.shape_for(0, 0) == generate.DEFAULT_SIZE)
+
+    wide = library.pool_add(DATA_TEST, png_bytes(320, 180), "image/png", "wide.png")
+    sent.clear()
+    real_up2, real_sub2 = generate.upload_reference, generate.submit
+    seen: dict = {}
+    generate.upload_reference = fake_upload
+    generate.submit = lambda kind, prompt, reference, size, seed, \
+        length=generate.DEFAULT_LENGTH, adopted_from="", \
+        keep=generate.DEFAULT_KEEP: (seen.update(size=size, keep=keep) or generate.Job(
+            id="t3", kind=kind, prompt=prompt, size=size, seed=seed,
+            has_reference=bool(reference), length=length,
+            adopted_from=adopted_from, keep=keep))
+    try:
+        c = srv.app.test_client()
+        r = c.post("/generate/run", data={"kind": "verify", "prompt": "x",
+                                          "pool_id": wide["id"], "size": "auto"},
+                   content_type="multipart/form-data")
+        check("auto reads the reference and picks landscape for a 16:9 source",
+              r.status_code == 202 and seen.get("size") == "landscape",
+              f'{r.status_code} {seen.get("size")}')
+        seen.clear()
+        r = c.post("/generate/run", data={"kind": "verify", "prompt": "x", "size": "auto"},
+                   content_type="multipart/form-data")
+        check("auto with no reference falls back rather than failing",
+              r.status_code == 202 and seen.get("size") == generate.DEFAULT_SIZE,
+              str(seen.get("size")))
+        r = c.post("/generate/run", data={"kind": "verify", "prompt": "x", "size": "oblong"},
+                   content_type="multipart/form-data")
+        check("an unknown size is still refused", r.status_code == 400, str(r.status_code))
+    finally:
+        generate.upload_reference, generate.submit = real_up2, real_sub2
 
     print("\nbad input")
     c = srv.app.test_client()

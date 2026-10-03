@@ -2189,6 +2189,9 @@ def generate_page():
         status=generate.status_line(),
         sizes=list(generate.SIZES),
         default_size=generate.DEFAULT_SIZE,
+        auto_size=generate.AUTO_SIZE,
+        keeps=list(generate.KEEP),
+        default_keep=generate.DEFAULT_KEEP,
         lengths=list(generate.LENGTHS),
         default_length=generate.DEFAULT_LENGTH,
         active=generate.queue_view(),
@@ -2200,6 +2203,15 @@ def generate_page():
     )
 
 
+def _dimensions(body: bytes) -> tuple[int, int]:
+    """Width and height of an encoded image, or (0, 0) if it will not open."""
+    try:
+        with Image.open(io.BytesIO(body)) as im:
+            return im.size
+    except Exception:  # noqa: BLE001 - a bad reference is caught downstream
+        return (0, 0)
+
+
 @app.post("/generate/run")
 def generate_run():
     """Start a verify or a clip. Returns at once with a job to poll."""
@@ -2208,6 +2220,9 @@ def generate_run():
         abort(400, "kind must be verify or clip")
     prompt = (request.form.get("prompt") or "").strip()
     size = request.form.get("size") or generate.DEFAULT_SIZE
+    keep = request.form.get("keep") or generate.DEFAULT_KEEP
+    if keep not in generate.KEEP:
+        abort(400, f"keep must be one of {', '.join(generate.KEEP)}")
     try:
         seed = int(request.form.get("seed") or 0) or random.randrange(2**31)
     except ValueError:
@@ -2218,9 +2233,12 @@ def generate_run():
     # being fetched back out of the browser first.
     reference = None
     adopted = ""
+    ref_size = (0, 0)
     try:
         if (up := request.files.get("reference")) is not None and up.filename:
-            reference = generate.upload_reference(up.read(), up.filename)
+            data = up.read()
+            ref_size = _dimensions(data)
+            reference = generate.upload_reference(data, up.filename)
         elif from_job := request.form.get("from_job"):
             # Adopting: the still a previous verify produced becomes the
             # reference for the next one. That is the refining loop -- look,
@@ -2230,6 +2248,7 @@ def generate_run():
                 abort(404, "no finished result for that job")
             if not src.content_type.startswith("image/"):
                 abort(400, "only a still can be adopted as a reference")
+            ref_size = _dimensions(src.result)
             reference = generate.upload_reference(src.result, f"{from_job}.png")
             adopted = from_job
         elif item_id := request.form.get("pool_id"):
@@ -2243,18 +2262,31 @@ def generate_run():
                     src = video.first_frame(body, 1024, 1024)
                 else:
                     src = Image.open(io.BytesIO(body))
+                ref_size = src.size
                 buf = io.BytesIO()
                 src.convert("RGB").save(buf, format="PNG")
                 reference = generate.upload_reference(buf.getvalue(), f"{item_id}.png")
     except generate.NoComfyUI as exc:
         abort(503, str(exc))
 
+    # "auto" can only be settled once the reference is known, which is why it
+    # is resolved here rather than with the other fields. Cropping a 16:9
+    # picture into a square throws its sides away before the model sees it,
+    # and the result then looks like the reference was ignored.
+    if size == generate.AUTO_SIZE:
+        size = (generate.shape_for(*ref_size) if any(ref_size)
+                else generate.DEFAULT_SIZE)
+    elif size not in generate.SIZES:
+        abort(400, f"size must be {generate.AUTO_SIZE} or one of "
+                   f"{', '.join(generate.SIZES)}")
+
     length = request.form.get("length") or generate.DEFAULT_LENGTH
     if length not in generate.LENGTHS:
         abort(400, f"length must be one of {', '.join(generate.LENGTHS)}")
 
     try:
-        job = generate.submit(kind, prompt, reference, size, seed, length, adopted)
+        job = generate.submit(kind, prompt, reference, size, seed, length,
+                              adopted, keep)
     except ValueError as exc:
         abort(400, str(exc))
     # Without JavaScript the page still works: it redirects back, and the job

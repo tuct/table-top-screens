@@ -58,10 +58,22 @@
     clearRef(true);
     reflabel.textContent = f.name;
     showRefImage(URL.createObjectURL(f), false);
+    refreshKeep();
   });
 
   var clear = $("refclear");
-  if (clear) clear.addEventListener("click", function () { clearRef(); hideRef(); });
+  if (clear) clear.addEventListener("click", function () {
+    clearRef(); hideRef(); refreshKeep();
+  });
+
+  // "Keep reference" only means anything when there is one.
+  function refreshKeep() {
+    var has = !refshot.hidden;
+    var field = $("keepfield"), note = $("keepnote");
+    if (field) field.style.opacity = has ? "" : ".45";
+    if ($("keep")) $("keep").disabled = !has;
+    if (note) note.hidden = !has;
+  }
 
   var drop = $("refdrop");
   if (drop) {
@@ -93,8 +105,19 @@
     pool.addEventListener("change", function () {
       if (file) file.value = "";
       fromjob.value = "";
-      hideRef();
+      var picked = form.querySelector('input[name="pool_id"]:checked');
+      if (picked) {
+        // Show it, the same as an upload. Without this the only sign a pool
+        // reference was chosen is a thin border on a tile inside a <details>
+        // that is usually collapsed -- which reads as nothing being chosen.
+        var tile = picked.closest(".pooltile").querySelector("img");
+        reflabel.textContent = "from the pool";
+        showRefImage(tile.src, false);
+      } else {
+        hideRef();
+      }
       syncPool();
+      refreshKeep();
     });
     syncPool();
   }
@@ -107,6 +130,7 @@
     fromjob.value = id;
     showRefImage("/generate/job/" + id + "/result?t=" + Date.now(), true);
     reflabel.textContent = "adopted from a verify";
+    refreshKeep();
     $("prompt").focus();
   }
 
@@ -325,6 +349,7 @@
     });
   }
 
+  refreshKeep();
   setInterval(heartbeat, POLL_MS);
   heartbeat();
 })();

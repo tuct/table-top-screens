@@ -57,6 +57,31 @@ SIZES = {
     "square":    (512, 512),
 }
 DEFAULT_SIZE = "portrait"
+AUTO_SIZE = "auto"      # match the reference's own proportions
+
+# How much of the reference to hold on to. For a still this is the denoise --
+# lower keeps more -- and for a clip it is how hard SparseCtrl pulls. Named for
+# the intent rather than the number, because "denoise 0.35" does not say
+# "looks like the picture I gave you", which is the thing being asked for.
+KEEP = {
+    "close":    {"denoise": 0.32, "control": 1.0},
+    "balanced": {"denoise": 0.55, "control": 1.0},
+    "loose":    {"denoise": 0.75, "control": 0.8},
+}
+DEFAULT_KEEP = "close"
+
+
+def shape_for(width: int, height: int) -> str:
+    """The named shape closest to these proportions.
+
+    A 16:9 picture squeezed into a square loses its sides to a centre crop,
+    which reads as the reference having been ignored when in fact most of it
+    was thrown away before the model ever saw it.
+    """
+    if not width or not height:
+        return DEFAULT_SIZE
+    want = width / height
+    return min(SIZES, key=lambda k: abs(SIZES[k][0] / SIZES[k][1] - want))
 
 # Interpolation doubles the frames after sampling, so what the sampler is
 # asked for is half of what gets written. Cost scales with the generated count,
@@ -202,7 +227,7 @@ def _base(prompt: str, negative: str, width: int, height: int,
 
 
 def still_graph(prompt: str, reference: str | None, size: str,
-                seed: int, strength: float = 0.55) -> dict:
+                seed: int, keep: str = DEFAULT_KEEP) -> dict:
     """One frame, no motion module. The quick look before the long wait.
 
     With a reference this is img2img at partial denoise, so the result keeps
@@ -219,7 +244,7 @@ def still_graph(prompt: str, reference: str | None, size: str,
                                "width": w, "height": h, "crop": "center"}}
         g["latent"] = {"class_type": "VAEEncode",
                        "inputs": {"pixels": ["fit", 0], "vae": ["vae", 0]}}
-        denoise = strength
+        denoise = KEEP.get(keep, KEEP[DEFAULT_KEEP])["denoise"]
     else:
         g["latent"] = {"class_type": "EmptyLatentImage",
                        "inputs": {"width": w, "height": h, "batch_size": 1}}
@@ -240,7 +265,7 @@ def still_graph(prompt: str, reference: str | None, size: str,
 
 
 def clip_graph(prompt: str, reference: str | None, size: str, seed: int,
-               length: str = DEFAULT_LENGTH) -> dict:
+               length: str = DEFAULT_LENGTH, keep: str = DEFAULT_KEEP) -> dict:
     """The looping MP4.
 
     With a reference, SparseCtrl pins it to both ends of the sequence and the
@@ -287,7 +312,7 @@ def clip_graph(prompt: str, reference: str | None, size: str, seed: int,
         g["cnet"] = {"class_type": "ControlNetApplyAdvanced",
                      "inputs": {"positive": ["pos", 0], "negative": ["neg", 0],
                                 "control_net": ["sparse", 0], "image": ["prep", 0],
-                                "strength": 1.0,
+                                "strength": KEEP.get(keep, KEEP[DEFAULT_KEEP])["control"],
                                 "start_percent": 0.0, "end_percent": 1.0,
                                 "vae": ["vae", 0]}}
         positive, negative = ["cnet", 0], ["cnet", 1]
@@ -330,6 +355,7 @@ class Job:
     seed: int
     has_reference: bool
     prompt_id: str = ""             # ComfyUI's id for it, once submitted
+    keep: str = DEFAULT_KEEP        # how much of the reference to hold on to
     length: str = DEFAULT_LENGTH    # only meaningful for a clip
     adopted_from: str = ""          # the verify this one was refined out of
     state: str = "queued"           # queued | running | done | error
@@ -367,7 +393,8 @@ class Job:
                 "running": round(self.running, 1),
                 "prompt": self.prompt, "size": self.size, "seed": self.seed,
                 "has_reference": self.has_reference, "ahead": self.ahead,
-                "length": self.length, "adopted_from": self.adopted_from,
+                "length": self.length, "keep": self.keep,
+                "adopted_from": self.adopted_from,
                 "is_image": self.content_type.startswith("image/"),
                 "filename": self.filename, "pool_id": self.pool_id,
                 "estimate": estimate_for(self.kind, self.length)}
@@ -424,7 +451,7 @@ def queue_view() -> list[dict]:
                          "state": "running" if position == 0 else "queued",
                          "ahead": position, "prompt": "started in ComfyUI",
                          "elapsed": 0.0, "running": 0.0, "estimate": 0,
-                         "length": "", "size": "", "seed": 0,
+                         "length": "", "keep": "", "size": "", "seed": 0,
                          "has_reference": False, "is_image": False,
                          "filename": "", "pool_id": "", "error": "",
                          "adopted_from": ""})
@@ -459,18 +486,19 @@ def _remember(job: Job) -> None:
 
 
 def submit(kind: str, prompt: str, reference: str | None, size: str, seed: int,
-           length: str = DEFAULT_LENGTH, adopted_from: str = "") -> Job:
+           length: str = DEFAULT_LENGTH, adopted_from: str = "",
+           keep: str = DEFAULT_KEEP) -> Job:
     """Queue a job and return at once; the work happens on a thread."""
     if not prompt.strip() and kind == "clip" and not reference:
         raise ValueError("a clip needs a description, a reference image, or both")
 
     job = Job(id=uuid.uuid4().hex[:12], kind=kind, prompt=prompt, size=size,
               seed=seed, has_reference=bool(reference), length=length,
-              adopted_from=adopted_from)
+              adopted_from=adopted_from, keep=keep)
     _remember(job)
 
-    graph = (still_graph(prompt, reference, size, seed) if kind == "verify"
-             else clip_graph(prompt, reference, size, seed, length))
+    graph = (still_graph(prompt, reference, size, seed, keep) if kind == "verify"
+             else clip_graph(prompt, reference, size, seed, length, keep))
     threading.Thread(target=_run, args=(job, graph), daemon=True).start()
     return job
 
