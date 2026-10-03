@@ -230,11 +230,15 @@ def write_launcher(comfy: Path) -> None:
     """A start script per platform, so nobody has to remember the flags."""
     if IS_WINDOWS:
         path = comfy / "start.cmd"
+        # newline="" turns OFF text-mode translation. Without it every \r\n
+        # here is written as \r\r\n, because text mode expands the \n a second
+        # time on Windows -- verified with od -c on a generated start.cmd.
         path.write_text(
             "@echo off\r\n"
             "rem ComfyUI launcher.\r\n"
             "cd /d \"%~dp0\"\r\n"
-            ".venv\\Scripts\\python.exe main.py --listen 127.0.0.1 --port 8188 %*\r\n")
+            ".venv\\Scripts\\python.exe main.py --listen 127.0.0.1 --port 8188 %*\r\n",
+            newline="")
     else:
         path = comfy / "start.sh"
         path.write_text(
