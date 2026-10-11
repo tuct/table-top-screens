@@ -202,6 +202,26 @@ def verify(path: Path, expected: str, label: str) -> bool:
 
 # -------------------------------------------------------------------- torch
 
+# Oldest card the CUDA 13 torch wheels still carry kernels for (Turing).
+CUDA_MODERN_MIN_CC = 7.5
+
+
+def gpu_compute_capability() -> float | None:
+    """The first NVIDIA card's compute capability, e.g. 12.0 for an RTX 50xx.
+
+    None when nvidia-smi cannot say -- very old drivers lack the query -- in
+    which case the caller assumes a current card, since that is what anyone
+    installing a video model is likely to have.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=20).stdout
+        return float(out.split()[0])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+
 def torch_packages(cfg: dict) -> list[str]:
     """The right torch build for this machine.
 
@@ -215,8 +235,19 @@ def torch_packages(cfg: dict) -> list[str]:
         return ["torch", "torchvision", "torchaudio"]
 
     if shutil.which("nvidia-smi"):
-        index = cfg.get("cuda_index", "https://download.pytorch.org/whl/cu126")
-        R.info(f"NVIDIA GPU detected; using {index}")
+        cc = gpu_compute_capability()
+        # No single CUDA build covers every card any more. CUDA 13 wheels are
+        # the only ones with kernels for Blackwell (RTX 50xx, sm_120), and
+        # they dropped everything older than Turing (RTX 20xx, 7.5). A cu12x
+        # build on a 50xx card installs, starts and then fails the first job
+        # with "no kernel image is available" -- so it has to be chosen from
+        # the card, not hardcoded.
+        if cc is not None and cc < CUDA_MODERN_MIN_CC:
+            index = cfg.get("cuda_index_legacy", "https://download.pytorch.org/whl/cu126")
+        else:
+            index = cfg.get("cuda_index", "https://download.pytorch.org/whl/cu130")
+        R.info(f"NVIDIA GPU detected (compute capability {cc or 'unknown'}); "
+               f"using {index}")
         return ["torch", "torchvision", "torchaudio", "--index-url", index]
 
     R.warn("no NVIDIA GPU detected; installing CPU-only torch. Generation will "

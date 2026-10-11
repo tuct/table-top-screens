@@ -1166,3 +1166,246 @@ def _migrate(root: Path) -> None:
 
     if changed or not _pool_index_path(root).exists():
         _write_json(_pool_index_path(root), index)
+
+
+# --------------------------------------------------------------------------
+# backgrounds
+#
+# A place, kept apart from the pool because it is half a picture rather than a
+# whole one. The point is reuse in both directions: the same tavern takes a
+# different character tomorrow, and the same character walks into a different
+# tavern -- which only works if the place is an asset with a name rather than
+# a step inside one character's flow.
+#
+# Each carries the words that made it AND the words for what should move in
+# it. The motion is recorded here, with the place, because that is where it
+# belongs: smoke drifts in a particular room, and the answer is the same every
+# time a clip is built from it. It is spent later, never at generation time --
+# a still cannot show motion, and asking for it while drawing the room only
+# muddies the room.
+
+BACKGROUNDS = "_backgrounds"
+
+
+def bg_dir(root: Path) -> Path:
+    return Path(root) / BACKGROUNDS
+
+
+def _bg_index_path(root: Path) -> Path:
+    return bg_dir(root) / "index.json"
+
+
+def bg_path(root: Path, bg_id: str) -> Path:
+    if not ITEM_RE.match(bg_id):
+        raise LibraryError("invalid background id")
+    return bg_dir(root) / "items" / f"{bg_id}.png"
+
+
+def bg_clip_path(root: Path, bg_id: str, loop_id: str = "") -> Path:
+    """Where one of a place's loops lives, beside its still.
+
+    A place has MANY loops, not one. Animating the same room with different
+    words is the normal way to work -- smoke, then firelight, then both -- and
+    each attempt is worth keeping next to the picture that produced it.
+    `loop_id` empty is the legacy single-loop name, still read so older data
+    keeps working.
+    """
+    if not ITEM_RE.match(bg_id):
+        raise LibraryError("invalid background id")
+    if loop_id and not re.match(r"^[0-9a-f]{8,16}$", loop_id):
+        raise LibraryError("invalid loop id")
+    name = f"{bg_id}-{loop_id}.mp4" if loop_id else f"{bg_id}.mp4"
+    return bg_dir(root) / "items" / name
+
+
+def bg_loops(root: Path, bg_id: str) -> list[dict]:
+    """Every loop of this place, newest first."""
+    entry = bg_get(root, bg_id)
+    if entry is None:
+        return []
+    return [lp for lp in (entry.get("loops") or [])
+            if lp.get("id") and bg_clip_path(root, bg_id, lp["id"]).exists()]
+
+
+def bg_add_clip(root: Path, bg_id: str, body: bytes, meta: dict) -> dict:
+    """Keep another loop of this place, with the words that moved it."""
+    _migrate_bg_loops(root)
+    items = _bg_raw(root)
+    entry = next((i for i in items if i["id"] == bg_id), None)
+    if entry is None:
+        raise LibraryError("no such background")
+    if not body:
+        raise LibraryError("empty clip")
+    loop_id = hashlib.sha256(body).hexdigest()[:12]
+    bg_clip_path(root, bg_id, loop_id).parent.mkdir(parents=True, exist_ok=True)
+    bg_clip_path(root, bg_id, loop_id).write_bytes(body)
+    loop = {"id": loop_id, "created_at": time.time(),
+            "motion": str(meta.get("motion") or "").strip(),
+            "length": str(meta.get("length") or "").strip(),
+            "seed": int(meta.get("seed") or 0)}
+    loops = [lp for lp in (entry.get("loops") or []) if lp.get("id") != loop_id]
+    entry["loops"] = [loop] + loops
+    _write_json(_bg_index_path(root), items)
+    return loop
+
+
+def bg_clip(root: Path, bg_id: str, loop_id: str = "") -> bytes:
+    path = bg_clip_path(root, bg_id, loop_id)
+    if not path.exists() and not loop_id:
+        # Fall through to the newest loop when no particular one was asked for.
+        loops = bg_loops(root, bg_id)
+        if loops:
+            path = bg_clip_path(root, bg_id, loops[0].get("id", ""))
+    if not path.exists():
+        raise LibraryError("no such clip")
+    return path.read_bytes()
+
+
+def bg_remove_clip(root: Path, bg_id: str, loop_id: str) -> None:
+    items = _bg_raw(root)
+    entry = next((i for i in items if i["id"] == bg_id), None)
+    if entry is None:
+        raise LibraryError("no such background")
+    path = bg_clip_path(root, bg_id, loop_id)
+    if not path.exists():
+        raise LibraryError("no such clip")
+    path.unlink(missing_ok=True)
+    entry["loops"] = [lp for lp in (entry.get("loops") or [])
+                      if lp.get("id") != loop_id]
+    _write_json(_bg_index_path(root), items)
+
+
+def _bg_raw(root: Path) -> list[dict]:
+    """The index exactly as stored.
+
+    Mutators read THIS, never backgrounds(). backgrounds() decorates each
+    entry with computed fields, and writing those back is what put a growing
+    pile of empty-id loop records in the index: a read-shaped field leaking
+    into a write, once per animate.
+    """
+    items = _read_json(_bg_index_path(root), [])
+    return items if isinstance(items, list) else []
+
+
+def _migrate_bg_loops(root: Path) -> None:
+    """Give the one legacy loop a real id, once.
+
+    Loops used to be a single file named after the place. That file has no id,
+    so the page could only render a delete URL with an empty one -- which
+    routes nowhere. Renaming it into the normal shape retires the special case
+    instead of teaching every caller about it.
+    """
+    items = _bg_raw(root)
+    changed = False
+    for entry in items:
+        bg_id = entry.get("id")
+        if not bg_id:
+            continue
+        # Drop the empty-id records the leak above wrote.
+        loops = [lp for lp in (entry.get("loops") or []) if lp.get("id")]
+        if loops != (entry.get("loops") or []):
+            entry["loops"] = loops
+            changed = True
+        legacy = bg_dir(root) / "items" / f"{bg_id}.mp4"
+        if not legacy.exists():
+            continue
+        body = legacy.read_bytes()
+        loop_id = hashlib.sha256(body).hexdigest()[:12]
+        bg_clip_path(root, bg_id, loop_id).write_bytes(body)
+        legacy.unlink(missing_ok=True)
+        if not any(lp.get("id") == loop_id for lp in loops):
+            entry["loops"] = [{"id": loop_id, "created_at": time.time(),
+                               "motion": entry.get("motion", ""),
+                               "length": "", "seed": 0}] + loops
+        changed = True
+    if changed:
+        _write_json(_bg_index_path(root), items)
+
+
+def backgrounds(root: Path) -> list[dict]:
+    """Every background, newest first. Entries with no file are dropped."""
+    _migrate_bg_loops(root)
+    items = _bg_raw(root)
+    if not isinstance(items, list):
+        return []
+    out = []
+    for i in items:
+        if not (isinstance(i, dict) and i.get("id") and bg_path(root, i["id"]).exists()):
+            continue
+        i = dict(i)
+        kept = [lp for lp in (i.get("loops") or [])
+                if lp.get("id") and bg_clip_path(root, i["id"], lp["id"]).exists()]
+        i["loops"] = kept
+        i["has_clip"] = bool(kept)
+        out.append(i)
+    return out
+
+
+def bg_get(root: Path, bg_id: str) -> dict | None:
+    return next((i for i in backgrounds(root) if i["id"] == bg_id), None)
+
+
+def bg_body(root: Path, bg_id: str) -> bytes:
+    path = bg_path(root, bg_id)
+    if not path.exists():
+        raise LibraryError("no such background")
+    return path.read_bytes()
+
+
+def bg_add(root: Path, body: bytes, meta: dict) -> dict:
+    """Keep a generated place, with the words that made it.
+
+    Identified by its own bytes, so regenerating the same picture from the
+    same seed does not fill the shelf with duplicates -- but the metadata is
+    refreshed, because the newer attempt is the one the user just approved.
+    """
+    if not body:
+        raise LibraryError("empty background")
+    bg_id = hashlib.sha256(body).hexdigest()[:16]
+    entry = {
+        "id": bg_id,
+        "created_at": time.time(),
+        "name": str(meta.get("name") or "").strip(),
+        "scene": str(meta.get("scene") or "").strip(),
+        "motion": str(meta.get("motion") or "").strip(),
+        "style": str(meta.get("style") or "").strip(),
+        "size": str(meta.get("size") or "").strip(),
+        "seed": int(meta.get("seed") or 0),
+        "source": str(meta.get("source") or "text").strip(),
+    }
+    bg_path(root, bg_id).parent.mkdir(parents=True, exist_ok=True)
+    bg_path(root, bg_id).write_bytes(body)
+    others = [i for i in backgrounds(root) if i["id"] != bg_id]
+    _write_json(_bg_index_path(root), [entry] + others)
+    return entry
+
+
+def bg_update(root: Path, bg_id: str, fields: dict) -> dict:
+    """Change the words on a background without regenerating it.
+
+    Mostly the motion: what should move is a judgement made while watching the
+    loop, not while drawing the room, so it has to be editable afterwards.
+    """
+    items = _bg_raw(root)
+    entry = next((i for i in items if i.get("id") == bg_id), None)
+    if entry is None:
+        raise LibraryError("no such background")
+    for key in ("name", "scene", "motion", "style"):
+        if key in fields and fields[key] is not None:
+            entry[key] = str(fields[key]).strip()
+    _write_json(_bg_index_path(root), items)
+    return entry
+
+
+def bg_remove(root: Path, bg_id: str) -> dict:
+    items = backgrounds(root)
+    entry = next((i for i in items if i["id"] == bg_id), None)
+    if entry is None:
+        raise LibraryError("no such background")
+    bg_path(root, bg_id).unlink(missing_ok=True)
+    # Every loop of it, not just the legacy one.
+    for lp in (entry.get("loops") or []):
+        bg_clip_path(root, bg_id, lp.get("id", "")).unlink(missing_ok=True)
+    bg_clip_path(root, bg_id).unlink(missing_ok=True)
+    _write_json(_bg_index_path(root), [i for i in items if i["id"] != bg_id])
+    return entry

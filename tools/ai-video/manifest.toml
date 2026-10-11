@@ -15,9 +15,12 @@
 version = "3.12"
 
 [torch]
-# Used only off macOS. If a Windows install fails to find a matching wheel,
-# this is the line to change -- the CUDA suffix must match the driver.
-cuda_index = "https://download.pytorch.org/whl/cu126"
+# Used only off macOS, and chosen by the card (see torch_packages): CUDA 13
+# for Turing (RTX 20xx) and newer -- the only build with kernels for an RTX
+# 50xx -- and the CUDA 12.6 build for anything older, which CUDA 13 dropped.
+# Both need a driver new enough for their CUDA version.
+cuda_index = "https://download.pytorch.org/whl/cu130"
+cuda_index_legacy = "https://download.pytorch.org/whl/cu126"
 cpu_index = "https://download.pytorch.org/whl/cpu"
 
 [comfyui]
@@ -107,6 +110,14 @@ size_mb = 1895
 why = "image-to-video: anchors a still from the pool and animates outward from it"
 
 # RIFE fetches its own weights into models/frame_interpolation on first use.
+
+[[models]]
+name = "birefnet.safetensors"
+dir = "background_removal"
+url = "https://huggingface.co/Comfy-Org/BiRefNet/resolve/main/background_removal/birefnet.safetensors"
+sha256 = "9ab37426bf4de0567af6b5d21b16151357149139362e6e8992021b8ce356a154"
+size_mb = 424
+why = "cuts the character out. ComfyUI has the nodes built in (LoadBackgroundRemovalModel -> RemoveBackground) but ships no weights, and birefnet.json is the config it expects. Beats the flood-fill cut-out on anything not shot on plain paper -- fur, blades, and the translucent bases a colour test cannot judge"
 
 # -------------------------------------------------------------- extra models
 #

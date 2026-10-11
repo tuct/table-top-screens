@@ -320,6 +320,64 @@ light:
     restore_mode: ALWAYS_ON
     default_transition_length: 500ms
 
+# Battery, on the MX1.25 connector (3.7 V Li-ion, charged by an ETA6098).
+# From the schematic (PCB Rev1.2): the cell's BAT net goes through a divider
+# -- R12 200k on top, R15 100k to ground, 100 nF across -- to BAT_ADC, which
+# is GPIO20, ADC1 channel 4. So the pin sees a third of the cell: 4.2 V full
+# reads as 1.4 V.
+#
+# Voltage only. The charger's STAT line goes to a test point (TP1), not to a
+# GPIO, so the board cannot tell charging from discharging. Two consequences
+# for the percentage: it reads HIGH while charging (the charger holds the cell
+# up), and with no battery fitted the charger's output floats near 4.2 V, so
+# a board on USB alone shows about 100%.
+sensor:
+  - platform: adc
+    pin: GPIO20
+    id: battery_voltage
+    name: Battery Voltage
+    attenuation: 12db
+    update_interval: 10s
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    filters:
+      - multiply: 3.0          # undo the 200k / 100k divider
+      # The panel and the radio pull the cell down in bursts; a median over
+      # a minute keeps the percentage from twitching with them.
+      - median:
+          window_size: 6
+          send_every: 3
+          send_first_at: 1
+
+  # Percentage from voltage. A Li-ion cell is not linear: it falls fast near
+  # full, sits around 3.7-3.8 V for most of its charge, then drops off a cliff
+  # below 3.6 V -- so this interpolates a typical discharge curve rather than
+  # mapping 3.0-4.2 V straight across, which would read 50% with a fifth left.
+  # Read under load (screen on), so it errs slightly low, which is the safe way.
+  - platform: copy
+    source_id: battery_voltage
+    name: Battery
+    id: battery_level
+    unit_of_measurement: "%"
+    device_class: battery
+    accuracy_decimals: 0
+    filters:
+      - lambda: |-
+          static const float V[] = {3.30f, 3.60f, 3.69f, 3.73f, 3.77f, 3.80f,
+                                    3.84f, 3.87f, 3.95f, 4.02f, 4.11f, 4.20f};
+          static const float P[] = {0.f,   5.f,   10.f,  20.f,  30.f,  40.f,
+                                    50.f,  60.f,  70.f,  80.f,  90.f,  100.f};
+          constexpr int N = sizeof(V) / sizeof(V[0]);
+          if (x <= V[0]) return 0.0f;
+          if (x >= V[N - 1]) return 100.0f;
+          for (int i = 1; i < N; i++) {
+            if (x <= V[i])
+              return P[i - 1] + (x - V[i - 1]) * (P[i] - P[i - 1]) / (V[i] - V[i - 1]);
+          }
+          return 100.0f;
+
 # NOT configured here: the microSD slot (GPIO39-44). It is wired for 4-bit
 # SDMMC, and components/sd_spi drives cards over SPI only -- the P4's card
 # pins are not on a SPI bus at all. So this board holds content in PSRAM

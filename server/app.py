@@ -187,6 +187,21 @@ def _frames_for(screen) -> int:
     return int(item.get("frames", 1) or 1)
 
 
+# Bump when the server starts producing DIFFERENT PIXELS for the same item and
+# the same settings. A screen keeps what it downloaded on its card under the
+# version token, and holds it there for good -- so a fix to rendering reaches a
+# screen that already has the item only if the token changes with it.
+#   2: a video whose real frame count fell short of probe()'s estimate was
+#      padded with a black frame, flashing black once per loop.
+RENDER_REV = 2
+
+
+def _framing_digest(config: dict) -> str:
+    """The token's third part: the screen's framing, and the renderer's rev."""
+    blob = json.dumps({"config": config, "render": RENDER_REV}, sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:8]
+
+
 def _version_for(device: str) -> str | None:
     """A token that names exactly what `device` is showing: variant + framing.
 
@@ -206,13 +221,47 @@ def _version_for(device: str) -> str | None:
     if not entry:
         return None
     # The variant id alone would not change when its framing is edited, and
-    # the source id alone cannot tell two variants of one picture apart.
-    digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode("utf-8")).hexdigest()
-    return f"{entry['src']}.{entry['id']}.{digest[:8]}" if config else f"{entry['src']}.{entry['id']}"
+    # the source id alone cannot tell two variants of one picture apart. The
+    # digest is there even with no framing at all, because it also carries
+    # RENDER_REV.
+    return f"{entry['src']}.{entry['id']}.{_framing_digest(config or {})}"
 
 
 registry.frames_provider = _frames_for
 registry.version_provider = _version_for
+
+
+def _file_finished_job(job) -> None:
+    """Put a finished background on the shelf, with the words that made it.
+
+    Automatic rather than a "keep" button, because a background exists to be
+    reused: one that needs saving is one that gets lost. Identified by its own
+    bytes, so re-rolling the same seed does not fill the shelf with copies.
+    """
+    if job.kind == "placeloop" and job.result and job.bg_id:
+        try:
+            library.bg_add_clip(DATA_DIR, job.bg_id, job.result,
+                                {"motion": job.motion, "length": job.length,
+                                 "seed": job.seed})
+        except (library.LibraryError, OSError) as exc:
+            app.logger.warning("could not file loop for %s: %s", job.bg_id, exc)
+        return
+    if job.kind != "background" or not job.result:
+        return
+    # NOT through lib(): that maps errors onto abort(), and this runs on the
+    # job thread where there is no request to abort.
+    try:
+        entry = library.bg_add(DATA_DIR, job.result, {
+            "scene": job.prompt, "motion": job.motion, "style": job.style,
+            "size": job.size, "seed": job.seed,
+            "source": "image" if job.has_reference else "text",
+        })
+        job.bg_id = entry["id"]
+    except (library.LibraryError, OSError) as exc:
+        app.logger.warning("could not file background for %s: %s", job.id, exc)
+
+
+generate.set_on_done(_file_finished_job)
 
 # (device, source_hash, params) -> (body, content_type)
 _render_cache: OrderedDict[tuple, tuple[bytes, str]] = OrderedDict()
@@ -358,14 +407,17 @@ def parse_cache_key(key: str) -> dict:
         return {"file": None, "item_id": None, "variant": None, "fps": None,
                 "framed": False}
     parts = [p for p in m.group(2).split(".") if p]
+    # Every token now carries a digest (it holds RENDER_REV too), so "has a
+    # third part" no longer means "framed": only a digest that differs from
+    # plain framing's does. Older keys still read right -- a two-part key has
+    # none, and an old three-part one only ever existed for real framing.
+    plain = _framing_digest({})
     return {
         "file": None,
         "item_id": m.group(1),
         "variant": parts[0] if parts else None,
         "fps": int(m.group(3)) if m.group(3) else None,
-        # A framing hash rides along only when the variant has framing of its
-        # own, so two parts means "not just the plain picture".
-        "framed": len(parts) > 1,
+        "framed": len(parts) > 1 and parts[1] != plain,
     }
 
 
@@ -2215,6 +2267,215 @@ def remove_device(device: str):
 
 # ----------------------------------------------------------------- generating
 
+@app.get("/backgrounds")
+def backgrounds_list():
+    """Every place on the shelf, newest first."""
+    return jsonify({"backgrounds": lib(library.backgrounds)})
+
+
+@app.get("/backgrounds/<bg_id>/image")
+def background_image(bg_id: str):
+    body = lib(library.bg_body, bg_id)
+    return Response(body, mimetype="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/backgrounds/<bg_id>/clip")
+@app.get("/backgrounds/<bg_id>/clip/<loop_id>")
+def background_clip(bg_id: str, loop_id: str = ""):
+    """One loop of a place. No id means the newest."""
+    body = lib(library.bg_clip, bg_id, loop_id)
+    return Response(body, mimetype="video/mp4",
+                    headers={"Cache-Control": "no-cache"})
+
+
+@app.post("/backgrounds/<bg_id>/clip/<loop_id>/delete")
+@app.delete("/backgrounds/<bg_id>/clip/<loop_id>")
+def background_clip_delete(bg_id: str, loop_id: str):
+    lib(library.bg_remove_clip, bg_id, loop_id)
+    if from_browser_form():
+        return Response(status=303, headers={"Location": redirect_target("/generate")})
+    return ("", 204)
+
+
+@app.post("/backgrounds/import")
+def background_import():
+    """Bring in a place that was not generated here.
+
+    A still or a loop: a photograph, a render, something downloaded. The same
+    shelf, the same animate and refine, so an imported room is not a
+    second-class citizen.
+
+    A still is squared off to a multiple of 16 first. Wan samples in blocks of
+    that, and a 500 pixel picture would come back 496 or 512 -- which breaks
+    the one promise animating makes, that the picture is not rescaled.
+    """
+    up = request.files.get("file")
+    if up is None or not up.filename:
+        abort(400, "choose a picture or a video to import")
+    body = up.read()
+    if not body:
+        abort(400, "that file is empty")
+
+    name = (request.form.get("name") or "").strip()
+    motion = (request.form.get("motion") or "").strip()
+
+    if video.looks_like_video(body, up.filename):
+        # A loop needs a still to hang off, and its own first frame is the
+        # honest one: it is literally what the loop starts from.
+        frame = video.first_frame(body)
+        buf = io.BytesIO()
+        frame.convert("RGB").save(buf, format="PNG")
+        entry = lib(library.bg_add, buf.getvalue(),
+                    {"name": name, "scene": "", "motion": motion,
+                     "style": "own", "source": "import"})
+        lib(library.bg_add_clip, entry["id"], body, {"motion": motion})
+    else:
+        try:
+            im = Image.open(io.BytesIO(body)).convert("RGB")
+        except Exception:
+            abort(400, "that does not look like a picture or a video")
+        w, h = (max(16, im.width - im.width % 16), max(16, im.height - im.height % 16))
+        if (w, h) != im.size:
+            im = im.crop(((im.width - w) // 2, (im.height - h) // 2,
+                          (im.width - w) // 2 + w, (im.height - h) // 2 + h))
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        entry = lib(library.bg_add, buf.getvalue(),
+                    {"name": name, "scene": "", "motion": motion,
+                     "style": "own", "source": "import"})
+
+    if from_browser_form():
+        return Response(status=303, headers={"Location": redirect_target("/generate")})
+    return jsonify(entry), 201
+
+
+@app.post("/backgrounds/<bg_id>/animate")
+def background_animate(bg_id: str):
+    """Set a place moving, with nobody in it.
+
+    The motion words stored with the place are the default, because that is
+    what they were written for -- but they can be overridden here, since what
+    should move is a judgement made watching the loop, not when the room was
+    drawn.
+    """
+    entry = lib(library.bg_get, bg_id)
+    if entry is None:
+        abort(404, "no such background")
+    form = request.form if request.form else (request.get_json(silent=True) or {})
+    motion = (form.get("motion") or entry.get("motion") or "").strip()
+    if not motion:
+        abort(400, "say what should move in it")
+    length = form.get("length") or generate.DEFAULT_WAN_LENGTH
+    if length not in generate.WAN_LENGTHS:
+        abort(400, f"length must be one of {', '.join(generate.WAN_LENGTHS)}")
+    try:
+        seed = int(form.get("seed") or 0) or random.randrange(2**31)
+    except ValueError:
+        abort(400, "seed must be a number")
+
+    try:
+        # Uploaded every time rather than cached: ComfyUI renames on
+        # collision, so the name it gives back is the only reliable handle.
+        name = generate.upload_reference(lib(library.bg_body, bg_id), f"{bg_id}.png")
+        job = generate.submit("placeloop", "", name, entry.get("size", "portrait"),
+                              seed, motion=motion, bg_id=bg_id, clip_length=length)
+    except generate.NoComfyUI as exc:
+        abort(503, str(exc))
+    except ValueError as exc:
+        abort(400, str(exc))
+
+    # Remember what was asked for, so the card shows the words that made it.
+    lib(library.bg_update, bg_id, {"motion": motion})
+    if from_browser_form():
+        return Response(status=303, headers={"Location": redirect_target("/generate")})
+    return jsonify(job.public()), 202
+
+
+@app.post("/backgrounds/<bg_id>")
+def background_edit(bg_id: str):
+    """Rename a place, or change what moves in it.
+
+    Editable after the fact because what should move is decided while watching
+    the loop, not while drawing the room -- and re-rolling the picture just to
+    change those words would throw away the place you liked.
+    """
+    form = request.form if request.form else (request.get_json(silent=True) or {})
+    entry = lib(library.bg_update, bg_id,
+                {k: form.get(k) for k in ("name", "motion", "scene", "style")})
+    if from_browser_form():
+        return Response(status=303, headers={"Location": redirect_target("/generate")})
+    return jsonify(entry)
+
+
+@app.delete("/backgrounds/<bg_id>")
+@app.post("/backgrounds/<bg_id>/delete")
+def background_delete(bg_id: str):
+    lib(library.bg_remove, bg_id)
+    if from_browser_form():
+        return Response(status=303, headers={"Location": redirect_target("/generate")})
+    return ("", 204)
+
+
+def _float_arg(name: str, default: float, lo: float, hi: float) -> float:
+    try:
+        return max(lo, min(hi, float(request.form.get(name, default))))
+    except (TypeError, ValueError):
+        abort(400, f"{name} must be a number between {lo} and {hi}")
+
+
+@app.post("/compose")
+def compose():
+    """Stand a character in a background. No model, no waiting.
+
+    This is the join between the two halves, and it is deliberately not a
+    generation step: the picture already exists and the figure is already cut
+    out, so the answer is a paste. Inpainting him in is what produced the halo
+    -- a ring of invented pixels along his outline -- and nothing tuned it
+    away, because the ring was the method rather than a setting.
+    """
+    bg_id = request.form.get("bg_id") or ""
+    if not bg_id:
+        abort(400, "pick a background")
+    bg = lib(library.bg_body, bg_id)
+
+    char = None
+    if (up := request.files.get("character")) is not None and up.filename:
+        char = up.read()
+    elif item_id := request.form.get("pool_id"):
+        char = lib(library.body_of, item_id)
+    if not char:
+        abort(400, "pick a character, by upload or from the pool")
+
+    try:
+        out = generate.compose_scene(
+            bg, char,
+            fill=_float_arg("fill", 0.82, 0.3, 1.0),
+            separation=_float_arg("separation", 0.55, 0.0, 1.0),
+            shadow=_float_arg("shadow", 0.55, 0.0, 1.0),
+            offset=_float_arg("offset", 0.0, -0.4, 0.4),
+            baseline=_float_arg("baseline", 0.95, 0.4, 1.1),
+            trim=_float_arg("trim", 0.0, 0.0, 0.5),
+            white=int(_float_arg("white", 0, 0, 254)),
+            # Off by default now: the model keeps an opaque base and that
+            # reads perfectly well as a figure standing on something.
+            drop_base=str(request.form.get("drop_base", "0")).strip().lower()
+            in ("1", "true", "yes", "on"),
+            ai_cutout=str(request.form.get("ai_cutout", "1")).strip().lower()
+            in ("1", "true", "yes", "on"))
+    except Exception as exc:  # noqa: BLE001 - a bad picture is a 400, not a 500
+        abort(400, f"could not compose: {exc}")
+
+    # Kept only when asked. Every nudge of a slider makes one of these, and the
+    # pool is what the screens show -- filling it with experiments would bury
+    # the pictures that matter.
+    if str(request.form.get("keep", "")).strip().lower() in ("1", "true", "yes", "on"):
+        item = lib(library.pool_add, out, "image/png", f"{bg_id}-scene.png")
+        return jsonify({"kept": item["id"]})
+    return Response(out, mimetype="image/png",
+                    headers={"Cache-Control": "no-store"})
+
+
 @app.get("/generate")
 def generate_page():
     """The make-a-clip page. Works with ComfyUI down; it just says so."""
@@ -2227,6 +2488,17 @@ def generate_page():
         auto_size=generate.AUTO_SIZE,
         keeps=list(generate.KEEP),
         default_keep=generate.DEFAULT_KEEP,
+        prompt_examples=generate.PROMPT_EXAMPLES,
+        styles=generate.STYLES,
+        default_style=generate.DEFAULT_STYLE,
+        refine_levels=generate.REFINE_LEVELS,
+        wan_lengths=list(generate.WAN_LENGTHS),
+        default_wan_length=generate.DEFAULT_WAN_LENGTH,
+        default_refine=generate.DEFAULT_REFINE,
+        scene_examples=generate.SCENE_EXAMPLES,
+        motion_examples=generate.MOTION_EXAMPLES,
+        default_motion=generate.DEFAULT_MOTION,
+        backgrounds=lib(library.backgrounds),
         lengths=list(generate.LENGTHS),
         default_length=generate.DEFAULT_LENGTH,
         active=generate.queue_view(),
@@ -2251,17 +2523,44 @@ def _dimensions(body: bytes) -> tuple[int, int]:
 def generate_run():
     """Start a verify or a clip. Returns at once with a job to poll."""
     kind = request.form.get("kind", "verify")
-    if kind not in ("verify", "clip"):
-        abort(400, "kind must be verify or clip")
+    if kind not in ("verify", "clip", "background", "placeloop"):
+        abort(400, "kind must be verify, clip, background or placeloop")
+    style = request.form.get("style") or generate.DEFAULT_STYLE
+    if style not in generate.STYLES:
+        abort(400, f"style must be one of {', '.join(generate.STYLES)}")
+    # What should move, kept with the place and spent when a clip is made from
+    # it. Never part of the background's own prompt: a still cannot show
+    # motion, and asking for it only muddies the room.
+    motion = (request.form.get("motion") or "").strip()
+    refine = request.form.get("refine") or generate.DEFAULT_REFINE
+    if refine not in generate.REFINE_LEVELS:
+        abort(400, f"refine must be one of {', '.join(generate.REFINE_LEVELS)}")
+    # Refining says what is DIFFERENT; the scene it started from stays as the
+    # context. Appending rather than replacing is the whole point -- a refine
+    # that only carried the change would lose the place it was changing.
+    change = (request.form.get("change") or "").strip()
     prompt = (request.form.get("prompt") or "").strip()
     size = request.form.get("size") or generate.DEFAULT_SIZE
     keep = request.form.get("keep") or generate.DEFAULT_KEEP
     if keep not in generate.KEEP:
         abort(400, f"keep must be one of {', '.join(generate.KEEP)}")
+    # Miniatures come on a moulded disc, which on a screen reads as "a model on
+    # a table" rather than a figure in a place. Default on, but only ever acts
+    # when the shape is clearly a base -- see _baseplate_top.
+    drop_base = str(request.form.get("drop_base", "1")).strip().lower() in (
+        "1", "true", "yes", "on")
     try:
         seed = int(request.form.get("seed") or 0) or random.randrange(2**31)
     except ValueError:
         abort(400, "seed must be a number")
+
+    # Refining: the description behind the picture is the context, and the
+    # change is what is new. base_scene wins over the visible box so that
+    # whatever is typed there is never silently folded in -- the box belongs to
+    # the next fresh scene, not to this refinement.
+    if change:
+        context = (request.form.get("base_scene") or "").strip() or prompt
+        prompt = f"{context}, {change}" if context else change
 
     # A reference comes either as an upload or as something already in the
     # pool, so a picture that is already on a screen can be animated without
@@ -2269,9 +2568,14 @@ def generate_run():
     reference = None
     adopted = ""
     ref_size = (0, 0)
+    # Kept so the "subject" level can cut the figure out below. The upload is
+    # one-shot, so without this the bytes are gone by the time we know we want
+    # them.
+    ref_bytes: bytes | None = None
     try:
         if (up := request.files.get("reference")) is not None and up.filename:
             data = up.read()
+            ref_bytes = data
             ref_size = _dimensions(data)
             reference = generate.upload_reference(data, up.filename)
         elif from_job := request.form.get("from_job"):
@@ -2284,8 +2588,18 @@ def generate_run():
             if not src.content_type.startswith("image/"):
                 abort(400, "only a still can be adopted as a reference")
             ref_size = _dimensions(src.result)
+            ref_bytes = src.result
             reference = generate.upload_reference(src.result, f"{from_job}.png")
             adopted = from_job
+        elif bg_ref := request.form.get("bg_id"):
+            # Refining a place: the background already on the shelf becomes the
+            # starting point for the next one, so a scene can be nudged instead
+            # of re-rolled from nothing. Taken from the shelf rather than from
+            # a job, because jobs are forgotten and a place is not.
+            body = library.bg_body(DATA_DIR, bg_ref)
+            ref_size = _dimensions(body)
+            ref_bytes = body
+            reference = generate.upload_reference(body, f"{bg_ref}.png")
         elif item_id := request.form.get("pool_id"):
             body = lib(library.body_of, item_id)
             if body:
@@ -2300,7 +2614,8 @@ def generate_run():
                 ref_size = src.size
                 buf = io.BytesIO()
                 src.convert("RGB").save(buf, format="PNG")
-                reference = generate.upload_reference(buf.getvalue(), f"{item_id}.png")
+                ref_bytes = buf.getvalue()
+                reference = generate.upload_reference(ref_bytes, f"{item_id}.png")
     except generate.NoComfyUI as exc:
         abort(503, str(exc))
 
@@ -2309,7 +2624,16 @@ def generate_run():
     # picture into a square throws its sides away before the model sees it,
     # and the result then looks like the reference was ignored.
     if size == generate.AUTO_SIZE:
-        size = (generate.shape_for(*ref_size) if any(ref_size)
+        shape_from = ref_size
+        if ref_bytes and generate.KEEP[keep].get("inpaint"):
+            # Measure HIM, not the photograph. A miniature is shot square
+            # whatever its pose, so the photo's proportions say nothing about
+            # whether the figure wants a portrait or a square frame.
+            try:
+                shape_from = generate.subject_shape(ref_bytes, drop_base)
+            except Exception as exc:  # noqa: BLE001 - fall back to the photo
+                app.logger.warning("subject_shape failed: %s", exc)
+        size = (generate.shape_for(*shape_from) if any(shape_from)
                 else generate.DEFAULT_SIZE)
     elif size not in generate.SIZES:
         abort(400, f"size must be {generate.AUTO_SIZE} or one of "
@@ -2325,9 +2649,32 @@ def generate_run():
     pingpong = str(request.form.get("pingpong", "")).strip().lower() in (
         "1", "true", "yes", "on")
 
+    # "subject" cuts the figure out and rebuilds only what is around him, so it
+    # needs a second upload: the composited canvas, and the mask saying what to
+    # regenerate. Done here rather than in submit() because this is where the
+    # original bytes still exist. Only stills inpaint -- a clip animates
+    # whatever still it was given.
+    mask = None
+    if kind == "verify" and ref_bytes and generate.KEEP[keep].get("inpaint"):
+        try:
+            cw, ch = generate.SIZES.get(size, generate.SIZES[generate.DEFAULT_SIZE])
+            canvas_png, mask_png = generate.isolate_subject(
+                ref_bytes, cw, ch, drop_base=drop_base)
+            reference = generate.upload_reference(canvas_png, "subject_canvas.png")
+            mask = generate.upload_reference(mask_png, "subject_mask.png")
+        except generate.NoComfyUI as exc:
+            abort(503, str(exc))
+        except Exception as exc:  # noqa: BLE001 - a bad picture must not 500
+            app.logger.warning("subject isolation failed: %s", exc)
+            mask = None
+
     try:
+        # The optional half by keyword. Twelve positional arguments is a
+        # signature nobody can read, and adding one silently shifts every
+        # caller and stand-in that mirrors it.
         job = generate.submit(kind, prompt, reference, size, seed, length,
-                              adopted, keep, pingpong)
+                              adopted, keep, pingpong=pingpong, mask=mask,
+                              style=style, motion=motion, refine=refine)
     except ValueError as exc:
         abort(400, str(exc))
     # Without JavaScript the page still works: it redirects back, and the job

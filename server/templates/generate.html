@@ -45,9 +45,315 @@
   </section>
 {% else %}
 
+{# A place, made and kept on its own, so the same tavern can take a different
+   character tomorrow and the same character can walk into a different tavern.
+   Plain form, no JavaScript: it posts, redirects back, and the job shows up in
+   the queue below like any other. #}
 <div class="cols gen">
+<section class="card pad" id="bgmaker">
+  <div class="eyebrow">Make a background</div>
+  <form id="bgform" method="post" action="/generate/run" enctype="multipart/form-data">
+    <input type="hidden" name="kind" value="background">
+    {# Set by "Refine" on a result or a shelf card. The scene and style text
+       stays as it is, so a place is nudged rather than described again. #}
+    <input type="hidden" name="bg_id" id="bgrefine" value="">
+    {# Carried, not shown in an editable box: the description that made the
+       picture is context, and typing over it is how you lose the version you
+       liked. #}
+    <input type="hidden" name="base_scene" id="bgbase" value="">
+    <div id="bgrefnote" hidden>
+      <div class="field">
+        <label for="bgchange">What to change</label>
+        <textarea id="bgchange" name="change" rows="2" class="desc-input"
+                  placeholder="more torches on the walls, a puddle on the floor"></textarea>
+        <p class="note">Starting from the picture below, described as
+          &ldquo;<span id="bgbasetext" class="mono"></span>&rdquo;. That stays
+          as it is — this only says what should be different.
+          <button type="button" class="icon" id="bgrefclear">start fresh instead</button>
+        </p>
+      </div>
+      <div class="field">
+        <label for="bgrefinelvl">How far it may travel</label>
+        <select id="bgrefinelvl" name="refine">
+          {% for key, lv in refine_levels.items() %}
+            <option value="{{ key }}"{{ ' selected' if key == default_refine }}>{{ lv.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="bgscene">The place
+        <span class="sub">— a place, with nobody in it</span></label>
+      <textarea id="bgscene" name="prompt" rows="2" class="desc-input"
+                placeholder="a torchlit dungeon corridor, damp stone walls, braziers, scattered rubble"></textarea>
+      <div class="examples">
+        <span class="sub">Start from:</span>
+        {% for ex in scene_examples %}
+          <button type="button" class="chip" data-prompt="{{ ex.text }}"
+                  data-target="bgscene" title="{{ ex.text }}">{{ ex.label }}</button>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="pair">
+      <div class="field narrow">
+        <label for="bgstyle">Style</label>
+        <select id="bgstyle" name="style">
+          {% for key, st in styles.items() %}
+            <option value="{{ key }}"{{ ' selected' if key == default_style }}>{{ st.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field narrow">
+        <label for="bgsize">Shape</label>
+        <select id="bgsize" name="size">
+          {% for s in sizes %}
+            <option value="{{ s }}"{{ ' selected' if s == default_size }}>{{ s }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field narrow">
+        <label for="bgseed">Seed <span class="sub">— 0 is random</span></label>
+        <input type="number" id="bgseed" name="seed" value="0" min="0" class="mono">
+      </div>
+    </div>
+
+    <div class="field">
+      <label>From a picture <span class="sub">— optional, restyles it</span></label>
+      <label class="drop">
+        <input type="file" name="reference" accept="image/*" hidden>
+        <span>Choose a room or sketch, or leave empty to invent one</span>
+      </label>
+    </div>
+
+    <div class="field">
+      <label for="bgmotion">What moves in it
+        <span class="sub">— saved with the place, used when a clip is made</span></label>
+      <textarea id="bgmotion" name="motion" rows="2"
+                class="desc-input">{{ default_motion }}</textarea>
+      <div class="examples">
+        <span class="sub">Start from:</span>
+        {% for ex in motion_examples %}
+          <button type="button" class="chip" data-prompt="{{ ex.text }}"
+                  data-target="bgmotion" title="{{ ex.text }}">{{ ex.label }}</button>
+        {% endfor %}
+      </div>
+      <p class="note">Small things only. A background that pans or changes is a
+        video; a screen showing it for an hour wants a place that is alive, not
+        one that is going somewhere.</p>
+    </div>
+
+    <div class="row-actions">
+      <button type="submit" class="primary">Make the place</button>
+    </div>
+    <p class="note">Animating uses the words above and renders the place
+      <b>with nobody in it</b>. A character is pasted on afterwards, which is
+      the only way he stays still — an image-to-video model handed a figure
+      will animate the figure, and no prompt talks it out of that.</p>
+  </form>
+</section>
+
   <section class="card pad">
-    <div class="eyebrow">What to make</div>
+    <div class="eyebrow">Result</div>
+    <div id="result" class="result">
+      <p class="note" id="resultempty">Nothing yet. Verify and it appears here.</p>
+      <div id="resultbox" hidden>
+        <div class="bezel wide"><div class="glass">
+          <img id="resultimg" alt="Generated still" hidden>
+          <video id="resultvid" controls loop muted playsinline hidden></video>
+        </div></div>
+        <div class="nameline"><span class="mono sub" id="resultmeta"></span></div>
+        <div class="row-actions">
+          <button type="button" class="primary" id="adopt" hidden>
+            Adopt as reference
+          </button>
+          {# The same move as Adopt, for places: the picture just made becomes
+             the starting point for the next one. #}
+          <button type="button" class="primary" id="refinebgbtn" hidden>
+            Refine this place
+          </button>
+          <form method="post" id="keepform" class="inline">
+            <select name="device" id="keepdevice" class="mono">
+              <option value="">Add to pool only</option>
+              {% for d in devices %}<option value="{{ d }}">…and show on {{ d }}</option>{% endfor %}
+            </select>
+            <button type="submit" class="secondary">Keep it</button>
+          </form>
+        </div>
+      </div>
+      <div id="working" hidden>
+        <div class="bar"><div class="fill" id="workfill" style="width:0%"></div></div>
+        <p class="note mono" id="workline">starting…</p>
+      </div>
+      <p class="warnline" id="failed" hidden></p>
+    </div>
+  </section>
+</div>
+
+<section class="card pad">
+  <div class="bgtop">
+    <div class="eyebrow" id="shelfhead"{{ '' if backgrounds else ' hidden' }}>Places you have</div>
+    {# Hidden for now, at your request. The route behind it works and is
+       tested; this is only the control. #}
+    <form method="post" action="/backgrounds/import" enctype="multipart/form-data"
+          class="inline importform" hidden>
+      <label class="drop compact">
+        <input type="file" name="file" accept="image/*,video/*" hidden
+               onchange="this.form.submit()">
+        <span>import a picture or a loop</span>
+      </label>
+    </form>
+  </div>
+  <div class="shelf" id="shelf">
+  {% if backgrounds %}
+      {% for bg in backgrounds %}
+        <figure class="bgcard" data-bg="{{ bg.id }}">
+          {# The still stays the face of the place. Its loops are versions OF
+             it and sit below, so a room with four attempts still reads as one
+             room rather than four. #}
+          <img src="/backgrounds/{{ bg.id }}/image" alt="{{ bg.scene }}" loading="lazy"
+               class="zoom" data-full="/backgrounds/{{ bg.id }}/image" data-kind="image">
+          <figcaption>
+            <form method="post" action="/backgrounds/{{ bg.id }}" class="bgedit">
+              <input type="text" name="name" value="{{ bg.name }}"
+                     placeholder="name it" class="mono">
+              <input type="text" name="motion" value="{{ bg.motion }}"
+                     placeholder="what moves" title="{{ bg.motion }}">
+              <button type="submit" class="icon" title="Save these words">save</button>
+            </form>
+            {% if bg.loops %}
+              <div class="loops">
+                {% for lp in bg.loops %}
+                  <div class="loop" title="{{ lp.motion }}">
+                    <video src="/backgrounds/{{ bg.id }}/clip{{ '/' ~ lp.id if lp.id }}"
+                           autoplay loop muted playsinline class="zoom"
+                           data-full="/backgrounds/{{ bg.id }}/clip{{ '/' ~ lp.id if lp.id }}"
+                           data-kind="video"></video>
+                    <form method="post" class="inline"
+                          action="/backgrounds/{{ bg.id }}/clip/{{ lp.id }}/delete">
+                      <button type="submit" class="icon danger" title="Delete this loop">x</button>
+                    </form>
+                  </div>
+                {% endfor %}
+              </div>
+            {% endif %}
+            <div class="bgrow">
+              <span class="sub">{{ styles.get(bg.style, {}).get('label', bg.style) }}</span>
+              <button type="button" class="icon refinebg"
+                      data-bg="{{ bg.id }}" data-scene="{{ bg.scene }}"
+                      data-style="{{ bg.style }}" data-motion="{{ bg.motion }}"
+                      title="Start the next one from this place">refine</button>
+              <select class="looplen mono" title="How long the loop runs">
+                {% for l in wan_lengths %}
+                  <option value="{{ l }}"{{ ' selected' if l == default_wan_length }}>{{ l }}</option>
+                {% endfor %}
+              </select>
+              <button type="button" class="icon animatebg" data-bg="{{ bg.id }}"
+                      title="Set it moving, using the words above">animate</button>
+            </div>
+            <form method="post" action="/backgrounds/{{ bg.id }}/delete" class="inline">
+              <button type="submit" class="icon danger" title="Delete this place">×</button>
+            </form>
+          </figcaption>
+        </figure>
+      {% endfor %}
+  {% endif %}
+  </div>
+</section>
+
+{# The join: a cut-out character standing in a place that already exists.
+   No model runs here, so it answers while you are still moving the slider. #}
+<section class="card pad" id="placer">
+  <div id="placerfold" hidden>
+  <form id="placeform">
+    <div class="pair">
+      <div class="field">
+        <label for="placebg">The place</label>
+        <select id="placebg" name="bg_id">
+          {% for bg in backgrounds %}
+            <option value="{{ bg.id }}">{{ bg.name or bg.scene[:48] or bg.id[:8] }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="placechar">The character</label>
+        <select id="placechar" name="pool_id">
+          {% for it in pool %}
+            <option value="{{ it.id }}">{{ it.name or it.filename or it.id[:8] }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+
+    <div class="pair">
+      <div class="field narrow">
+        <label for="placefill">Scale <span class="sub" id="fillval">82%</span></label>
+        <input type="range" id="placefill" name="fill" min="0.4" max="1" step="0.02" value="0.82">
+      </div>
+      <div class="field narrow">
+        <label for="placesep">Push back <span class="sub" id="sepval">55%</span></label>
+        <input type="range" id="placesep" name="separation" min="0" max="1" step="0.05" value="0.55">
+      </div>
+      <div class="field narrow">
+        <label for="placeshadow">Shadow <span class="sub" id="shadowval">55%</span></label>
+        <input type="range" id="placeshadow" name="shadow" min="0" max="1" step="0.05" value="0.55">
+      </div>
+      <div class="field narrow">
+        <label for="placeoffset">Across <span class="sub" id="offsetval">0</span></label>
+        <input type="range" id="placeoffset" name="offset" min="-0.4" max="0.4" step="0.02" value="0">
+      </div>
+      <div class="field narrow">
+        <label for="placebaseline">Up / down <span class="sub" id="baselineval">95%</span></label>
+        <input type="range" id="placebaseline" name="baseline" min="0.4" max="1.1" step="0.01" value="0.95">
+      </div>
+    </div>
+
+    <div class="pair">
+      <div class="field narrow">
+        <label for="placetrim">Trim his feet <span class="sub" id="trimval">0%</span></label>
+        <input type="range" id="placetrim" name="trim" min="0" max="0.5" step="0.01" value="0">
+      </div>
+      <div class="field narrow">
+        <label for="placewhite">Cut-out <span class="sub" id="whiteval">auto</span></label>
+        <input type="range" id="placewhite" name="white" min="0" max="254" step="2" value="0">
+      </div>
+    </div>
+    <p class="note"><b>Trim his feet</b> cuts upward from the bottom, for when
+      the baseplate defeats the automatic detection — a clear plastic base is
+      neither backdrop nor figure, so there has to be a way to simply say where
+      he ends. <b>Cut-out</b> is how bright a pixel must be to count as
+      backdrop: leave it on auto for a product shot on white paper, lower it
+      for a grey card or warm light, raise it if pale armour is being eaten.</p>
+
+    <label class="checkrow">
+      <input type="checkbox" id="placebase" name="drop_base" value="1">
+      <span>Remove the baseplate</span>
+    </label>
+    <p class="note"><b>Push back</b> dims, softens and vignettes the place
+      behind him. It is the control the model would not give us from a prompt:
+      a figure is read as a silhouette first, and on a 240&ndash;480 pixel
+      panel an equally bright backdrop competes with him for the same eye.</p>
+
+    <div class="row-actions">
+      <button type="submit" class="primary">Place him</button>
+      <button type="button" class="primary" id="placekeep">Keep it</button>
+      <span class="sub" id="placemsg"></span>
+    </div>
+  </form>
+  <div class="bezel wide" id="placebezel" hidden><div class="glass">
+    <img id="placeimg" alt="The character in the place">
+  </div></div>
+  </div>
+</section>
+
+<div class="cols gen">
+  {# Hidden, not deleted. The flow is now place -> loop -> character, and this
+     older one-shot form only clutters it -- but generate.js looks up #genform
+     on load and gives up entirely if it is absent, which would take every
+     other control on this page down with it. Hidden keeps it in the DOM. #}
+  <section class="card pad">
+    <div id="oldmaker" hidden>
 
     <form id="genform" method="post" action="/generate/run" enctype="multipart/form-data">
       {# Set when a verify result is adopted; cleared by picking any other
@@ -58,6 +364,21 @@
         <label for="prompt">Description</label>
         <textarea id="prompt" name="prompt" rows="3" class="desc-input"
                   placeholder="a torchlit tavern at night, firelight flickering"></textarea>
+        {# Real text, not placeholder grey: a placeholder cannot be edited,
+           and these are the two prompts that actually produced good output on
+           an RTX 4070 Ti, so they are worth having as a starting point rather
+           than as a hint that vanishes the moment you type. #}
+        <div class="examples">
+          <span class="sub">Start from:</span>
+          {% for ex in prompt_examples %}
+            <button type="button" class="chip" data-prompt="{{ ex.text }}"
+                    title="{{ ex.text }}">{{ ex.label }}</button>
+          {% endfor %}
+        </div>
+        <p class="note">For a <b>clip</b>, describe what MOVES, not the scene —
+          the picture already says what things look like. "flickering
+          torchlight, drifting smoke, eyes blink" animates; "a dungeon" just
+          describes what is already there.</p>
       </div>
 
       <div class="field">
@@ -74,9 +395,20 @@
         </div>
         <p class="note" id="refnote" hidden>Adopted from a verify. Edit the words
           and run verify again to keep refining.</p>
-        <p class="note" id="keepnote" hidden><b>close</b> holds the reference
-          tightly — same subject, restyled. <b>loose</b> treats it as a starting
-          point and will happily change who or what is in it.</p>
+        <label class="checkrow" id="basefield">
+          <input type="checkbox" id="drop_base" name="drop_base" value="1" checked>
+          <span>Remove the baseplate</span>
+        </label>
+        <p class="note" id="basenote">Miniatures are sold and photographed on a
+          moulded disc. Dropped, the figure stands on the generated floor
+          instead of on a model base — and the frame is then chosen to suit
+          <em>him</em> rather than the photo. Only acts when the shape really
+          is a base, so a picture without one is untouched.</p>
+        <p class="note" id="keepnote" hidden><b>subject</b> keeps him exactly —
+          his pixels are composited back, not re-generated — and builds the
+          scene only around him. <b>close</b> holds the reference tightly but
+          gives the words little say; <b>loose</b> will happily change who is
+          in it.</p>
       </div>
 
       {% if pool %}
@@ -151,38 +483,9 @@
         each turn costs about ten seconds. Animate once the still is the one you
         wanted; that is the part that costs minutes.</p>
     </form>
-  </section>
-
-  <section class="card pad">
-    <div class="eyebrow">Result</div>
-    <div id="result" class="result">
-      <p class="note" id="resultempty">Nothing yet. Verify and it appears here.</p>
-      <div id="resultbox" hidden>
-        <div class="bezel wide"><div class="glass">
-          <img id="resultimg" alt="Generated still" hidden>
-          <video id="resultvid" controls loop muted playsinline hidden></video>
-        </div></div>
-        <div class="nameline"><span class="mono sub" id="resultmeta"></span></div>
-        <div class="row-actions">
-          <button type="button" class="primary" id="adopt" hidden>
-            Adopt as reference
-          </button>
-          <form method="post" id="keepform" class="inline">
-            <select name="device" id="keepdevice" class="mono">
-              <option value="">Add to pool only</option>
-              {% for d in devices %}<option value="{{ d }}">…and show on {{ d }}</option>{% endfor %}
-            </select>
-            <button type="submit" class="secondary">Keep it</button>
-          </form>
-        </div>
-      </div>
-      <div id="working" hidden>
-        <div class="bar"><div class="fill" id="workfill" style="width:0%"></div></div>
-        <p class="note mono" id="workline">starting…</p>
-      </div>
-      <p class="warnline" id="failed" hidden></p>
     </div>
   </section>
+
 </div>
 
 <section class="card pad">
@@ -246,5 +549,13 @@
   </section>
 </div>
 {% endif %}
+
+{# Popup for a closer look. One element reused for every picture and loop,
+   rather than one per card: a shelf of twenty places would otherwise carry
+   twenty hidden overlays and twenty video elements the browser keeps warm. #}
+<div id="lightbox" hidden>
+  <button type="button" id="lightclose" title="Close">close</button>
+  <div id="lightinner"></div>
+</div>
 
 <script src="{{ url_for('static', filename='generate.js') }}"></script>

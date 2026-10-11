@@ -220,16 +220,25 @@ def iter_frames(body: bytes | None, indices: list[int], w: int, h: int):
         info = video.probe(body)
         fps = (len(indices) * 1000.0) / max(1, sum(durations(body))) if indices else info["fps"]
         n = 0
+        last = None
         for img in video.iter_video_frames(body, fps or info["fps"], w, h,
                                            limit=len(wanted), info=info):
             yield wanted[n], img
+            last = img
             n += 1
             if n >= len(wanted):
                 break
         # A container that ends early still has to fill the sequence, or the
-        # caller is left with a hole it cannot render.
+        # caller is left with a hole it cannot render. And it routinely does:
+        # probe() ESTIMATES the frame count from duration x rate, which is a
+        # frame or so over for most real files (4.1 s at 24 fps says 98; the
+        # file held 97). Filled with black, that shortfall was one black frame
+        # at the very end of the cycle -- a flash on every loop. The last real
+        # frame held a moment longer is invisible; black is kept only for a
+        # file that decoded nothing at all.
         while n < len(wanted):
-            yield wanted[n], Image.new("RGB", (w, h), (0, 0, 0))
+            yield wanted[n], (last.copy() if last is not None
+                              else Image.new("RGB", (w, h), (0, 0, 0)))
             n += 1
         return
     if body is not None and is_animated(body):

@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 os.environ["SCREENS_DISCOVERY"] = "0"
 
@@ -130,14 +130,17 @@ def main() -> int:  # noqa: PLR0915
     generate.upload_reference = fake_upload
     generate.submit = lambda kind, prompt, reference, size, seed, \
         length=generate.DEFAULT_LENGTH, adopted_from="", \
-        keep=generate.DEFAULT_KEEP, pingpong=False: generate.Job(
+        keep=generate.DEFAULT_KEEP, **kw: generate.Job(
             id="t", kind=kind, prompt=prompt, size=size, seed=seed,
             has_reference=bool(reference), length=length,
             adopted_from=adopted_from, keep=keep)
     try:
         c = srv.app.test_client()
+        # keep=close: this checks that the POOL picture is what gets uploaded,
+        # and the default "subject" level uploads a composited canvas and a
+        # mask built from it instead.
         r = c.post("/generate/run", data={"kind": "verify", "prompt": "x",
-                                          "pool_id": item["id"]},
+                                          "pool_id": item["id"], "keep": "close"},
                    content_type="multipart/form-data")
         check("the run is accepted", r.status_code == 202, str(r.status_code))
         check("something was uploaded as the reference", "body" in sent)
@@ -252,14 +255,18 @@ def main() -> int:  # noqa: PLR0915
     real_submit2 = generate.submit
     generate.submit = lambda kind, prompt, reference, size, seed, \
         length=generate.DEFAULT_LENGTH, adopted_from="", \
-        keep=generate.DEFAULT_KEEP, pingpong=False: generate.Job(
+        keep=generate.DEFAULT_KEEP, **kw: generate.Job(
             id="t2", kind=kind, prompt=prompt, size=size, seed=seed,
             has_reference=bool(reference), length=length,
             adopted_from=adopted_from, keep=keep)
     try:
         c = srv.app.test_client()
+        # keep=close on purpose: this is about the adopt plumbing, and the
+        # default "subject" level uploads a composited canvas and a mask
+        # instead of the still itself, which would make the next check assert
+        # the wrong thing.
         r = c.post("/generate/run", data={"kind": "verify", "prompt": "refined",
-                                          "from_job": "done1"},
+                                          "from_job": "done1", "keep": "close"},
                    content_type="multipart/form-data")
         check("a finished still can be adopted", r.status_code == 202, str(r.status_code))
         check("and it is that still that gets uploaded",
@@ -296,8 +303,15 @@ def main() -> int:  # noqa: PLR0915
     check("close denoises less, so more of the picture survives",
           close["sampler"]["inputs"]["denoise"] < loose["sampler"]["inputs"]["denoise"],
           f'{close["sampler"]["inputs"]["denoise"]} < {loose["sampler"]["inputs"]["denoise"]}')
+    # Stated as the intent rather than the name: the default must hold the
+    # subject, whether it does that by denoising least or by masking him out
+    # of the sampling altogether.
+    default = generate.KEEP[generate.DEFAULT_KEEP]
     check("the default is the one that keeps the subject",
-          generate.DEFAULT_KEEP == "close")
+          bool(default.get("inpaint"))
+          or default["denoise"] <= min(v["denoise"] for v in generate.KEEP.values()
+                                       if not v.get("inpaint")),
+          generate.DEFAULT_KEEP)
     check("it reaches a clip's control strength too",
           generate.clip_graph("x", "r.png", "square", 1, "1s", "loose")["cnet"]["inputs"]["strength"]
           < generate.clip_graph("x", "r.png", "square", 1, "1s", "close")["cnet"]["inputs"]["strength"])
@@ -326,8 +340,9 @@ def main() -> int:  # noqa: PLR0915
     generate.upload_reference = fake_upload
     generate.submit = lambda kind, prompt, reference, size, seed, \
         length=generate.DEFAULT_LENGTH, adopted_from="", \
-        keep=generate.DEFAULT_KEEP, pingpong=False: (
-            seen.update(size=size, keep=keep, pingpong=pingpong) or generate.Job(
+        keep=generate.DEFAULT_KEEP, **kw: (
+            seen.update(size=size, keep=keep, pingpong=kw.get('pingpong', False),
+                        style=kw.get('style'), motion=kw.get('motion')) or generate.Job(
             id="t3", kind=kind, prompt=prompt, size=size, seed=seed,
             has_reference=bool(reference), length=length,
             adopted_from=adopted_from, keep=keep))
@@ -363,6 +378,321 @@ def main() -> int:  # noqa: PLR0915
               str(seen.get("pingpong")))
     finally:
         generate.upload_reference, generate.submit = real_up2, real_sub2
+
+    print("\nexample prompts")
+    # Real text, not placeholder grey: a placeholder cannot be edited, and the
+    # whole point is to start from something that works.
+    check("there are examples", len(generate.PROMPT_EXAMPLES) >= 2)
+    for ex in generate.PROMPT_EXAMPLES:
+        ok = ex.get("label") and ex.get("text") and ex.get("kind") in ("scene", "motion")
+        check(f"{ex.get('label','?')} is well formed", bool(ok), str(sorted(ex)))
+    # Both kinds must exist, because the split is the actual lesson: a scene
+    # prompt builds the still, a motion prompt animates it.
+    kinds = {e["kind"] for e in generate.PROMPT_EXAMPLES}
+    check("both a scene and a motion example are offered", kinds == {"scene", "motion"},
+          str(sorted(kinds)))
+    page = srv.app.test_client().get("/generate").get_data(as_text=True)
+    check("every example reaches the page in full",
+          all(e["text"] in page for e in generate.PROMPT_EXAMPLES))
+
+    print("\nbackgrounds: a place, kept and reused")
+    bg = generate.background_graph("a torchlit dungeon", "dnd", "portrait", 7)
+    check("a background has nobody in it",
+          "person" in bg["neg"]["inputs"]["text"] and "character" in bg["neg"]["inputs"]["text"])
+    check("the style is folded into the prompt",
+          "dungeons and dragons" in bg["pos"]["inputs"]["text"])
+    own = generate.background_graph("just this", "own", "square", 7)["pos"]["inputs"]["text"]
+    check("roll-your-own adds no STYLE of its own",
+          not any(w in own for w in ("dungeons and dragons", "isometric")), own[:60])
+    check("but the composition still applies, whatever the look",
+          generate.BACKGROUND_COMPOSITION in own)
+    # A place is made once and reused for weeks, so it does NOT take the clip's
+    # speed-over-sharpness bargain.
+    check("it skips the latent-consistency LoRA", "lcm" not in bg)
+    check("and samples properly", bg["sampler"]["inputs"]["steps"] == generate.BACKGROUND_STEPS)
+    check("from text it starts from nothing", bg["sampler"]["inputs"]["denoise"] == 1.0)
+    frompic = generate.background_graph("restyle", "dnd", "square", 7, reference="r.png")
+    check("from a picture it is img2img", frompic["sampler"]["inputs"]["denoise"] < 1.0)
+    # Refining has its own scale, deliberately gentler than the character
+    # flow's: a place that gets repainted is a sibling, not a revision.
+    lv = {k: generate.background_graph("x", "dnd", "square", 7, reference="r.png",
+                                       refine=k)["sampler"]["inputs"]["denoise"]
+          for k in generate.REFINE_LEVELS}
+    check("a refine travels less the gentler it is",
+          lv["nudge"] < lv["change"] < lv["rework"], str(lv))
+    check("even a rework stays well short of a repaint", lv["rework"] <= 0.6, str(lv["rework"]))
+    check("the default keeps the room", lv[generate.DEFAULT_REFINE] <= 0.4,
+          str(lv[generate.DEFAULT_REFINE]))
+    check("an unknown level falls back rather than failing",
+          generate.background_graph("x", "dnd", "square", 7, reference="r.png",
+                                    refine="nonsense")["sampler"]["inputs"]["denoise"]
+          == lv[generate.DEFAULT_REFINE])
+    # Motion is recorded WITH the place and spent later; it must never reach
+    # the picture, which cannot show it.
+    check("motion is not in the scene prompt",
+          "smoke" not in bg["pos"]["inputs"]["text"].lower())
+    check("there is a default for what moves", bool(generate.DEFAULT_MOTION))
+    check("and examples to start from", len(generate.MOTION_EXAMPLES) >= 3)
+    # A background is half a picture: a character is composited into the middle
+    # later, so the middle has to be free.
+    # Asserted against the constant, not a phrase: the wording gets tuned
+    # whenever the model misreads it, and a test that pins the exact words
+    # fails for the wrong reason every time.
+    check("it asks for clear floor in the middle",
+          "middle" in generate.BACKGROUND_COMPOSITION
+          and generate.BACKGROUND_COMPOSITION in bg["pos"]["inputs"]["text"])
+    # Measured as OVERHEAD, not total: what the user types can be any length,
+    # and the thing worth guarding is how much of the 77-token budget is spent
+    # before their words are even considered. It was 50 words once, which is
+    # why torches could not get a word in.
+    scene_words = len("a torchlit dungeon".split())
+    overhead = len(generate.background_graph("a torchlit dungeon", "dnd", "portrait", 1)
+                   ["pos"]["inputs"]["text"].split()) - scene_words
+    # Everything we add: style AND composition. Both come out of the same
+    # budget as the scene, and it was 50 words once -- which is why "iron
+    # torches in wall brackets" could not get a word in.
+    check("everything we add leaves room for the scene", overhead <= 34,
+          f"{overhead} words of boilerplate")
+    check("no style argues with the composition",
+          not any("detailed" in v["prompt"] for v in generate.STYLES.values()),
+          str([v["prompt"][:30] for v in generate.STYLES.values()]))
+    check("and the default description still fits inside the budget",
+          len(generate.background_graph(generate.DEFAULT_SCENE, "dnd", "portrait", 1)
+              ["pos"]["inputs"]["text"].split()) <= 56,
+          str(len(generate.background_graph(generate.DEFAULT_SCENE, "dnd", "portrait", 1)
+                  ["pos"]["inputs"]["text"].split())))
+    check("and the scene leads, weighted above the boilerplate",
+          ":1.3)" in bg["pos"]["inputs"]["text"])
+    check("and says the place is empty, not just forbids people",
+          "nobody" in bg["pos"]["inputs"]["text"])
+    # The character examples are written from the figure's point of view and
+    # begin "standing in a...", which is itself a request for a person.
+    # The default is the one most people will press Make with unchanged, so it
+    # has to demonstrate the four things that actually work.
+    # The default is what most people press Make with unchanged, and these
+    # screens are 240-480 pixels with a character standing in front. So it has
+    # to place a light (separation), name the ground (he stands on it) and let
+    # the back fall away (depth without detail) -- and stay short, because
+    # every word competes with the boilerplate for the same budget.
+    d = generate.DEFAULT_SCENE.lower()
+    check("the default places a light, not a mood",
+          "light from the side" in d or "light from" in d, d)
+    check("the default says what the ground is", "floor" in d, d)
+    check("the default lets the back fall away",
+          "shadow" in d or "distance" in d or "falling away" in d, d)
+    check("and it is short enough to leave room",
+          len(generate.DEFAULT_SCENE.split()) <= 24,
+          f"{len(generate.DEFAULT_SCENE.split())} words")
+    check("background examples never ask for someone standing there",
+          not any("standing" in e["text"].lower() for e in generate.SCENE_EXAMPLES),
+          str([e["label"] for e in generate.SCENE_EXAMPLES]))
+    check("they are a separate set from the character ones",
+          {e["text"] for e in generate.SCENE_EXAMPLES}
+          .isdisjoint({e["text"] for e in generate.PROMPT_EXAMPLES}))
+    check("every style has a label",
+          all(v.get("label") for v in generate.STYLES.values()), str(sorted(generate.STYLES)))
+
+    print("\nthe background shelf, as a BROWSER sees it")
+    # Through the browser path on purpose. The JSON path was the only one
+    # covered, so a NameError on the redirect sat in the delete route
+    # unnoticed: the row vanished and the response was a 500.
+    import library as _lib
+    _buf = io.BytesIO()
+    Image.new("RGB", (48, 48), (20, 24, 30)).save(_buf, "PNG")
+    kept = _lib.bg_add(DATA_TEST, _buf.getvalue(),
+                       {"scene": "a hall", "motion": "dust", "style": "dnd"})
+    bc = srv.app.test_client()
+    FORM = {"Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "text/html,application/xhtml+xml"}
+    r = bc.post(f"/backgrounds/{kept['id']}", data={"name": "Great hall",
+                                                    "motion": "embers"},
+                headers={"Accept": "text/html,application/xhtml+xml"})
+    check("editing from a form redirects, not errors", r.status_code == 303,
+          str(r.status_code))
+    again = _lib.bg_get(DATA_TEST, kept["id"])
+    check("and the words actually changed",
+          again["name"] == "Great hall" and again["motion"] == "embers",
+          str(again["name"]))
+    # A delete button submits a form with NO fields, and the content type is
+    # what marks it as a browser -- which is exactly the shape that caught the
+    # Show and remove buttons before (see from_browser_form).
+    r = bc.post(f"/backgrounds/{kept['id']}/delete",
+                content_type="application/x-www-form-urlencoded",
+                headers={"Accept": "text/html,application/xhtml+xml"})
+    check("deleting from a form redirects, not errors", r.status_code == 303,
+          str(r.status_code))
+    check("and the place is gone", _lib.bg_get(DATA_TEST, kept["id"]) is None)
+    check("deleting something that is not there is a 404",
+          bc.post("/backgrounds/0000000000000000/delete").status_code == 404)
+
+    print("\nstanding a character in a place")
+    import library as _l
+    _b = io.BytesIO(); Image.new("RGB", (384, 640), (70, 60, 50)).save(_b, "PNG")
+    place = _l.bg_add(DATA_TEST, _b.getvalue(), {"scene": "a hall"})
+    _c = io.BytesIO(); Image.new("RGB", (300, 400), (255, 255, 255)).save(_c, "PNG")
+    # a dark blob on white paper: a subject the cut-out can actually find
+    blob = Image.open(io.BytesIO(_c.getvalue())).convert("RGB")
+    ImageDraw.Draw(blob).ellipse([110, 90, 190, 330], fill=(40, 60, 90))
+    _c2 = io.BytesIO(); blob.save(_c2, "PNG")
+    hero = _l.pool_add(DATA_TEST, _c2.getvalue(), "image/png", "hero.png")
+    pc = srv.app.test_client()
+
+    r = pc.post("/compose", data={"bg_id": place["id"], "pool_id": hero["id"]},
+                content_type="multipart/form-data")
+    check("composing answers with a picture",
+          r.status_code == 200 and r.mimetype == "image/png", str(r.status_code))
+    out = Image.open(io.BytesIO(r.data))
+    check("it is the size of the PLACE, not the character", out.size == (384, 640),
+          str(out.size))
+
+    # Push-back is the whole reason this step exists: the backdrop has to give
+    # way, or the figure competes with it on a 240 pixel panel.
+    flat = pc.post("/compose", data={"bg_id": place["id"], "pool_id": hero["id"],
+                                     "separation": "0", "shadow": "0"},
+                   content_type="multipart/form-data").data
+    pushed = pc.post("/compose", data={"bg_id": place["id"], "pool_id": hero["id"],
+                                       "separation": "1", "shadow": "0"},
+                     content_type="multipart/form-data").data
+    import statistics
+    def lum(b):
+        im = Image.open(io.BytesIO(b)).convert("L")
+        return statistics.fmean(im.crop((0, 0, 60, 60)).getdata())   # a corner
+    check("pushing back actually dims the backdrop", lum(pushed) < lum(flat),
+          f"{lum(pushed):.0f} vs {lum(flat):.0f}")
+
+    tall = pc.post("/compose", data={"bg_id": place["id"], "pool_id": hero["id"],
+                                     "fill": "0.95"}, content_type="multipart/form-data").data
+    short = pc.post("/compose", data={"bg_id": place["id"], "pool_id": hero["id"],
+                                      "fill": "0.45"}, content_type="multipart/form-data").data
+    check("how tall he stands is actually a control", tall != short)
+
+    check("keeping puts it in the pool",
+          pc.post("/compose", data={"bg_id": place["id"], "pool_id": hero["id"],
+                                    "keep": "1"},
+                  content_type="multipart/form-data").get_json().get("kept"))
+    check("a place is required",
+          pc.post("/compose", data={"pool_id": hero["id"]},
+                  content_type="multipart/form-data").status_code == 400)
+    check("a character is required",
+          pc.post("/compose", data={"bg_id": place["id"]},
+                  content_type="multipart/form-data").status_code == 400)
+    # Placement has to be movable: the floor in a generated place is wherever
+    # the model put it, so a fixed baseline is a guess that is often wrong.
+    base_hi = pc.post("/compose", data={"bg_id": place["id"], "pool_id": hero["id"],
+                                        "baseline": "0.6"},
+                      content_type="multipart/form-data").data
+    base_lo = pc.post("/compose", data={"bg_id": place["id"], "pool_id": hero["id"],
+                                        "baseline": "1.0"},
+                      content_type="multipart/form-data").data
+    check("up and down moves him", base_hi != base_lo)
+    across = pc.post("/compose", data={"bg_id": place["id"], "pool_id": hero["id"],
+                                       "offset": "0.3"},
+                     content_type="multipart/form-data").data
+    check("and across moves him too", across != flat)
+
+    # The cut-out needs a manual escape: a clear plastic base is neither
+    # backdrop nor figure, and no automatic rule gets every photo right.
+    trimmed = pc.post("/compose", data={"bg_id": place["id"], "pool_id": hero["id"],
+                                        "trim": "0.2"},
+                      content_type="multipart/form-data").data
+    check("his feet can be trimmed by hand", trimmed != flat)
+    loose = pc.post("/compose", data={"bg_id": place["id"], "pool_id": hero["id"],
+                                      "white": "150"},
+                    content_type="multipart/form-data").data
+    check("and how much counts as backdrop is adjustable", loose != flat)
+    check("an impossible baseline is refused",
+          pc.post("/compose", data={"bg_id": place["id"], "pool_id": hero["id"],
+                                    "baseline": "nonsense"},
+                  content_type="multipart/form-data").status_code == 400)
+
+    # The cut-out is done by a model now, which means it needs ComfyUI. It
+    # must DEGRADE rather than break: the compose path still answers with a
+    # picture when the generator is down, using the old flood-fill.
+    check("composing still works with no generator",
+          pc.post("/compose", data={"bg_id": place["id"], "pool_id": hero["id"],
+                                    "ai_cutout": "0"},
+                  content_type="multipart/form-data").status_code == 200)
+    # Needs a figure that actually HAS a disc: legs as two narrow spans, then
+    # a single wide one under them, which is the shape the detector reads.
+    based = Image.new("RGB", (300, 400), (255, 255, 255))
+    bd = ImageDraw.Draw(based)
+    bd.rectangle([120, 60, 150, 300], fill=(40, 60, 90))      # leg
+    bd.rectangle([170, 60, 200, 300], fill=(40, 60, 90))      # leg
+    bd.ellipse([60, 300, 260, 360], fill=(20, 20, 20))        # the base
+    _bb = io.BytesIO(); based.save(_bb, "PNG")
+    onbase = _l.pool_add(DATA_TEST, _bb.getvalue(), "image/png", "onbase.png")
+    check("the baseplate is kept unless asked",
+          pc.post("/compose", data={"bg_id": place["id"], "pool_id": onbase["id"],
+                                    "ai_cutout": "0"},
+                  content_type="multipart/form-data").data
+          != pc.post("/compose", data={"bg_id": place["id"], "pool_id": onbase["id"],
+                                       "ai_cutout": "0", "drop_base": "1"},
+                     content_type="multipart/form-data").data)
+    check("and the detector finds that disc",
+          generate._baseplate_top(
+              generate._subject_mask(based),
+              generate._subject_mask(based).getbbox()) is not None)
+    check("a cut-out that cannot run falls back rather than raising",
+          generate.cutout(b"not an image at all") is None)
+
+    check("a nonsense slider is refused, not clamped silently",
+          pc.post("/compose", data={"bg_id": place["id"], "pool_id": hero["id"],
+                                    "fill": "enormous"},
+                  content_type="multipart/form-data").status_code == 400)
+
+    print("@NLanimating a place, with nobody in it")
+    import library as _lb
+    _pb = io.BytesIO(); Image.new("RGB", (384, 640), (60, 50, 40)).save(_pb, "PNG")
+    room = _lb.bg_add(DATA_TEST, _pb.getvalue(),
+                      {"scene": "a hall", "motion": "drifting smoke"})
+    ac = srv.app.test_client()
+    check("a place starts with no loop", room.get("has_clip") in (None, False))
+
+    # The graph the model is handed must contain the PLACE and no character.
+    g = generate.background_clip_graph("room.png", "drifting smoke", "2s", seed=3)
+    check("the loop starts from the place's own picture",
+          g["img"]["inputs"]["image"] == "room.png")
+    check("and the words are what moves, not what it looks like",
+          g["pos"]["inputs"]["text"] == "drifting smoke")
+    check("people are refused outright", "people" in g["neg"]["inputs"]["text"])
+    check("only the START frame is pinned, so it can actually move",
+          "end_image" not in g["i2v"]["inputs"])
+    check("and the loop is closed by ping-pong instead",
+          g["out"]["inputs"]["pingpong"] is True)
+    check("length is Wan's 4n+1",
+          (g["i2v"]["inputs"]["length"] - 1) % 4 == 0, str(g["i2v"]["inputs"]["length"]))
+    check("a longer loop really is longer",
+          generate.background_clip_graph("r.png", "m", "3s")["i2v"]["inputs"]["length"]
+          > generate.background_clip_graph("r.png", "m", "1s")["i2v"]["inputs"]["length"])
+
+    # An empty override falls back to the words stored with the place, which
+    # is the point of storing them -- so the refusal needs a place that has
+    # none at all.
+    _nb = io.BytesIO(); Image.new("RGB", (64, 64), (10, 10, 10)).save(_nb, "PNG")
+    silent = _lb.bg_add(DATA_TEST, _nb.getvalue(), {"scene": "a still room"})
+    check("animating with nothing to move is refused",
+          ac.post(f"/backgrounds/{silent['id']}/animate", data={"motion": ""},
+                  content_type="application/x-www-form-urlencoded").status_code == 400)
+    check("but an empty override falls back to the stored words",
+          ac.post(f"/backgrounds/{room['id']}/animate", data={"motion": ""},
+                  content_type="application/x-www-form-urlencoded"
+                  ).status_code in (202, 303, 503))
+    check("an unknown length is refused",
+          ac.post(f"/backgrounds/{room['id']}/animate",
+                  data={"motion": "smoke", "length": "9s"},
+                  content_type="application/x-www-form-urlencoded").status_code in (400, 503))
+    check("a loop that does not exist is a 404",
+          ac.get(f"/backgrounds/{room['id']}/clip").status_code == 404)
+
+    # Once filed, the place carries it.
+    _lb.bg_set_clip(DATA_TEST, room["id"], b"not really an mp4, but bytes")
+    check("a filed loop is served back",
+          ac.get(f"/backgrounds/{room['id']}/clip").status_code == 200)
+    check("and the shelf says the place moves",
+          next(b for b in _lb.backgrounds(DATA_TEST) if b["id"] == room["id"])["has_clip"])
+    _lb.bg_remove(DATA_TEST, room["id"])
+    check("deleting the place takes its loop with it",
+          not _lb.bg_clip_path(DATA_TEST, room["id"]).exists())
 
     print("\nbad input")
     c = srv.app.test_client()

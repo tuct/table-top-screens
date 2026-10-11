@@ -143,6 +143,23 @@
     if (b) { e.preventDefault(); adoptJob(b.dataset.id); }
   });
 
+  // Example prompts drop their real text into the box, where it can be edited.
+  // Appended rather than replacing, so picking a scene and then a motion line
+  // builds one prompt instead of throwing the first away.
+  document.addEventListener("click", function (e) {
+    var c = e.target.closest && e.target.closest(".chip[data-prompt]");
+    if (!c) return;
+    e.preventDefault();
+    var box = $(c.dataset.target || "prompt");
+    if (!box) return;
+    var had = box.value.trim();
+    box.value = had ? had.replace(/[,\s]+$/, "") + ", " + c.dataset.prompt
+                    : c.dataset.prompt;
+    box.focus();
+    box.setSelectionRange(box.value.length, box.value.length);
+    box.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+
   // ---- what a loop will cost ---------------------------------------------
   var lengthSel = $("length"), clipcost = $("clipcost");
   if (lengthSel && clipcost) {
@@ -172,6 +189,263 @@
       .then(watch)
       .catch(fail);
   });
+
+  // A background goes through exactly the same machinery as a clip: post,
+  // watch, show. Without this it was a plain form that redirected, so the
+  // picture only appeared after a reload -- you asked for a place and the page
+  // told you nothing until you went looking for it.
+  var bgform = $("bgform");
+  if (bgform) bgform.addEventListener("submit", function (e) {
+    e.preventDefault();
+    var data = new FormData(bgform);
+    data.set("kind", "background");
+    reset();
+    working.hidden = false;
+    line.textContent = "queued…";
+    fetch("/generate/run", { method: "POST", body: data })
+      .then(function (r) {
+        if (!r.ok) return r.text().then(function (t) { throw new Error(strip(t)); });
+        return r.json();
+      })
+      .then(watch)
+      .catch(fail);
+  });
+
+  // Start the next background from an existing one. The words are carried
+  // over too, because refining is "this, but ..." -- retyping the scene from
+  // memory is how you lose the bit you liked.
+  function refineBackground(id, scene, style, motion) {
+    var f = $("bgform");
+    if (!f) return;
+    $("bgrefine").value = id;
+    // Deliberately NOT written into the scene box. That box is yours; the
+    // description behind the picture rides along in a hidden field and is
+    // shown read-only, so refining never types over what you wrote.
+    $("bgbase").value = scene || "";
+    var shown = $("bgbasetext");
+    if (shown) shown.textContent = scene || "(no description)";
+    if (motion) $("bgmotion").value = motion;
+    if (style) {
+      var sel = $("bgstyle");
+      if (sel) sel.value = style;
+    }
+    var note = $("bgrefnote");
+    if (note) note.hidden = false;
+    var ch = $("bgchange");
+    if (ch) ch.value = "";          // a fresh refine asks a fresh question
+    f.scrollIntoView({ behavior: "smooth", block: "center" });
+    // Focus what is actually being asked for, not the scene that is only
+    // carried along as context.
+    (ch || $("bgscene")).focus();
+  }
+
+  document.addEventListener("click", function (e) {
+    var b = e.target.closest && e.target.closest(".refinebg");
+    if (!b) return;
+    e.preventDefault();
+    refineBackground(b.dataset.bg, b.dataset.scene, b.dataset.style, b.dataset.motion);
+  });
+
+  // Set a place moving. The job goes through the same queue and preview as
+  // everything else; when it lands, the card starts playing.
+  document.addEventListener("click", function (e) {
+    var b = e.target.closest && e.target.closest(".animatebg");
+    if (!b) return;
+    e.preventDefault();
+    var id = b.dataset.bg;
+    var card = document.querySelector('.bgcard[data-bg="' + id + '"]');
+    var motion = card ? card.querySelector('[name=motion]') : null;
+    var data = new FormData();
+    if (motion && motion.value.trim()) data.set("motion", motion.value.trim());
+    var len = card ? card.querySelector(".looplen") : null;
+    if (len) data.set("length", len.value);
+    b.disabled = true;
+    b.textContent = "...";
+    reset();
+    working.hidden = false;
+    line.textContent = "queued...";
+    fetch("/backgrounds/" + id + "/animate", { method: "POST", body: data })
+      .then(function (r) {
+        if (!r.ok) return r.text().then(function (t) { throw new Error(strip(t)); });
+        return r.json();
+      })
+      .then(function (job) {
+        watch(job);
+        // Swap the still for the loop once it exists. The poll is cheap and
+        // stops either way; a stuck job leaves the still in place.
+        var tries = 0;
+        var swap = setInterval(function () {
+          if (++tries > 200) { clearInterval(swap); b.disabled = false; b.textContent = "animate"; return; }
+          fetch("/backgrounds/" + id + "/clip", { method: "HEAD" }).then(function (r) {
+            if (!r.ok || !card) return;
+            clearInterval(swap);
+            var v = document.createElement("video");
+            v.src = "/backgrounds/" + id + "/clip?t=" + Date.now();
+            v.autoplay = v.loop = v.muted = v.playsInline = true;
+            var old = card.querySelector("img, video");
+            if (old) card.replaceChild(v, old);
+            b.disabled = false;
+            b.textContent = "again";
+          });
+        }, 2000);
+      })
+      .catch(function (err) {
+        fail(err);
+        b.disabled = false;
+        b.textContent = "animate";
+      });
+  });
+
+  // A closer look. Pictures and loops both open here; a loop plays, because a
+  // loop that does not move tells you nothing about whether it is any good.
+  (function () {
+    var box = $("lightbox"), inner = $("lightinner"), close = $("lightclose");
+    if (!box) return;
+
+    function shut() {
+      box.hidden = true;
+      inner.innerHTML = "";          // stops the video rather than hiding it
+    }
+
+    document.addEventListener("click", function (e) {
+      var z = e.target.closest && e.target.closest(".zoom[data-full]");
+      if (!z) return;
+      e.preventDefault();
+      inner.innerHTML = "";
+      var el;
+      if (z.dataset.kind === "video") {
+        el = document.createElement("video");
+        el.src = z.dataset.full;
+        el.autoplay = el.loop = el.muted = el.playsInline = true;
+        el.controls = true;
+      } else {
+        el = document.createElement("img");
+        el.src = z.dataset.full;
+      }
+      inner.appendChild(el);
+      box.hidden = false;
+    });
+
+    close.addEventListener("click", shut);
+    box.addEventListener("click", function (e) {
+      if (e.target === box) shut();        // clicking the backdrop closes it
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && !box.hidden) shut();
+    });
+  })();
+
+  var bgrefclear = $("bgrefclear");
+  if (bgrefclear) bgrefclear.addEventListener("click", function () {
+    $("bgrefine").value = "";
+    $("bgbase").value = "";
+    $("bgrefnote").hidden = true;
+    var ch = $("bgchange");
+    if (ch) ch.value = "";          // or it would be sent on the next plain run
+  });
+
+  // Standing a character in a place. No model runs, so this answers in
+  // milliseconds and the sliders can be live rather than a submit-and-wait.
+  var placeform = $("placeform");
+  if (placeform) (function () {
+    var img = $("placeimg"), bezel = $("placebezel"), msg = $("placemsg");
+    var busy = false, again = false, lastUrl = null;
+
+    function label() {
+      $("fillval").textContent = Math.round($("placefill").value * 100) + "%";
+      $("sepval").textContent = Math.round($("placesep").value * 100) + "%";
+      $("shadowval").textContent = Math.round($("placeshadow").value * 100) + "%";
+      $("offsetval").textContent = Math.round($("placeoffset").value * 100);
+      $("baselineval").textContent = Math.round($("placebaseline").value * 100) + "%";
+      $("trimval").textContent = Math.round($("placetrim").value * 100) + "%";
+      var wv = Number($("placewhite").value);
+      $("whiteval").textContent = wv === 0 ? "auto" : wv;
+    }
+
+    function draw() {
+      if (busy) { again = true; return; }       // coalesce: sliders fire fast
+      busy = true; again = false;
+      var data = new FormData(placeform);
+      if (!$("placebase").checked) data.set("drop_base", "0");
+      fetch("/compose", { method: "POST", body: data })
+        .then(function (r) {
+          if (!r.ok) return r.text().then(function (t) { throw new Error(strip(t)); });
+          return r.blob();
+        })
+        .then(function (b) {
+          // Revoked, or every slider nudge leaks a few hundred KB.
+          if (lastUrl) URL.revokeObjectURL(lastUrl);
+          lastUrl = URL.createObjectURL(b);
+          img.src = lastUrl;
+          bezel.hidden = false;
+          msg.textContent = "";
+        })
+        .catch(function (e) { msg.textContent = e.message; })
+        .then(function () {
+          busy = false;
+          if (again) draw();
+        });
+    }
+
+    placeform.addEventListener("submit", function (e) { e.preventDefault(); draw(); });
+    placeform.addEventListener("input", function () { label(); draw(); });
+    placeform.addEventListener("change", draw);
+    label();
+
+    $("placekeep").addEventListener("click", function () {
+      var data = new FormData(placeform);
+      if (!$("placebase").checked) data.set("drop_base", "0");
+      data.set("keep", "1");
+      fetch("/compose", { method: "POST", body: data })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          msg.textContent = j.kept ? "kept — it is in the pool now" : "could not keep it";
+        })
+        .catch(function (e) { msg.textContent = e.message; });
+    });
+  })();
+
+  // Put a finished place on the shelf without a reload. It is filed server
+  // side the moment it is made, so this is only catching the page up.
+  function addToShelf(job) {
+    var shelf = $("shelf");
+    if (!shelf || !job.bg_id) return;
+    if (shelf.querySelector('[data-bg="' + job.bg_id + '"]')) return;
+    var head = $("shelfhead");
+    if (head) head.hidden = false;
+    var fig = document.createElement("figure");
+    fig.className = "bgcard";
+    fig.dataset.bg = job.bg_id;
+    var img = document.createElement("img");
+    img.src = "/backgrounds/" + job.bg_id + "/image";
+    img.alt = job.prompt || "";
+    img.loading = "lazy";
+    var cap = document.createElement("figcaption");
+    var f = document.createElement("form");
+    f.method = "post";
+    f.action = "/backgrounds/" + job.bg_id;
+    f.className = "bgedit";
+    f.innerHTML = '<input type="text" name="name" value="" placeholder="name it" class="mono">'
+                + '<input type="text" name="motion" placeholder="what moves">'
+                + '<button type="submit" class="icon">save</button>';
+    f.querySelector('[name=motion]').value = job.motion || "";
+    var row = document.createElement("div");
+    row.className = "bgrow";
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "icon refinebg";
+    btn.textContent = "refine";
+    btn.dataset.bg = job.bg_id;
+    btn.dataset.scene = job.prompt || "";
+    btn.dataset.style = job.style || "";
+    btn.dataset.motion = job.motion || "";
+    row.appendChild(btn);
+    cap.appendChild(f);
+    cap.appendChild(row);
+    fig.appendChild(img);
+    fig.appendChild(cap);
+    shelf.insertBefore(fig, shelf.firstChild);
+  }
 
   function stopTimers() {
     if (polling) { clearInterval(polling); polling = null; }
@@ -234,10 +508,21 @@
     working.hidden = true;
     box.hidden = false;
 
+    if (job.kind === "background") addToShelf(job);
+    var rb = $("refinebgbtn");
+    if (rb) {
+      rb.hidden = !(job.kind === "background" && job.bg_id);
+      rb.onclick = function () {
+        refineBackground(job.bg_id, job.prompt, job.style, job.motion);
+      };
+    }
+
     var url = "/generate/job/" + job.id + "/result?t=" + Date.now();
     if (job.is_image) {
       img.src = url; img.hidden = false;
-      adopt.hidden = false;              // only a still can be a reference
+      // A background is not a reference to refine from -- it is a place, and
+      // adopting it would start a character run with a picture of a room.
+      adopt.hidden = job.kind === "background";
     } else {
       vid.src = url; vid.hidden = false;
       vid.play().catch(function () {});
